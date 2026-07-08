@@ -3,7 +3,9 @@ package html_test
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -629,5 +631,163 @@ func TestConcurrentFileOperations(t *testing.T) {
 			err := <-errCh
 			testutil.AssertNoError(t, err, "Concurrent read with shared processor failed")
 		}
+	})
+}
+
+// TestExtractFromFile_AllowedBaseDir covers the AllowedBaseDir directory-jail
+// branch of validateAndReadFile (processor.go): a file inside the configured
+// base dir is read normally, while a file outside it is rejected as a path
+// violation even though the path is otherwise valid. This branch is unreachable
+// when AllowedBaseDir is unset (the default), so it needs an explicit test.
+func TestExtractFromFile_AllowedBaseDir(t *testing.T) {
+	t.Parallel()
+
+	// Two independent temp directories: one is the jail, one is "outside".
+	allowedDir := t.TempDir()
+	outsideDir := t.TempDir()
+
+	allowedFile := filepath.Join(allowedDir, "inside.html")
+	outsideFile := filepath.Join(outsideDir, "outside.html")
+	content := []byte("<html><body><p>hello allowed base dir</p></body></html>")
+	if err := os.WriteFile(allowedFile, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outsideFile, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("file inside base dir is allowed", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := html.DefaultConfig()
+		cfg.AllowedBaseDir = allowedDir
+		p, err := html.New(cfg)
+		testutil.AssertNoError(t, err, "New() failed")
+		defer p.Close()
+
+		result, err := p.ExtractFromFile(allowedFile)
+		testutil.AssertNoError(t, err, "file inside AllowedBaseDir should be readable")
+		testutil.AssertContains(t, result.Text, "hello allowed base dir", "extracted text")
+	})
+
+	t.Run("file outside base dir is blocked", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := html.DefaultConfig()
+		cfg.AllowedBaseDir = allowedDir
+		p, err := html.New(cfg)
+		testutil.AssertNoError(t, err, "New() failed")
+		defer p.Close()
+
+		_, err = p.ExtractFromFile(outsideFile)
+		testutil.AssertError(t, err, "file outside AllowedBaseDir should be rejected")
+		testutil.AssertTrue(t,
+			strings.Contains(err.Error(), "outside allowed directory"),
+			"error should mention 'outside allowed directory'")
+	})
+}
+
+// TestExtractFromFile_AllowedBaseDir_Symlink covers the reparse-point
+// containment branch of validateAndReadFile (processor.go): a symlink or Windows
+// directory junction placed inside the allowed tree whose target points outside
+// it must NOT be followed, otherwise AllowedBaseDir containment can be bypassed.
+// Symlinks require privileges on some hosts (notably Windows without Developer
+// Mode / admin), so those cases skip when the harness cannot create one; the
+// Windows junction case uses mklink /J, which needs no privilege.
+func TestExtractFromFile_AllowedBaseDir_Symlink(t *testing.T) {
+	t.Parallel()
+
+	allowedDir := t.TempDir()
+	outsideDir := t.TempDir()
+
+	// Secret content that must never reach the caller through the allowed tree.
+	secret := []byte("<html><body><p>TOP SECRET outside content</p></body></html>")
+	secretFile := filepath.Join(outsideDir, "secret.html")
+	if err := os.WriteFile(secretFile, secret, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	newProcessor := func(t *testing.T) *html.Processor {
+		t.Helper()
+		cfg := html.DefaultConfig()
+		cfg.AllowedBaseDir = allowedDir
+		p, err := html.New(cfg)
+		testutil.AssertNoError(t, err, "New() failed")
+		return p
+	}
+
+	// assertBlocked reads viaPath and asserts it is rejected as outside the base,
+	// and that no secret content is returned.
+	assertBlocked := func(t *testing.T, viaPath string) {
+		t.Helper()
+		p := newProcessor(t)
+		defer p.Close()
+
+		result, err := p.ExtractFromFile(viaPath)
+		testutil.AssertError(t, err, "path escaping AllowedBaseDir should be rejected")
+		testutil.AssertTrue(t,
+			strings.Contains(err.Error(), "outside allowed directory"),
+			"error should mention 'outside allowed directory'")
+		if result != nil {
+			testutil.AssertNotContains(t, result.Text, "TOP SECRET",
+				"secret outside content must not be returned")
+		}
+	}
+
+	t.Run("file symlink escaping base is blocked", func(t *testing.T) {
+		t.Parallel()
+
+		// allowedDir/escape.html -> outsideDir/secret.html
+		link := filepath.Join(allowedDir, "escape.html")
+		if err := os.Symlink(secretFile, link); err != nil {
+			t.Skipf("cannot create symlink on this host: %v", err)
+		}
+		assertBlocked(t, link)
+	})
+
+	t.Run("directory symlink escaping base is blocked", func(t *testing.T) {
+		t.Parallel()
+
+		// allowedDir/escape-dir -> outsideDir, then read a file through it.
+		dirLink := filepath.Join(allowedDir, "escape-dir")
+		if err := os.Symlink(outsideDir, dirLink); err != nil {
+			t.Skipf("cannot create symlink on this host: %v", err)
+		}
+		assertBlocked(t, filepath.Join(dirLink, "secret.html"))
+	})
+
+	t.Run("windows directory junction escaping base is blocked", func(t *testing.T) {
+		t.Parallel()
+
+		// allowedDir/escape-dir -> outsideDir via a junction (mklink /J). Junctions
+		// need NO privilege on Windows and are NOT resolved by filepath.EvalSymlinks,
+		// so this is the primary AllowedBaseDir bypass on that platform. It is the
+		// one case that actually executes on a default Windows host.
+		if runtime.GOOS != "windows" {
+			t.Skip("junctions are a Windows reparse-point feature")
+		}
+		dirLink := filepath.Join(allowedDir, "escape-dir")
+		out, err := exec.Command("cmd", "/c", "mklink", "/J", dirLink, outsideDir).CombinedOutput()
+		if err != nil {
+			t.Skipf("cannot create junction on this host: %v: %s", err, out)
+		}
+		assertBlocked(t, filepath.Join(dirLink, "secret.html"))
+	})
+
+	t.Run("legitimate file inside base still reads", func(t *testing.T) {
+		t.Parallel()
+
+		// Regression guard: the new symlink logic must not break the happy path.
+		legit := filepath.Join(allowedDir, "inside.html")
+		if err := os.WriteFile(legit, []byte("<p>allowed content</p>"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		p := newProcessor(t)
+		defer p.Close()
+
+		result, err := p.ExtractFromFile(legit)
+		testutil.AssertNoError(t, err, "legitimate file inside AllowedBaseDir should be readable")
+		testutil.AssertContains(t, result.Text, "allowed content", "extracted text")
 	})
 }

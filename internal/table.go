@@ -134,8 +134,16 @@ func getCellAlign(n *html.Node) table.CellAlignment {
 	return table.AlignDefault
 }
 
+// maxCellSpan caps colspan/rowspan values. The HTML spec clamps both to 1000
+// (browsers ignore anything larger), and oversized values are almost always
+// malformed; capping also bounds the placeholder cells expandColspanCells
+// allocates (colspan-1 per cell), which would otherwise let a single
+// <td colspan="N"> exhaust memory.
+const maxCellSpan = 1000
+
 // getColSpan extracts the colspan attribute value from a table cell.
 // Returns 1 if no colspan attribute is present or if the value is invalid.
+// Values above maxCellSpan are clamped to maxCellSpan.
 func getColSpan(n *html.Node) int {
 	if n == nil {
 		return 1
@@ -143,6 +151,9 @@ func getColSpan(n *html.Node) int {
 	for _, attr := range n.Attr {
 		if strings.ToLower(attr.Key) == "colspan" {
 			if val, err := strconv.Atoi(strings.TrimSpace(attr.Val)); err == nil && val > 0 {
+				if val > maxCellSpan {
+					return maxCellSpan
+				}
 				return val
 			}
 		}
@@ -152,6 +163,7 @@ func getColSpan(n *html.Node) int {
 
 // getRowSpan extracts the rowspan attribute value from a table cell.
 // Returns 1 if no rowspan attribute is present or if the value is invalid.
+// Values above maxCellSpan are clamped to maxCellSpan.
 func getRowSpan(n *html.Node) int {
 	if n == nil {
 		return 1
@@ -159,11 +171,27 @@ func getRowSpan(n *html.Node) int {
 	for _, attr := range n.Attr {
 		if strings.ToLower(attr.Key) == "rowspan" {
 			if val, err := strconv.Atoi(strings.TrimSpace(attr.Val)); err == nil && val > 0 {
+				if val > maxCellSpan {
+					return maxCellSpan
+				}
 				return val
 			}
 		}
 	}
 	return 1
+}
+
+// isZeroWidthValue reports whether a width value represents zero width ("",
+// "0", "0px", "0%", case-insensitive). Such values carry no usable column-width
+// information and are dropped so structure-row detection and style emission
+// treat the cell as widthless. Shared by the width-attribute and style-attribute
+// branches of getCellWidth so both apply the same filter.
+func isZeroWidthValue(s string) bool {
+	switch strings.ToLower(s) {
+	case "", "0", "0px", "0%":
+		return true
+	}
+	return false
 }
 
 // getCellWidth extracts the width from a table cell node.
@@ -176,7 +204,7 @@ func getCellWidth(n *html.Node) string {
 	for _, attr := range n.Attr {
 		if strings.ToLower(attr.Key) == "width" {
 			widthVal := strings.TrimSpace(attr.Val)
-			if widthVal != "" && widthVal != "0" {
+			if !isZeroWidthValue(widthVal) {
 				return widthVal
 			}
 		}
@@ -185,9 +213,13 @@ func getCellWidth(n *html.Node) string {
 	for _, attr := range n.Attr {
 		if strings.ToLower(attr.Key) == "style" {
 			style := attr.Val
-			widthLower := strings.ToLower(style)
-			if idx := strings.Index(widthLower, "width:"); idx >= 0 {
-				start := idx + 6
+			// Find "width:" case-insensitively with an index valid for the
+			// original style string. Searching the original rather than a
+			// strings.ToLower copy keeps the index correct even when lowercasing
+			// would change byte length (some non-ASCII runes fold to a different
+			// number of bytes), and preserves the value's original case.
+			if idx := asciiFoldIndex(style, "width:"); idx >= 0 {
+				start := idx + len("width:")
 				for start < len(style) && (style[start] == ' ' || style[start] == '\t') {
 					start++
 				}
@@ -200,11 +232,29 @@ func getCellWidth(n *html.Node) string {
 					end++
 				}
 				widthVal := strings.TrimSpace(style[start:end])
-				if widthVal != "" && widthVal != "0" && widthVal != "0px" && widthVal != "0%" {
+				if !isZeroWidthValue(widthVal) {
 					return widthVal
 				}
 			}
 		}
 	}
 	return ""
+}
+
+// asciiFoldIndex returns the byte index of the first ASCII-case-insensitive
+// occurrence of substr within s, or -1 if none. The returned index is valid for
+// slicing the original s: unlike strings.Index on a strings.ToLower copy, it
+// stays correct when lowercasing would change the byte length of s (some
+// non-ASCII runes fold to a different number of bytes). substr must be non-empty
+// and lowercase ASCII (the "width:" caller satisfies both).
+func asciiFoldIndex(s, substr string) int {
+	if len(substr) == 0 {
+		return 0
+	}
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if asciiFoldHasPrefix(s[i:], substr) {
+			return i
+		}
+	}
+	return -1
 }

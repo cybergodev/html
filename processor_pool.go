@@ -59,6 +59,28 @@ func getPooledProcessor() *Processor {
 	return p
 }
 
+// getPooledProcessorSafe returns a pooled Processor, converting a panic from
+// processorPool.New into an ErrInternalPanic error.
+//
+// processorPool.New panics only when poolCfg fails validation — a library
+// invariant violation, since poolCfg is derived from DefaultConfig() and is
+// valid by construction (see the comment on processorPool). That panic sits on
+// the public-API path: every package-level function reaches the pool through
+// withProcessor/withProcessorBatch. Per SEC-003 (no panic escapes the public
+// API), this wrapper recovers such a panic and returns it wrapped in
+// ErrInternalPanic, preserving the original value in the message. sync.Pool
+// does not cache the result of a panicking New, so a later Get retries fresh
+// rather than handing out a poisoned entry.
+func getPooledProcessorSafe() (p *Processor, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: processor pool initialization failed: %v", ErrInternalPanic, r)
+		}
+	}()
+	p = getPooledProcessor()
+	return p, nil
+}
+
 // putPooledProcessor returns a Processor to the pool.
 // The processor's statistics, audit log, and cache are reset before returning
 // to prevent memory accumulation from cached results across pool uses.
@@ -66,11 +88,18 @@ func putPooledProcessor(p *Processor) {
 	if p == nil {
 		return
 	}
-	// Capture whether Close() stopped the cleanup goroutine during this use.
-	// Pooled processors are never closed on the normal path, so we only restart
-	// cleanup when it was actually stopped — otherwise every pooled call would
-	// needlessly stop and respawn the background cleanup goroutine.
-	wasClosed := p.closed.Swap(false)
+	// If the processor was closed during this use, discard it instead of
+	// resurrecting it. Pooled processors are never closed on the normal path
+	// (withProcessor Close()s only the non-pooled branch), so this only fires
+	// under misuse — and a closed processor must not be handed back out: its
+	// cache cleanup goroutine has been stopped and its audit sink closed.
+	// Previously this code did closed.Swap(false) to un-close the processor and
+	// then RestartCleanup, but that branch was dead on every real path (poolCfg
+	// zeroes CacheTTL/CacheCleanup) and silently broke Close's "do not reuse"
+	// contract. sync.Pool tolerates the missing Put; its New rebuilds on next Get.
+	if p.closed.Load() {
+		return
+	}
 	p.ResetStatistics()
 	// Sink writes are synchronous, so by the time the previous user's Extract
 	// returned, every audit entry was already handed to its sink. Wait() is a
@@ -81,10 +110,6 @@ func putPooledProcessor(p *Processor) {
 	}
 	p.ClearAuditLog()
 	p.ClearCache()
-	// Restart background cleanup only if Close() stopped it during this use.
-	if wasClosed && p.config.CacheTTL > 0 && p.config.CacheCleanup > 0 {
-		p.cache.RestartCleanup(p.config.CacheCleanup)
-	}
 	processorPool.Put(p)
 }
 
@@ -109,7 +134,11 @@ func resolveConfig(cfg ...Config) (Config, bool, error) {
 // When pooled is false, creates a temporary processor with the given config.
 func withProcessor[T any](pooled bool, cfg Config, fn func(*Processor) (T, error)) (T, error) {
 	if pooled {
-		p := getPooledProcessor()
+		p, err := getPooledProcessorSafe()
+		if err != nil {
+			var zero T
+			return zero, err
+		}
 		defer putPooledProcessor(p)
 		return fn(p)
 	}
@@ -127,7 +156,21 @@ func withProcessor[T any](pooled bool, cfg Config, fn func(*Processor) (T, error
 func withProcessorBatch(pooled bool, cfg Config, itemCount int, fn func(*Processor) *BatchResult) *BatchResult {
 	var p *Processor
 	if pooled {
-		p = getPooledProcessor()
+		var err error
+		p, err = getPooledProcessorSafe()
+		if err != nil {
+			// Propagate the invariant failure to every item, mirroring the
+			// New-failure path in the else branch below.
+			errs := make([]error, itemCount)
+			for i := range errs {
+				errs[i] = err
+			}
+			return &BatchResult{
+				Results: make([]*Result, itemCount),
+				Errors:  errs,
+				Failed:  itemCount,
+			}
+		}
 		defer putPooledProcessor(p)
 	} else {
 		var err error

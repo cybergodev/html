@@ -2,6 +2,7 @@ package html
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -380,27 +381,13 @@ func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
 		return nil, newFileError("ReadFile", filePath, fmt.Errorf("path traversal detected: %s", cleanPath))
 	}
 
-	// Enforce AllowedBaseDir restriction when configured.
-	// Both paths are converted to absolute form for reliable prefix comparison.
+	// Enforce AllowedBaseDir restriction when configured. Containment is verified
+	// against the real on-disk path resolved through the OS file handle, which
+	// catches symlinks (all platforms) and Windows junctions/reparse points
+	// (which need no privilege and are NOT resolved by filepath.EvalSymlinks).
+	// See readContained for details.
 	if p.config.AllowedBaseDir != "" {
-		absPath, err := filepath.Abs(cleanPath)
-		if err != nil {
-			return nil, newFileError("ReadFile", cleanPath, fmt.Errorf("failed to resolve path: %w", err))
-		}
-		absBase, err := filepath.Abs(p.config.AllowedBaseDir)
-		if err != nil {
-			return nil, newFileError("ReadFile", cleanPath, fmt.Errorf("invalid AllowedBaseDir: %w", err))
-		}
-		// Ensure trailing separator so "/data-allowed" doesn't match "/data"
-		if !strings.HasSuffix(absBase, string(filepath.Separator)) {
-			absBase += string(filepath.Separator)
-		}
-		if !strings.HasPrefix(absPath+string(filepath.Separator), absBase) {
-			if p.audit != nil {
-				p.audit.RecordPathTraversal(filePath)
-			}
-			return nil, newFileError("ReadFile", filePath, fmt.Errorf("path outside allowed directory"))
-		}
+		return p.readContained(cleanPath)
 	}
 
 	data, err := os.ReadFile(cleanPath)
@@ -412,4 +399,79 @@ func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
 	}
 
 	return data, nil
+}
+
+// readContained enforces the AllowedBaseDir restriction for a file read.
+//
+// It opens the target, resolves its true on-disk path through the OS file
+// handle (realPath), confirms that path is within the configured base, and only
+// then reads from the already-open handle. Resolving through the handle (rather
+// than the path) is what closes the containment gaps that a path-only check
+// leaves open:
+//
+//   - Symlinks inside the allowed tree pointing outside it (all platforms).
+//   - Windows directory junctions / reparse points, which need no privilege to
+//     create and are NOT resolved by filepath.EvalSymlinks.
+//
+// Reading the same handle that was verified also removes the TOCTOU window
+// between the check and the read. The resolved real path is used only for the
+// containment decision and never reaches the returned error (which carries the
+// caller-supplied path, sanitized by FileError), so no filesystem layout is
+// disclosed on rejection.
+func (p *Processor) readContained(cleanPath string) ([]byte, error) {
+	absBase, err := filepath.Abs(p.config.AllowedBaseDir)
+	if err != nil {
+		return nil, newFileError("ReadFile", cleanPath, fmt.Errorf("invalid AllowedBaseDir: %w", err))
+	}
+
+	f, err := os.Open(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, newFileError("ReadFile", cleanPath, ErrFileNotFound)
+		}
+		return nil, newFileError("ReadFile", cleanPath, err)
+	}
+	defer f.Close()
+
+	realTarget, err := realPath(f)
+	if err != nil {
+		return nil, newFileError("ReadFile", cleanPath, fmt.Errorf("failed to resolve path: %w", err))
+	}
+
+	realBase, err := resolveRealPath(absBase)
+	if err != nil {
+		return nil, newFileError("ReadFile", cleanPath, fmt.Errorf("invalid AllowedBaseDir: %w", err))
+	}
+
+	if !pathWithin(realBase, realTarget) {
+		if p.audit != nil {
+			p.audit.RecordPathTraversal(cleanPath)
+		}
+		return nil, newFileError("ReadFile", cleanPath, fmt.Errorf("path outside allowed directory"))
+	}
+
+	return io.ReadAll(f)
+}
+
+// resolveRealPath opens path, resolves its true on-disk location, and closes it.
+// It is the path-based counterpart to realPath, used to put the base directory
+// into the same canonical form as the target so the containment comparison is
+// exact (including when the base itself crosses a symlink or junction).
+func resolveRealPath(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	return realPath(f)
+}
+
+// pathWithin reports whether target is realBase or located beneath it. Both
+// inputs must be cleaned, absolute paths in the same canonical form.
+func pathWithin(realBase, target string) bool {
+	base := filepath.Clean(realBase)
+	if !strings.HasSuffix(base, string(filepath.Separator)) {
+		base += string(filepath.Separator)
+	}
+	return strings.HasPrefix(filepath.Clean(target)+string(filepath.Separator), base)
 }

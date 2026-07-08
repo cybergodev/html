@@ -22,7 +22,7 @@ import (
 // tags sanitization would otherwise strip — such as <script src>, <iframe>,
 // <link>, and <embed> — are still enumerated.
 func (p *Processor) ExtractAllLinks(htmlBytes []byte) ([]LinkResource, error) {
-	return recoverLinks(func() ([]LinkResource, error) {
+	return recoverPanic(func() ([]LinkResource, error) {
 		// Validate input
 		if len(htmlBytes) == 0 {
 			return []LinkResource{}, nil
@@ -65,7 +65,7 @@ func (p *Processor) ExtractAllLinks(htmlBytes []byte) ([]LinkResource, error) {
 // from the HTML file and converts it to UTF-8 before extracting links.
 // Use this when you have a file path instead of raw bytes.
 func (p *Processor) ExtractAllLinksFromFile(filePath string) ([]LinkResource, error) {
-	return recoverLinks(func() ([]LinkResource, error) {
+	return recoverPanic(func() ([]LinkResource, error) {
 		if p == nil {
 			return nil, ErrProcessorClosed
 		}
@@ -86,7 +86,7 @@ func (p *Processor) ExtractAllLinksFromFile(filePath string) ([]LinkResource, er
 // This method provides cooperative cancellation, allowing long-running extractions to be
 // interrupted when the context is cancelled.
 func (p *Processor) ExtractAllLinksWithContext(ctx context.Context, htmlBytes []byte) ([]LinkResource, error) {
-	return recoverLinks(func() ([]LinkResource, error) {
+	return recoverPanic(func() ([]LinkResource, error) {
 		// Early cancellation check
 		select {
 		case <-ctx.Done():
@@ -146,7 +146,7 @@ func (p *Processor) ExtractAllLinksWithContext(ctx context.Context, htmlBytes []
 
 // ExtractAllLinksFromFileWithContext extracts all links from an HTML file with context support.
 func (p *Processor) ExtractAllLinksFromFileWithContext(ctx context.Context, filePath string) ([]LinkResource, error) {
-	return recoverLinks(func() ([]LinkResource, error) {
+	return recoverPanic(func() ([]LinkResource, error) {
 		// Early cancellation check
 		select {
 		case <-ctx.Done():

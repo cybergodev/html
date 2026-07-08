@@ -70,10 +70,12 @@ func main() {
 		case "css":
 			icon = "🎨"
 		case "link":
-			icon = "📄"
-		default:
+			// Distinguish external links (https and not our base host)
+			// from internal ones; otherwise the 🔗 case below never fires.
 			if strings.HasPrefix(link.URL, "https://") && !strings.Contains(link.URL, "example.com") {
 				icon = "🔗"
+			} else {
+				icon = "📄"
 			}
 		}
 		fmt.Printf("  %s %s [%s]\n", icon, link.URL, link.Type)

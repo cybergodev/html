@@ -27,6 +27,13 @@ const (
 	mimeEmbed = "embed"
 )
 
+// videoExtensions and audioExtensions map file extensions to MIME types for the
+// regex/tag-based media extraction in the public package. They intentionally
+// overlap on ".ogg": an OGG container can carry either video (Theora) or audio
+// (Vorbis/Opus), and the extension alone cannot disambiguate, so a single
+// ".ogg" URL is detected as both video (video/ogg) and audio (audio/ogg) and may
+// appear in both Result.Videos and Result.Audios. The audio-only variant ".oga"
+// is listed only under audioExtensions.
 var (
 	// Video extensions for video-specific detection
 	videoExtensions = map[string]string{
@@ -54,10 +61,15 @@ var (
 	}
 
 	// mediaPatterns groups every media signature — file extensions (".mp4", ".mp3",
-	// ...) and embed-host patterns ("youtube.com/embed/", ...) — by its first byte
-	// (lowercased). HasMediaReference uses it to find any signature in a single
-	// allocation-free pass, checking only the few signatures that start with the
-	// byte at the current position instead of scanning once per pattern.
+	// ...) and embed-host patterns ("youtube.com/embed/", ...) — by its first byte.
+	// HasMediaReference uses it to find any signature in a single allocation-free
+	// pass, checking only the few signatures that start with the byte at the current
+	// position instead of scanning once per pattern.
+	//
+	// Each signature is indexed under BOTH ASCII cases of its first byte (e.g. under
+	// both 'y' and 'Y'), so the scan looks up mediaPatterns[c] directly without a
+	// per-byte case-fold branch. The match itself (asciiFoldHasPrefix) is still
+	// case-insensitive over the whole signature.
 	mediaPatterns [256][]string
 )
 
@@ -67,10 +79,18 @@ func init() {
 			return
 		}
 		first := sig[0]
-		if first >= 'A' && first <= 'Z' {
-			first += 32
-		}
+		// All signatures are lowercase by construction, but handle either case
+		// defensively: index under the byte itself and its ASCII-case counterpart.
 		mediaPatterns[first] = append(mediaPatterns[first], sig)
+		var other byte
+		if first >= 'a' && first <= 'z' {
+			other = first - 32
+		} else if first >= 'A' && first <= 'Z' {
+			other = first + 32
+		}
+		if other != 0 {
+			mediaPatterns[other] = append(mediaPatterns[other], sig)
+		}
 	}
 	for ext := range videoExtensions {
 		addSignature(ext)
@@ -107,9 +127,12 @@ func DetectAudioType(url string) string {
 	return detectAudioType(lowerURL)
 }
 
-// detectVideoType performs lookup for video extensions.
-// Handles URLs with query parameters and fragments by stripping them first.
-func detectVideoType(url string) string {
+// detectMediaTypeByExtension returns the MIME type for url based on a trailing
+// extension in exts. Query parameters and fragments are stripped first so that
+// URLs like "song.mp3?v=2#audio" still match. The two callers pass distinct,
+// non-overlapping maps (videoExtensions / audioExtensions), so iteration order
+// does not affect the result.
+func detectMediaTypeByExtension(url string, exts map[string]string) string {
 	// Remove query parameters and fragments
 	if idx := strings.IndexByte(url, '?'); idx >= 0 {
 		url = url[:idx]
@@ -118,7 +141,7 @@ func detectVideoType(url string) string {
 		url = url[:idx]
 	}
 
-	for ext, mimeType := range videoExtensions {
+	for ext, mimeType := range exts {
 		if strings.HasSuffix(url, ext) {
 			return mimeType
 		}
@@ -126,23 +149,16 @@ func detectVideoType(url string) string {
 	return ""
 }
 
+// detectVideoType performs lookup for video extensions.
+// Handles URLs with query parameters and fragments by stripping them first.
+func detectVideoType(url string) string {
+	return detectMediaTypeByExtension(url, videoExtensions)
+}
+
 // detectAudioType performs lookup for audio extensions.
 // Handles URLs with query parameters and fragments by stripping them first.
 func detectAudioType(url string) string {
-	// Remove query parameters and fragments
-	if idx := strings.IndexByte(url, '?'); idx >= 0 {
-		url = url[:idx]
-	}
-	if idx := strings.IndexByte(url, '#'); idx >= 0 {
-		url = url[:idx]
-	}
-
-	for ext, mimeType := range audioExtensions {
-		if strings.HasSuffix(url, ext) {
-			return mimeType
-		}
-	}
-	return ""
+	return detectMediaTypeByExtension(url, audioExtensions)
 }
 
 // hasEmbedPattern checks if URL contains known embed patterns
@@ -176,11 +192,9 @@ func hasEmbedPattern(url string) bool {
 func HasMediaReference(content string) bool {
 	n := len(content)
 	for i := 0; i < n; i++ {
-		c := content[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 32
-		}
-		bucket := mediaPatterns[c]
+		// mediaPatterns is pre-indexed under both ASCII cases of each signature's
+		// first byte, so this lookup needs no per-byte case fold.
+		bucket := mediaPatterns[content[i]]
 		if len(bucket) == 0 {
 			continue
 		}

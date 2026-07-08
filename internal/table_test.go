@@ -535,8 +535,21 @@ func TestTableStructureRowDetection(t *testing.T) {
 			// Count rows by counting lines with | characters
 			result := sb.String()
 			lines := strings.Split(strings.TrimSpace(result), "\n")
+			// isBlankPipeRow detects a row whose cells are all empty (only pipes
+			// and whitespace), e.g. the synthesized header row emitted for
+			// headerless tables. Such rows are not data rows and must not be
+			// counted as such.
+			isBlankPipeRow := func(line string) bool {
+				if !strings.Contains(line, "|") {
+					return false
+				}
+				return strings.Trim(line, "| \t") == ""
+			}
 			dataRowCount := 0
 			for _, line := range lines {
+				if isBlankPipeRow(line) {
+					continue
+				}
 				if strings.Contains(line, "|") && !strings.Contains(line, "| ---") && !strings.Contains(line, "|:--") && !strings.Contains(line, "|---:") {
 					dataRowCount++
 				}

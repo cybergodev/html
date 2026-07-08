@@ -111,13 +111,8 @@ func ResolveURL(baseURL, relativeURL string) string {
 		return relativeURL
 	}
 
-	// Handle protocol-relative URLs (//example.com/path)
-	if len(relativeURL) >= 2 && relativeURL[0] == '/' && relativeURL[1] == '/' {
-		if strings.HasPrefix(baseURL, "https:") {
-			return "https:" + relativeURL
-		}
-		return "http:" + relativeURL
-	}
+	// Note: protocol-relative URLs ("//example.com/path") are caught by
+	// IsExternalURL above and never reach here, so no dedicated branch is needed.
 
 	// Handle absolute paths (/path)
 	if len(relativeURL) > 0 && relativeURL[0] == '/' {
@@ -129,6 +124,28 @@ func ResolveURL(baseURL, relativeURL string) string {
 			return baseURL + relativeURL
 		}
 		return relativeURL
+	}
+
+	// Fragment-only ("#frag") and query-only ("?q") references preserve the
+	// base path per RFC 3986 §5.3. Treating the base as a directory (as relative
+	// paths do below) would wrongly drop its last segment: ".../page.html" +
+	// "#top" would become ".../#top" instead of ".../page.html#top". Strip the
+	// base's existing query/fragment as appropriate and append the reference.
+	switch relativeURL[0] {
+	case '#':
+		basePath := baseURL
+		if i := strings.IndexByte(basePath, '#'); i >= 0 {
+			basePath = basePath[:i]
+		}
+		return basePath + relativeURL
+	case '?':
+		basePath := baseURL
+		if i := strings.IndexByte(basePath, '?'); i >= 0 {
+			basePath = basePath[:i]
+		} else if i := strings.IndexByte(basePath, '#'); i >= 0 {
+			basePath = basePath[:i]
+		}
+		return basePath + relativeURL
 	}
 
 	// Handle relative paths (path or ./path).

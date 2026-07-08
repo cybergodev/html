@@ -602,3 +602,40 @@ func waitCacheLen(c *Cache[string], want int, timeout time.Duration) bool {
 	}
 	return c.Len() == want
 }
+
+// TestCacheNewClampsNegativeArgs covers the negative-argument clamping in
+// NewCache (maxEntries<0 -> 0, ttl<0 -> 0). A disabled cache must reject all
+// Sets and return nil for all Gets.
+func TestCacheNewClampsNegativeArgs(t *testing.T) {
+	t.Parallel()
+
+	c := NewCache[string](-5, -time.Second)
+	if c.maxEntries != 0 {
+		t.Errorf("negative maxEntries should clamp to 0, got %d", c.maxEntries)
+	}
+	if c.ttl != 0 {
+		t.Errorf("negative ttl should clamp to 0, got %v", c.ttl)
+	}
+
+	c.Set("k", "v")
+	if got := c.Get("k"); got != nil {
+		t.Errorf("disabled cache Get should return nil, got %v", got)
+	}
+	if c.Len() != 0 {
+		t.Errorf("disabled cache should stay empty, got Len=%d", c.Len())
+	}
+}
+
+// TestCacheEvictOneEmptyList covers the evictOne branch where the cache map and
+// the linked list disagree on emptiness (tail.prev == head): evicting must not
+// panic and must leave the cache consistent. This branch is unreachable through
+// the public Set path (evictOne only runs at capacity), so it is driven directly.
+func TestCacheEvictOneEmptyList(t *testing.T) {
+	t.Parallel()
+
+	c := NewCache[string](2, 0)
+	c.evictOne(time.Now().UnixNano()) // no entries: LRU tail == head sentinel
+	if c.Len() != 0 {
+		t.Errorf("evictOne on empty cache should not change Len, got %d", c.Len())
+	}
+}

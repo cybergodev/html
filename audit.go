@@ -2,6 +2,7 @@ package html
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -542,20 +543,22 @@ func (s *MultiSink) Write(entry AuditEntry) {
 	}
 }
 
-// Close closes all sinks.
+// Close closes all sinks and joins every error returned (Go 1.20+ errors.Join)
+// rather than silently dropping all but the last. For an audit subsystem, losing
+// close errors from earlier sinks hides real delivery failures.
 func (s *MultiSink) Close() error {
 	if s == nil {
 		return nil
 	}
-	var lastErr error
+	var errs []error
 	for _, sink := range s.sinks {
 		if sink != nil {
 			if err := sink.Close(); err != nil {
-				lastErr = err
+				errs = append(errs, err)
 			}
 		}
 	}
-	return lastErr
+	return errors.Join(errs...)
 }
 
 // FilteredSink filters audit entries before writing to the underlying sink.

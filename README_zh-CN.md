@@ -513,7 +513,7 @@ type AudioInfo struct {
 type LinkResource struct {
     URL   string
     Title string
-    Type  string // "css", "js", "image", "video", "audio", "icon", "link"
+    Type  string // "link", "image", "video", "audio", "css", "js", "icon", "media"
 }
 
 type NodeAttr struct {
@@ -608,7 +608,7 @@ type Config struct {
 ## 🔒 安全特性
 
 ### HTML 净化
-- **危险标签移除**：`<script>`、`<style>`、`<noscript>`、`<iframe>`、`<embed>`、`<object>`、`<form>`、`<input>`、`<button>`、`<svg>`、`<math>`
+- **危险标签移除**：`<script>`、`<style>`、`<noscript>`、`<iframe>`、`<embed>`、`<object>`、`<input>`、`<button>`、`<svg>`、`<math>`（`<form>` 容器会特意保留 —— 仅移除其中的表单控件）
 - **事件处理器移除**：所有 `on*` 属性（onclick、onerror、onload 等）
 - **危险协议阻止**：`javascript:`、`vbscript:`、`data:`（安全媒体类型除外）
 - **XSS 防护**：全面的净化以防止跨站脚本攻击

@@ -31,13 +31,18 @@ const (
 //   - ttl < 0: Treated as 0 (no time-based expiration)
 //
 // Thread Safety: All public methods are safe for concurrent use.
-// Get() uses a write lock to prevent TOCTOU race conditions.
+//
+// The lock is a plain sync.Mutex rather than sync.RWMutex: Get() must promote
+// the matched entry to the front of the LRU list (a write), so it takes the
+// write lock anyway, and the only remaining reader was Len(). An RWMutex here
+// bought no read concurrency in exchange for its larger word and RLock path,
+// so Mutex is the simpler, honest choice.
 //
 // SECURITY: Cache entries may contain sensitive data. Use Clear() to remove
 // all entries when processing sensitive content. Consider setting an appropriate
 // TTL to limit data retention.
 type Cache[K comparable] struct {
-	mu         sync.RWMutex
+	mu         sync.Mutex
 	entries    map[K]*cacheEntry[K]
 	maxEntries int
 	ttl        time.Duration
@@ -101,9 +106,9 @@ func (c *Cache[K]) Get(key K) any {
 	}
 	now := time.Now().UnixNano()
 
-	// Use a single write lock to avoid TOCTOU race condition.
-	// The overhead of write lock vs read lock is minimal compared to
-	// the complexity and potential races of lock switching.
+	// Lock for the whole Get: a read-only check would race with a concurrent
+	// Set over the same entry's LRU position, so Get promotes the entry to the
+	// front under the write lock (see type doc for why Cache uses sync.Mutex).
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -202,12 +207,18 @@ func (c *Cache[K]) removeNode(entry *cacheEntry[K]) {
 }
 
 func (c *Cache[K]) evictOne(nowNano int64) {
-	// First, try to remove an expired entry
-	for key, entry := range c.entries {
-		if entry.isExpired(nowNano) {
-			c.removeNode(entry)
-			delete(c.entries, key)
-			return
+	// First, try to remove an expired entry. This scan only makes sense when
+	// entries can expire: with ttl == 0 every entry is created with
+	// expiresAt == 0, so isExpired always returns false and the full O(n) map
+	// scan would run on every capacity-exceeding Set without ever matching.
+	// Skipping it avoids serializing that scan against concurrent Gets.
+	if c.ttl > 0 {
+		for key, entry := range c.entries {
+			if entry.isExpired(nowNano) {
+				c.removeNode(entry)
+				delete(c.entries, key)
+				return
+			}
 		}
 	}
 
@@ -320,21 +331,30 @@ func (c *Cache[K]) StopCleanup() {
 	}
 }
 
-// RestartCleanup stops any running cleanup goroutine and starts a new one.
-// This is needed when a pooled processor is reused after Close(), since
-// Close() calls StopCleanup(). Without this, expired entries accumulate
-// indefinitely when the processor is reused from the pool.
+// RestartCleanup stops any running cleanup goroutine and starts a new one. It
+// is the public lifecycle primitive for a Cache whose sweeper has been stopped
+// (e.g. via StopCleanup, or Close on an owning Processor) but whose expired
+// entries should keep being evicted.
+//
+// The internal processor pool previously called this when returning a processor
+// to the pool after Close(); that path was dead on every real execution and has
+// been removed, so RestartCleanup currently has no in-module production caller.
+// It is retained as part of the Cache API for callers that manage the cleanup
+// lifecycle directly (and is exercised by TestCacheRestartCleanup).
 //
 // Concurrency: callers MUST serialize StartCleanup/StopCleanup/RestartCleanup
 // against each other for a given Cache. The cleanupOnce reset below is taken
 // under cleanupMu so it cannot race with a concurrent StartCleanup's Do(), but
-// the broader start→stop→restart sequence is not internally serialized. The
-// library's only caller (putPooledProcessor) honors this by holding single
-// ownership of the processor (and thus its cache) when returning it to the pool.
+// the broader start→stop→restart sequence is not internally serialized.
 func (c *Cache[K]) RestartCleanup(interval time.Duration) {
 	c.StopCleanup()
-	// Reset sync.Once under cleanupMu so this write cannot race with a
-	// concurrent StartCleanup reading cleanupOnce via Do().
+	// This assignment is NOT made race-free by cleanupMu alone: StartCleanup
+	// reads cleanupOnce via Do() WITHOUT that lock (it only takes cleanupMu
+	// inside the Do closure and again afterward to read cleanupCancel). Safety
+	// against a concurrent StartCleanup therefore rests entirely on the caller
+	// honoring the "MUST serialize" contract in the method doc above. cleanupMu
+	// is still taken here to keep this write ordered with the cleanupCancel
+	// reads/writes in StartCleanup/StopCleanup.
 	c.cleanupMu.Lock()
 	c.cleanupOnce = sync.Once{}
 	c.cleanupMu.Unlock()
@@ -359,7 +379,7 @@ func (c *Cache[K]) cleanupExpired() {
 // Len returns the current number of entries in the cache.
 // This is useful for monitoring and debugging.
 func (c *Cache[K]) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return len(c.entries)
 }

@@ -133,7 +133,7 @@ func TestMarkdownRenderer(t *testing.T) {
 			{{Text: "1"}, {Text: "2"}},
 		}
 
-		r.Render(tableData, tb, 2, nil)
+		r.Render(tableData, tb, 2)
 		output := sb.String()
 
 		// Check for markdown table structure
@@ -158,7 +158,7 @@ func TestMarkdownRenderer(t *testing.T) {
 			{{Text: "L1", Align: table.AlignLeft}, {Text: "R1", Align: table.AlignRight}},
 		}
 
-		r.Render(tableData, tb, 2, nil)
+		r.Render(tableData, tb, 2)
 		output := sb.String()
 
 		// Check for alignment markers
@@ -180,7 +180,7 @@ func TestMarkdownRenderer(t *testing.T) {
 			{{Text: "A"}, {Text: "B"}},
 		}
 
-		r.Render(tableData, tb, 2, nil)
+		r.Render(tableData, tb, 2)
 		output := sb.String()
 
 		// Colspan cells are expanded in markdown
@@ -196,12 +196,121 @@ func TestMarkdownRenderer(t *testing.T) {
 		r := &table.MarkdownRenderer{}
 		tableData := [][]table.CellData{}
 
-		r.Render(tableData, tb, 0, nil)
+		r.Render(tableData, tb, 0)
 		output := sb.String()
 
 		// Empty table should produce empty or minimal output
 		if len(output) > 0 {
 			t.Logf("Empty table output: %q", output)
+		}
+	})
+}
+
+// TestMarkdownRowspanGrid verifies that a cell with rowspan > 1 occupies its
+// column in the rows it spans, repeating the originating cell's text (the
+// Pandoc convention for Markdown, which cannot express rowspan). Without the
+// grid, later rows' cells shift left: a cell in a spanned row would land under
+// the spanned cell instead of beside it.
+func TestMarkdownRowspanGrid(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rowspan repeats value in spanned rows", func(t *testing.T) {
+		var sb strings.Builder
+		tb := table.NewTrackedBuilder(&sb)
+
+		r := &table.MarkdownRenderer{}
+		// <tr><td rowspan=2>A</td><td>B</td></tr><tr><td>C</td></tr>
+		// Input is post-colspan-expansion (what the renderer receives); each
+		// entry is one column, carrying its Rowspan.
+		tableData := [][]table.CellData{
+			{{Text: "A", Rowspan: 2}, {Text: "B"}},
+			{{Text: "C"}},
+		}
+
+		r.Render(tableData, tb, 2)
+		output := sb.String()
+
+		// "A" must repeat in the one spanned row, so it appears twice total
+		// (once in its declared row, once repeated).
+		if got := strings.Count(output, "A"); got != 2 {
+			t.Errorf("expected A repeated once in the spanned row (count=2), got %d\n%s", got, output)
+		}
+
+		// In the spanned row, "A" (col 0) must precede "C" (col 1) — proving C
+		// landed in column 1 beside A, not in column 0 under A (the pre-grid
+		// misalignment). The row containing C must therefore also contain A.
+		lines := strings.Split(strings.TrimSpace(output), "\n")
+		var cRow string
+		for _, line := range lines {
+			if strings.Contains(line, "C") {
+				cRow = line
+				break
+			}
+		}
+		if cRow == "" {
+			t.Fatalf("no row containing C in output:\n%s", output)
+		}
+		ai := strings.Index(cRow, "A")
+		ci := strings.Index(cRow, "C")
+		if ai < 0 || ai > ci {
+			t.Errorf("expected A before C in spanned row, got %q", cRow)
+		}
+	})
+
+	t.Run("rowspan exceeding row count is clamped", func(t *testing.T) {
+		var sb strings.Builder
+		tb := table.NewTrackedBuilder(&sb)
+
+		r := &table.MarkdownRenderer{}
+		// rowspan=5 but only 2 rows exist: must not panic or fabricate rows.
+		tableData := [][]table.CellData{
+			{{Text: "A", Rowspan: 5}, {Text: "B"}},
+			{{Text: "C"}},
+		}
+
+		r.Render(tableData, tb, 2)
+		output := sb.String()
+
+		// Only one spanned row exists, so A repeats exactly once (count=2).
+		if got := strings.Count(output, "A"); got != 2 {
+			t.Errorf("expected A repeated once (only 1 spanned row exists), got %d\n%s", got, output)
+		}
+	})
+
+	t.Run("rowspan with header repeats header value", func(t *testing.T) {
+		var sb strings.Builder
+		tb := table.NewTrackedBuilder(&sb)
+
+		r := &table.MarkdownRenderer{}
+		// <tr><th rowspan=2>Name</th><th>Value</th></tr><tr><td>1</td></tr>
+		tableData := [][]table.CellData{
+			{{Text: "Name", Rowspan: 2, IsHeader: true}, {Text: "Value", IsHeader: true}},
+			{{Text: "1"}},
+		}
+
+		r.Render(tableData, tb, 2)
+		output := sb.String()
+
+		// "Name" spans into the data row, so it appears twice.
+		if got := strings.Count(output, "Name"); got != 2 {
+			t.Errorf("expected Name repeated once in the spanned row (count=2), got %d\n%s", got, output)
+		}
+		// "1" lands in column 1 (beside the repeated Name), not column 0.
+		lines := strings.Split(strings.TrimSpace(output), "\n")
+		var oneRow string
+		for _, line := range lines {
+			if strings.Contains(line, "1") {
+				oneRow = line
+				break
+			}
+		}
+		if oneRow == "" {
+			t.Fatalf("no row containing 1 in output:\n%s", output)
+		}
+		ni := strings.Index(oneRow, "Name")
+		oi := strings.Index(oneRow, "1")
+		if ni < 0 || ni > oi {
+			t.Errorf("expected Name before 1 in spanned row, got %q", oneRow)
 		}
 	})
 }
@@ -227,7 +336,7 @@ func TestHTMLRenderer(t *testing.T) {
 			{{Text: "Data"}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		// Check for HTML table structure
@@ -253,7 +362,7 @@ func TestHTMLRenderer(t *testing.T) {
 			{{Text: "B"}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		if !strings.Contains(output, `rowspan="2"`) {
@@ -270,7 +379,7 @@ func TestHTMLRenderer(t *testing.T) {
 			{{Text: "Span", Colspan: 3, OriginalColspan: 3}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		if !strings.Contains(output, `colspan="3"`) {
@@ -287,7 +396,7 @@ func TestHTMLRenderer(t *testing.T) {
 			{{Text: "Center", Align: table.AlignCenter}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		if !strings.Contains(output, "text-align:center") {
@@ -304,7 +413,7 @@ func TestHTMLRenderer(t *testing.T) {
 			{{Text: "Wide", Width: "100px"}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		if !strings.Contains(output, "width:100px") {
@@ -391,11 +500,10 @@ func TestAlignCount(t *testing.T) {
 	t.Parallel()
 
 	counts := table.AlignCount{
-		Left:         5,
-		Center:       3,
-		Right:        2,
-		Justify:      1,
-		DefaultCount: 10,
+		Left:    5,
+		Center:  3,
+		Right:   2,
+		Justify: 1,
 	}
 
 	if counts.Left != 5 {
@@ -851,7 +959,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 			{{Text: "Longer content here", Align: table.AlignDefault}, {Text: "X", Align: table.AlignDefault}, {Text: "Y", Align: table.AlignDefault}},
 		}
 
-		r.Render(tableData, tb, 3, nil)
+		r.Render(tableData, tb, 3)
 		output := sb.String()
 
 		// Check alignment markers (center uses :---: format)
@@ -876,7 +984,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 			{{Text: " "}, {Text: "Data"}},
 		}
 
-		r.Render(tableData, tb, 2, nil)
+		r.Render(tableData, tb, 2)
 		output := sb.String()
 
 		if !strings.Contains(output, "Header") {
@@ -897,7 +1005,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 			{{Text: "Data", Align: table.AlignRight, Rowspan: 2, Colspan: 2, OriginalColspan: 2}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		if !strings.Contains(output, `text-align:center`) {
@@ -923,7 +1031,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 			{{Text: "Justified", Align: table.AlignJustify}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		if !strings.Contains(output, "text-align:justify") {
@@ -947,7 +1055,7 @@ func TestTableWithDifferentWidths(t *testing.T) {
 			{{Text: "A", Align: table.AlignDefault}, {Text: "B", Align: table.AlignDefault}},
 		}
 
-		r.Render(tableData, tb, 2, []string{"100px", "200px"})
+		r.Render(tableData, tb, 2)
 		output := sb.String()
 
 		if !strings.Contains(output, "|") {
@@ -970,7 +1078,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 			{{Text: "Data"}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		if !strings.Contains(output, "Header") || !strings.Contains(output, "Data") {
@@ -993,7 +1101,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 			},
 		}
 
-		r.Render(tableData, tb, 5, nil)
+		r.Render(tableData, tb, 5)
 		output := sb.String()
 
 		// Count pipes to verify 5 columns
@@ -1014,7 +1122,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 			{{Text: longText}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		if !strings.Contains(output, "LongContent") {
@@ -1032,7 +1140,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 			{{Text: "Data with *asterisks* and _underscores_"}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		// Should handle special markdown characters
@@ -1056,7 +1164,7 @@ func TestHTMLTableEdgeCases(t *testing.T) {
 			{{Text: "Data with <em>italic</em>"}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		if !strings.Contains(output, "<table>") {
@@ -1074,7 +1182,7 @@ func TestHTMLTableEdgeCases(t *testing.T) {
 			{},
 		}
 
-		r.Render(tableData, tb, 2, nil)
+		r.Render(tableData, tb, 2)
 		output := sb.String()
 
 		if !strings.Contains(output, `rowspan="2"`) {
@@ -1094,7 +1202,7 @@ func TestHTMLTableEdgeCases(t *testing.T) {
 			{{Text: "Cell", Rowspan: 0, Colspan: 0}},
 		}
 
-		r.Render(tableData, tb, 1, nil)
+		r.Render(tableData, tb, 1)
 		output := sb.String()
 
 		// Zero values should not produce attributes

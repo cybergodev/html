@@ -18,6 +18,21 @@ const (
 
 	// bufferPoolInitialCapacity is the initial capacity for pooled bytes.Buffer
 	bufferPoolInitialCapacity = 1024
+
+	// maxPooledByteCap is the largest []byte/bytes.Buffer capacity that is returned
+	// to a pool. Buffers that grew beyond this (e.g. a multi-MB extraction result)
+	// are dropped on Put so the pool does not retain them indefinitely — the
+	// classic sync.Pool retention footgun, where one oversized buffer is handed
+	// back out for every subsequent small request and stays live per-P forever.
+	// 64 KiB covers the hot paths (GetTextContent, charset transform chunks) while
+	// shedding the pathological large-document buffers.
+	maxPooledByteCap = 64 * 1024
+
+	// maxPooledNodeSliceCap bounds retained []*html.Node slices (≈64 KiB of
+	// pointers at 8 bytes each). Tree traversal stacks are normally tiny; a slice
+	// this large indicates a pathologically wide document whose stack should not
+	// be retained.
+	maxPooledNodeSliceCap = 8192
 )
 
 // poolDebug enables debug logging for pool corruption detection.
@@ -217,6 +232,11 @@ func PutBuffer(buf *bytes.Buffer) {
 	if buf == nil {
 		return
 	}
+	// Drop oversized buffers so the pool does not retain a multi-MB backing array
+	// indefinitely (see maxPooledByteCap rationale).
+	if cap(buf.Bytes()) > maxPooledByteCap {
+		return
+	}
 	// SECURITY: Optionally clear sensitive data before returning to pool
 	if poolSecureClear.Load() {
 		// Zero out the buffer contents before reset
@@ -268,6 +288,11 @@ func PutByteBuf(bp *[]byte) {
 	if bp == nil {
 		return
 	}
+	// Drop oversized buffers so the pool does not retain a multi-MB backing array
+	// indefinitely (see maxPooledByteCap rationale).
+	if cap(*bp) > maxPooledByteCap {
+		return
+	}
 	*bp = (*bp)[:0]
 	byteBufPool.Put(bp)
 }
@@ -304,6 +329,11 @@ func GetTransformBuffer() *[]byte {
 // before being returned to prevent data leakage.
 func PutTransformBuffer(buf *[]byte) {
 	if buf == nil {
+		return
+	}
+	// Drop oversized buffers so the pool does not retain a multi-MB backing array
+	// indefinitely (see maxPooledByteCap rationale).
+	if cap(*buf) > maxPooledByteCap {
 		return
 	}
 	// SECURITY: Optionally clear sensitive data before returning to pool
@@ -347,6 +377,11 @@ func GetNodeSlice() *[]*html.Node {
 // before being returned to prevent potential pointer leakage.
 func PutNodeSlice(s *[]*html.Node) {
 	if s == nil {
+		return
+	}
+	// Drop oversized slices so the pool does not retain a pathologically wide
+	// traversal stack indefinitely (see maxPooledNodeSliceCap rationale).
+	if cap(*s) > maxPooledNodeSliceCap {
 		return
 	}
 	// SECURITY: Optionally clear node pointers to prevent potential

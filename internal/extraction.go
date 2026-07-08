@@ -90,6 +90,13 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 	}
 	if node.Type == html.ElementNode {
 		if node.Data == "img" && imageCounter != nil {
+			// Only emit a placeholder for imgs with a usable src, so the count
+			// stays in lockstep with extractImagesAndLinks (which assigns
+			// positions only to such imgs) and no unmatched [IMAGE:n] token can
+			// leak into output.
+			if !imgHasValidSrc(node) {
+				return
+			}
 			*imageCounter++
 			table.EnsureNewline(tb)
 			tb.WriteString("[IMAGE:")
@@ -113,9 +120,20 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 			return
 		}
 		if node.Data == "table" {
-			// Use the table processor for table extraction
-			TableProcessor().Extract(node, tb, tableFormat)
-			return
+			if containsNestedTable(node) {
+				// Layout table: this <table> wraps other <table> elements in its
+				// cells purely for visual layout (common on financial sites such
+				// as Finviz, where the whole page is nested layout tables).
+				// Rendering it as a Markdown table would capture each outer cell
+				// via GetTextContent, which recursively flattens every nested
+				// data table into unstructured run-on text. Fall through to the
+				// generic block handling below so each nested data table is
+				// dispatched and rendered on its own terms.
+			} else {
+				// Use the table processor for table extraction
+				TableProcessor().Extract(node, tb, tableFormat)
+				return
+			}
 		}
 		// Check if this is a paragraph-level block element that needs double newlines
 		// Elements like li, br, hr, tr, td, th should not add extra spacing
@@ -173,6 +191,34 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 			extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, parentBlock, depth+1)
 		}
 	}
+}
+
+// containsNestedTable reports whether tableNode has another <table> element
+// anywhere in its subtree. Such tables are almost always used for visual
+// layout — wrapping real data tables inside <td> cells — rather than carrying
+// data themselves.
+//
+// The walk short-circuits as soon as a nested <table> is found: once `found`
+// is set, the callback returns false for every subsequent node, which makes
+// WalkNodes skip those subtrees, so the cost on layout tables is minimal. A
+// genuine data table (no nested table) pays one full subtree walk, which is
+// unavoidable to prove the absence of a nested table.
+func containsNestedTable(tableNode *html.Node) bool {
+	if tableNode == nil {
+		return false
+	}
+	found := false
+	WalkNodes(tableNode, func(n *html.Node) bool {
+		if found {
+			return false
+		}
+		if n != tableNode && n.Type == html.ElementNode && n.Data == "table" {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // CleanContentNode removes non-content elements from the node tree.

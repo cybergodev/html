@@ -4,6 +4,33 @@ All notable changes to the cybergodev/html library will be documented in this fi
 
 ---
 
+## v1.4.5 - Security Hardening, Table & URL Fixes, Allocation Cuts (2026-07-08)
+
+### Security
+- `AllowedBaseDir` containment now resolves symlinks and Windows junctions via a handle-based, TOCTOU-free check, closing a bypass where an in-tree reparse point pointing outside the allowed dir was followed by `os.ReadFile`
+- Package-level entry points (`Extract*`, `ExtractAllLinks`, `ExtractBatch*`) now recover a pool-`New` panic and return `ErrInternalPanic` instead of letting it escape to callers
+- Data URLs with an empty media type (`data:;base64,...`) are now rejected — previously arbitrary base64 payload bypassed the safe-MIME whitelist
+- Table `colspan`/`rowspan` clamped to 1000 (HTML spec ceiling) to close a memory-exhaustion vector; CSS `width` values and oversized non-data URIs are now sanitized/rejected before emission
+- Pooled `[]byte`/node-slice buffers above 64 KiB / 8192 entries are no longer retained in `sync.Pool`, eliminating the retention footgun where one multi-MB buffer was reused for every later small request
+
+### Fixed
+- Table extraction: nested layout tables (e.g. Finviz) no longer flatten inner data tables into one line, and headerless tables no longer mispromote the first `<tr>` to a header
+- Markdown tables: `rowspan > 1` cells now repeat across spanned rows, cell text is HTML/pipe-escaped, and padding is sized by rune count (fixing CJK over-padding)
+- `ResolveURL` now resolves fragment-only (`#frag`) and query-only (`?q`) references per RFC 3986 §5.3 — a file-style base (`…/page.html` + `#top`) no longer drops its last segment
+- Image positions are now contiguous and match `[IMAGE:n]` placeholders — `<img>` with an invalid/missing `src` no longer leaves leaked unmatched tokens
+- Hidden elements styled with whitespace around the colon (`display:  none`, `display :none`) are now removed instead of leaking into content
+- `EncodingDetector.ToUTF8` now errors on an unknown charset + non-UTF-8 input instead of silently passing undecodable bytes through (behavior change)
+
+### Changed
+- `Cache.mu` is now `sync.Mutex` (RWMutex bought no read concurrency — `Get` write-locks every read for LRU promotion); closed pooled processors are no longer resurrected
+
+### Performance
+- `GetTextContent` zero-allocation fast path for the common single-text-node case (`<a>link</a>`, `<td>cell</td>`) — ~111 allocs/op off the realistic benchmark
+- Single-pass image+link collection, inline-element skip in article scoring, direct-index media scan, table allocation cuts, and a `ttl == 0` eviction fast path
+- `BenchmarkRealisticNoCache` (uncached): −5.3% time (402→381 µs), −4.3% allocs/op (2576→2465); output byte-identical
+
+---
+
 ## v1.4.4 - Content Extraction Fixes, Sitemap Stripping & Allocation Cuts (2026-06-26)
 
 ### Added
@@ -33,7 +60,6 @@ All notable changes to the cybergodev/html library will be documented in this fi
 
 ### Added
 - Definition lists (`<dl>`/`<dt>`/`<dd>`) now render with PHP Markdown Extra `: ` definition markers, indented two spaces per nesting level
-- Five testable, `Output:`-verified `Example` functions for godoc/pkg.go.dev (the public package previously had none)
 - `byteBufPool` — a capacity-retaining `[]byte` pool (`GetByteBuf`/`PutByteBuf`) backing the rewritten `GetTextContent`
 
 ### Fixed
@@ -42,7 +68,7 @@ All notable changes to the cybergodev/html library will be documented in this fi
 - `ResolveURL` now correctly resolves relative references against a file-style base URL (e.g. `…/page.html` + `about.html`); bases ending in `/` are unchanged and all existing cases stay byte-identical
 - Background goroutines (audit sink write, cache TTL cleanup) now recover panics, so a panicking user-supplied `AuditSink` or an internal cleanup fault can no longer crash the process
 - Removed file-header comments that polluted the package godoc overview; `go doc .` is now clean
-- `examples/`: each demo moved to its own package so `go build -tags examples ./examples/...` succeeds; the cache-benefit benchmark now reports an honest ~40x+ per-op speedup; the sequential-vs-batch comparison is fair; JSON pretty-printing uses `json.Indent` to preserve ordering and precision
+- `examples/`: the cache-benefit benchmark now reports an honest ~40x+ per-op speedup; the sequential-vs-batch comparison is fair; JSON pretty-printing uses `json.Indent` to preserve ordering and precision. (Correction: the demos were not moved to separate packages — all eight remain `package main` in one directory, so `go build -tags examples ./examples/...` still fails with `main redeclared`; known issue, see F-3.)
 
 ### Changed
 - Audit sink writes are now synchronous on the recording goroutine, removing the unbounded-goroutine amplification an adversarial document could cause (`Wait()` retained as a nil-safe no-op)
@@ -62,7 +88,7 @@ All notable changes to the cybergodev/html library will be documented in this fi
 - `internal/constants.go`: `builderInitialSize` (only used by the old builder path)
 
 ### Notes
-- No breaking public API changes. Full `examples/` audit (DOC-005) verified all 8 demos compile and run; test suite hardened with boundary tests for previously-uncovered functions and table-driven consolidation. `go test -race` was not run — ThreadSanitizer cannot reserve shadow memory on this Windows host (environment limitation, not a code race).
+- No breaking public API changes. Test suite hardened with boundary tests for previously-uncovered functions and table-driven consolidation. (Correction: the `examples/` audit did not in fact verify the demos build together — all eight are `package main` in one directory, so `go build -tags examples ./examples/...` fails with `main redeclared`, and the public package has no testable `Example*` functions; both are known issues, see F-3/F-4.) `go test -race` was not run — ThreadSanitizer cannot reserve shadow memory on this Windows host (environment limitation, not a code race).
 
 ---
 

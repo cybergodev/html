@@ -699,3 +699,134 @@ func TestScoreLanguagePatterns(t *testing.T) {
 		})
 	}
 }
+
+// TestIsPrintable exercises every branch of isPrintable: printable ASCII, the
+// three whitelisted whitespace bytes, the non-ASCII passthrough, and the
+// remaining control bytes that must report false.
+func TestIsPrintable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		b    byte
+		want bool
+	}{
+		{"space", ' ', true},
+		{"digit", '0', true},
+		{"upper", 'Z', true},
+		{"lower tilde", '~', true}, // 126
+		{"tab", '\t', true},
+		{"lf", '\n', true},
+		{"cr", '\r', true},
+		{"high byte 0x80", 0x80, true},
+		{"high byte 0xFF", 0xFF, true},
+		{"nul", 0x00, false},
+		{"soh", 0x01, false},
+		{"vt", 0x0B, false},
+		{"unit separator", 0x1F, false},
+		{"del", 0x7F, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isPrintable(tt.b); got != tt.want {
+				t.Errorf("isPrintable(0x%02X) = %v, want %v", tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCalculateValidUTF8RatioFull covers the ASCII fast path, every multi-byte
+// length (2/3/4), and the three malformed-sequence branches: invalid leading
+// byte, truncated sequence, and bad continuation byte.
+func TestCalculateValidUTF8RatioFull(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		data []byte
+		// ratio is valid/len; we assert the exact expected value per case.
+		want float64
+	}{
+		{"empty", nil, 0},
+		{"pure ascii", []byte("hello"), 1.0},                               // 5/5
+		{"valid 2-byte", []byte{0xC3, 0xA9}, 0.5},                          // é: 1/2
+		{"valid 3-byte", []byte{0xE4, 0xB8, 0xAD}, 1.0 / 3},                // 中: 1/3
+		{"valid 4-byte", []byte{0xF0, 0x9F, 0x98, 0x80}, 0.25},             // 😀: 1/4
+		{"ascii plus valid multibyte", []byte{'a', 0xC3, 0xA9}, 2.0 / 3.0}, // 2 valid / 3 bytes
+		{"invalid leading byte 0x80", []byte{0x80}, 0},                     // continuation byte as lead
+		{"invalid leading byte 0xFE", []byte{0xFE}, 0},                     // out of range
+		{"truncated 2-byte", []byte{0xC3}, 0},                              // lead present, no continuation
+		{"bad continuation", []byte{0xC3, 0x41}, 0},                        // 0x41 is not a continuation byte
+		{"truncated 3-byte", []byte{0xE4, 0xB8}, 0},                        // needs 3, has 2
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := calculateValidUTF8RatioFull(tt.data)
+			if got != tt.want {
+				t.Errorf("calculateValidUTF8RatioFull(% x) = %v, want %v", tt.data, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHasExcessiveControlChars covers the empty input, the >5% threshold
+// (excluding tab/lf/cr), and the just-below-threshold boundary.
+func TestHasExcessiveControlChars(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"empty", nil, false},
+		{"clean ascii", []byte("hello world"), false},
+		{"whitespace not counted", []byte("a\tb\nc\rd"), false},
+		{"one control in twenty is exactly 5 percent", []byte("\x01aaaaaaaaaaaaaaaaaaa"), false}, // 1/20 = 5%, not > 5%
+		{"one control in nineteen exceeds 5 percent", []byte("\x01aaaaaaaaaaaaaaaaaa"), true},    // 1/19 ≈ 5.26%
+		{"mostly control chars", []byte("\x00\x01\x02\x03\x04abc"), true},                        // 5/8
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := hasExcessiveControlChars(tt.data); got != tt.want {
+				t.Errorf("hasExcessiveControlChars(% x) = %v, want %v", tt.data, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestScoreEncodingMatchOptimized covers the UTF-8 valid/invalid special cases,
+// the unknown-charset (nil encoding) early return, and a successful non-UTF-8
+// decode through scoreDecodedData.
+func TestScoreEncodingMatchOptimized(t *testing.T) {
+	t.Parallel()
+	ed := NewEncodingDetector()
+
+	tests := []struct {
+		name        string
+		data        []byte
+		charset     string
+		isUTF8Valid bool
+		wantZero    bool // true asserts score == 0
+	}{
+		{"utf-8 valid scores positive", []byte("héllo 世界"), "utf-8", true, false},
+		{"utf-8 flagged invalid scores zero", []byte{0xFF, 0xFE, 0xFD}, "utf-8", false, true},
+		{"unknown charset scores zero", []byte("hello"), "no-such-charset-xyz", true, true},
+		{"windows-1252 decodes successfully", []byte("caf\xe9"), "windows-1252", true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := ed.scoreEncodingMatchOptimized(tt.data, tt.charset, tt.isUTF8Valid)
+			if tt.wantZero && got != 0 {
+				t.Errorf("scoreEncodingMatchOptimized(%q, %q) = %d, want 0", tt.data, tt.charset, got)
+			}
+			if !tt.wantZero && got <= 0 {
+				t.Errorf("scoreEncodingMatchOptimized(%q, %q) = %d, want > 0", tt.data, tt.charset, got)
+			}
+		})
+	}
+}

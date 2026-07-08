@@ -371,12 +371,7 @@ func TestSanitizeHTML_MalformedDataURLs(t *testing.T) {
 		},
 		{
 			name:  "data URL with control characters",
-			input: "<img src=\"data:image/png;base,\x00\x01\x02\">",
-			valid: false,
-		},
-		{
-			name:  "data URL with null bytes",
-			input: "<img src=\"data:image/png;base,abc\x00def\">",
+			input: "<img src=\"data:image/png;base,\x01\x02\">",
 			valid: false,
 		},
 		{
@@ -408,6 +403,97 @@ func TestSanitizeHTML_MalformedDataURLs(t *testing.T) {
 				if strings.Contains(output, "data:") {
 					t.Errorf("malformed data URL should be removed, but found in: %s", output)
 				}
+			}
+		})
+	}
+}
+
+// captureAudit is an AuditRecorder that records the reasons URLs were blocked,
+// so data-URL validation can assert both the boolean result and the audit event.
+type captureAudit struct {
+	blockedReasons []string
+}
+
+func (c *captureAudit) RecordBlockedTag(string)          {}
+func (c *captureAudit) RecordBlockedAttr(string, string) {}
+func (c *captureAudit) RecordBlockedURL(_ string, reason string) {
+	c.blockedReasons = append(c.blockedReasons, reason)
+}
+
+// TestIsValidDataURL_ControlChars exercises isValidDataURLWithAudit at the only
+// layer where raw control bytes (including NUL) can be observed. Through
+// SanitizeHTML the HTML tokenizer rewrites NUL (\x00) to U+FFFD first, so a
+// data URL whose only "dangerous" byte is a NUL survives sanitization; that
+// case cannot be asserted via the HTML path and belongs here instead.
+func TestIsValidDataURL_ControlChars(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		url     string
+		wantOK  bool
+		wantHas bool // whether any block reason is recorded
+	}{
+		// Non-base64 payload: a single raw control byte (< 0x20) must reject.
+		{name: "nul byte in payload", url: "data:image/png;base,abc\x00def", wantOK: false, wantHas: true},
+		{name: "x01 in payload", url: "data:image/png;base,abc\x01def", wantOK: false, wantHas: true},
+		{name: "del 0x7f in payload", url: "data:image/png;base,abc\x7fdef", wantOK: false, wantHas: true},
+		{name: "vertical tab 0x0b in payload", url: "data:image/png;base,ab\x0bcd", wantOK: false, wantHas: true},
+		// Per the validator, tab (0x09), LF (0x0a) and CR (0x0d) are allowed in
+		// non-base64 payloads, so a payload carrying only those is accepted.
+		{name: "tab allowed in payload", url: "data:image/png;base,ab\tcd", wantOK: true, wantHas: false},
+		// Base64 payload: any byte outside [A-Za-z0-9+/=] plus CR/LF must reject.
+		{name: "nul byte in base64", url: "data:image/png;base64,ABCD\x00EFG=", wantOK: false, wantHas: true},
+		{name: "space in base64", url: "data:image/png;base64,ABCD EFG=", wantOK: false, wantHas: true},
+		// Valid reference cases.
+		{name: "valid base64 png", url: "data:image/png;base64,iVBORw0KGgo=", wantOK: true, wantHas: false},
+		{name: "valid font woff2", url: "data:font/woff2;base64,ABC123", wantOK: true, wantHas: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var audit captureAudit
+			got := isValidDataURLWithAudit(tt.url, &audit)
+			if got != tt.wantOK {
+				t.Errorf("isValidDataURLWithAudit(%q) = %v, want %v", tt.url, got, tt.wantOK)
+			}
+			blocked := len(audit.blockedReasons) > 0
+			if blocked != tt.wantHas {
+				t.Errorf("isValidDataURLWithAudit(%q) recorded block=%v, want %v (reasons=%v)",
+					tt.url, blocked, tt.wantHas, audit.blockedReasons)
+			}
+		})
+	}
+}
+
+// TestIsValidDataURL_Structure covers the structural rejects that precede the
+// payload scan: missing comma, comma immediately after "data:", and oversized
+// URLs. These branches of isValidDataURLWithAudit were previously unexercised.
+func TestIsValidDataURL_Structure(t *testing.T) {
+	t.Parallel()
+
+	oversize := "data:image/png;base64," + strings.Repeat("A", MaxDataURILength)
+	tests := []struct {
+		name   string
+		url    string
+		wantOK bool
+	}{
+		{name: "not a data url", url: "https://example.com/x.png", wantOK: false},
+		{name: "no comma", url: "data:image/pngbase64AAAA", wantOK: false},
+		{name: "comma right after scheme", url: "data:,hello", wantOK: false},
+		{name: "empty media type base64", url: "data:;base64,AAAA", wantOK: false},
+		{name: "empty media type plain", url: "data:,text", wantOK: false},
+		{name: "unsafe media type", url: "data:text/html,<b>", wantOK: false},
+		{name: "exceeds size limit", url: oversize, wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var audit captureAudit
+			if got := isValidDataURLWithAudit(tt.url, &audit); got != tt.wantOK {
+				t.Errorf("isValidDataURLWithAudit(%q) = %v, want %v", tt.url, got, tt.wantOK)
 			}
 		})
 	}

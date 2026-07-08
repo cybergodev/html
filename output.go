@@ -13,7 +13,7 @@ import (
 // This method configures the extractor to use markdown format for inline images and links.
 // Thread-safe: creates a config copy to avoid modifying shared state.
 func (p *Processor) ExtractToMarkdown(htmlBytes []byte) (string, error) {
-	return recoverString(func() (string, error) {
+	return recoverPanic(func() (string, error) {
 		result, err := p.extractWithFormats(htmlBytes, "markdown", "markdown")
 		if err != nil {
 			return "", err
@@ -28,7 +28,7 @@ func (p *Processor) ExtractToMarkdown(htmlBytes []byte) (string, error) {
 // This method configures the extractor to use markdown format for inline images and links.
 // Thread-safe: creates a config copy to avoid modifying shared state.
 func (p *Processor) ExtractToMarkdownFromFile(filePath string) (string, error) {
-	return recoverString(func() (string, error) {
+	return recoverPanic(func() (string, error) {
 		result, err := p.extractFromFileWithFormats(filePath, "markdown", "markdown")
 		if err != nil {
 			return "", err
@@ -42,7 +42,7 @@ func (p *Processor) ExtractToMarkdownFromFile(filePath string) (string, error) {
 // from the HTML bytes and converts it to UTF-8 before processing.
 // This method uses the processor's configuration (cache, timeout, etc.) for extraction.
 func (p *Processor) ExtractToJSON(htmlBytes []byte) ([]byte, error) {
-	return recoverBytes(func() ([]byte, error) {
+	return recoverPanic(func() ([]byte, error) {
 		result, err := p.Extract(htmlBytes)
 		if err != nil {
 			return nil, err
@@ -56,7 +56,7 @@ func (p *Processor) ExtractToJSON(htmlBytes []byte) ([]byte, error) {
 // from the HTML file and converts it to UTF-8 before processing.
 // This method uses the processor's configuration (cache, timeout, etc.) for extraction.
 func (p *Processor) ExtractToJSONFromFile(filePath string) ([]byte, error) {
-	return recoverBytes(func() ([]byte, error) {
+	return recoverPanic(func() ([]byte, error) {
 		result, err := p.ExtractFromFile(filePath)
 		if err != nil {
 			return nil, err
@@ -70,7 +70,7 @@ func (p *Processor) ExtractToJSONFromFile(filePath string) ([]byte, error) {
 // from the HTML bytes and converts it to UTF-8 before processing.
 // Thread-safe: creates a config copy to avoid modifying shared state.
 func (p *Processor) ExtractToMarkdownWithContext(ctx context.Context, htmlBytes []byte) (string, error) {
-	return recoverString(func() (string, error) {
+	return recoverPanic(func() (string, error) {
 		result, err := p.extractWithFormatsWithContext(ctx, htmlBytes, "markdown", "markdown")
 		if err != nil {
 			return "", err
@@ -84,7 +84,7 @@ func (p *Processor) ExtractToMarkdownWithContext(ctx context.Context, htmlBytes 
 // from the HTML file and converts it to UTF-8 before processing.
 // Thread-safe: creates a config copy to avoid modifying shared state.
 func (p *Processor) ExtractToMarkdownFromFileWithContext(ctx context.Context, filePath string) (string, error) {
-	return recoverString(func() (string, error) {
+	return recoverPanic(func() (string, error) {
 		result, err := p.extractFromFileWithFormatsWithContext(ctx, filePath, "markdown", "markdown")
 		if err != nil {
 			return "", err
@@ -97,7 +97,7 @@ func (p *Processor) ExtractToMarkdownFromFileWithContext(ctx context.Context, fi
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML bytes and converts it to UTF-8 before processing.
 func (p *Processor) ExtractToJSONWithContext(ctx context.Context, htmlBytes []byte) ([]byte, error) {
-	return recoverBytes(func() ([]byte, error) {
+	return recoverPanic(func() ([]byte, error) {
 		result, err := p.ExtractWithContext(ctx, htmlBytes)
 		if err != nil {
 			return nil, err
@@ -110,7 +110,7 @@ func (p *Processor) ExtractToJSONWithContext(ctx context.Context, htmlBytes []by
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML file and converts it to UTF-8 before processing.
 func (p *Processor) ExtractToJSONFromFileWithContext(ctx context.Context, filePath string) ([]byte, error) {
-	return recoverBytes(func() ([]byte, error) {
+	return recoverPanic(func() ([]byte, error) {
 		result, err := p.ExtractFromFileWithContext(ctx, filePath)
 		if err != nil {
 			return nil, err

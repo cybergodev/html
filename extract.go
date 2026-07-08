@@ -88,12 +88,9 @@ func recoverPanic[T any](fn func() (T, error)) (result T, err error) {
 	return fn()
 }
 
-func recoverResult(fn func() (*Result, error)) (*Result, error) { return recoverPanic(fn) }
-func recoverLinks(fn func() ([]LinkResource, error)) ([]LinkResource, error) {
-	return recoverPanic(fn)
-}
-func recoverString(fn func() (string, error)) (string, error) { return recoverPanic(fn) }
-func recoverBytes(fn func() ([]byte, error)) ([]byte, error)  { return recoverPanic(fn) }
+// (recoverResult/recoverLinks/recoverString/recoverBytes were one-line wrappers
+// around the generic recoverPanic[T]; removed — Go infers T from the func literal
+// at each call site, so callers now invoke recoverPanic directly.)
 
 // Extract extracts content from HTML bytes with automatic encoding detection.
 // This is a convenience function that uses a pooled Processor for efficiency.
@@ -271,7 +268,7 @@ func ExtractFromFileWithContext(ctx context.Context, filePath string, cfg ...Con
 //   - ErrProcessingTimeout if processing exceeds ProcessingTimeout
 //   - ErrInternalPanic if an unexpected internal panic is recovered
 func (p *Processor) Extract(htmlBytes []byte) (*Result, error) {
-	return recoverResult(func() (*Result, error) {
+	return recoverPanic(func() (*Result, error) {
 		return p.extractCoreWithContext(context.Background(), htmlBytes)
 	})
 }
@@ -296,7 +293,7 @@ func (p *Processor) Extract(htmlBytes []byte) (*Result, error) {
 // In addition to the errors returned by [Processor.Extract], this method returns
 // context.Canceled or context.DeadlineExceeded when ctx is cancelled.
 func (p *Processor) ExtractWithContext(ctx context.Context, htmlBytes []byte) (*Result, error) {
-	return recoverResult(func() (*Result, error) {
+	return recoverPanic(func() (*Result, error) {
 		return p.extractCoreWithContext(ctx, htmlBytes)
 	})
 }
@@ -484,7 +481,7 @@ func (p *Processor) processContentWithContext(ctx context.Context, htmlContent s
 // from the HTML file and converts it to UTF-8 before processing.
 // Use this when you have a file path instead of raw bytes.
 func (p *Processor) ExtractFromFile(filePath string) (*Result, error) {
-	return recoverResult(func() (*Result, error) {
+	return recoverPanic(func() (*Result, error) {
 		// Validate processor state (no input size check for file paths)
 		if p == nil || p.closed.Load() {
 			return nil, ErrProcessorClosed
@@ -510,7 +507,7 @@ func (p *Processor) ExtractFromFile(filePath string) (*Result, error) {
 //
 //	result, err := processor.ExtractFromFileWithContext(ctx, "page.html")
 func (p *Processor) ExtractFromFileWithContext(ctx context.Context, filePath string) (*Result, error) {
-	return recoverResult(func() (*Result, error) {
+	return recoverPanic(func() (*Result, error) {
 		// Early cancellation check
 		select {
 		case <-ctx.Done():
@@ -746,8 +743,7 @@ func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string) 
 
 	// Use placeholder path if either image or link format is not "none"
 	if imageFormat != "none" || linkFormat != "none" {
-		images := p.extractImagesWithPosition(contentNode)
-		links := p.extractLinksWithPosition(contentNode)
+		images, links := p.extractImagesAndLinks(contentNode, true, true)
 
 		if p.config.PreserveImages {
 			result.Images = images
@@ -770,11 +766,12 @@ func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string) 
 	} else {
 		result.Text = p.extractTextContent(contentNode, p.config.TableFormat)
 
+		images, links := p.extractImagesAndLinks(contentNode, p.config.PreserveImages, p.config.PreserveLinks)
 		if p.config.PreserveImages {
-			result.Images = p.extractImagesWithPosition(contentNode)
+			result.Images = images
 		}
 		if p.config.PreserveLinks {
-			result.Links = p.extractLinksWithPosition(contentNode)
+			result.Links = links
 		}
 	}
 
@@ -847,7 +844,14 @@ func (p *Processor) extractArticleNode(doc *stdxhtml.Node) *stdxhtml.Node {
 	candidates := make(map[*stdxhtml.Node]int, initialMapCap)
 
 	internal.WalkNodes(doc, func(n *stdxhtml.Node) bool {
-		if n.Type == stdxhtml.ElementNode {
+		// Only score elements that can plausibly be an article root. Inline/
+		// phrasing/media tags (a, span, em, img, br, …) have tiny subtrees that
+		// never win SelectBestCandidate, and Score() walks the full subtree of
+		// every candidate (collectContentMetrics), so skipping them avoids an
+		// O(N×subtree) traversal surge with no change to the selected node. Score
+		// already short-circuits 'p' and IsNonContentElement tags the same way;
+		// this only broadens that skip. Custom/namespaced/block tags still score.
+		if n.Type == stdxhtml.ElementNode && !internal.IsInlineElement(n.Data) {
 			if score := p.scorer.Score(n); score > 0 {
 				candidates[n] = score
 			}
@@ -1041,22 +1045,60 @@ func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkI
 	return sb.String()
 }
 
-func (p *Processor) extractImagesWithPosition(node *stdxhtml.Node) []ImageInfo {
-	images := make([]ImageInfo, 0, initialSliceCap)
-	position := 0
+// extractImagesAndLinks collects images and/or links from node in a single
+// document-order traversal, assigning positions with the same semantics the
+// previous separate collectors used:
+//   - image positions count only <img> with a valid src (parseImageNode accepts),
+//     keeping them contiguous and in lockstep with the [IMAGE:n] placeholders the
+//     text pass emits (which guards on imgHasValidSrc).
+//   - link positions count every <a> (invalid-href anchors still consume a
+//     number but are not appended), matching the [LINK:n] placeholders the text
+//     pass emits.
+//
+// The two counters are independent, so one walk yields the same results as the
+// previous two. Pass wantImages/wantLinks false to skip (and avoid allocating)
+// a kind; the traversal runs at most once.
+func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantLinks bool) (images []ImageInfo, links []LinkInfo) {
+	if wantImages {
+		images = make([]ImageInfo, 0, initialSliceCap)
+	}
+	if wantLinks {
+		links = make([]LinkInfo, 0, initialSliceCap)
+	}
+	if !wantImages && !wantLinks {
+		return images, links
+	}
 
+	imgPos, linkPos := 0, 0
 	internal.WalkNodes(node, func(n *stdxhtml.Node) bool {
-		if n.Type == stdxhtml.ElementNode && n.Data == "img" {
-			position++
-			img := p.parseImageNode(n, position)
-			if img.URL != "" {
-				images = append(images, img)
+		if n.Type != stdxhtml.ElementNode {
+			return true
+		}
+		switch n.Data {
+		case "img":
+			if !wantImages {
+				return true
+			}
+			img := p.parseImageNode(n, imgPos+1)
+			if img.URL == "" {
+				return true
+			}
+			imgPos++
+			images = append(images, img)
+		case "a":
+			if !wantLinks {
+				return true
+			}
+			linkPos++
+			link := p.parseLinkNode(n)
+			link.Position = linkPos
+			if link.URL != "" {
+				links = append(links, link)
 			}
 		}
 		return true
 	})
-
-	return images
+	return images, links
 }
 
 func (p *Processor) parseImageNode(n *stdxhtml.Node, position int) ImageInfo {
@@ -1086,25 +1128,6 @@ func (p *Processor) parseImageNode(n *stdxhtml.Node, position int) ImageInfo {
 
 	img.IsDecorative = img.Alt == ""
 	return img
-}
-
-func (p *Processor) extractLinksWithPosition(node *stdxhtml.Node) []LinkInfo {
-	links := make([]LinkInfo, 0, initialSliceCap)
-	position := 0
-
-	internal.WalkNodes(node, func(n *stdxhtml.Node) bool {
-		if n.Type == stdxhtml.ElementNode && n.Data == "a" {
-			position++
-			link := p.parseLinkNode(n)
-			link.Position = position
-			if link.URL != "" {
-				links = append(links, link)
-			}
-		}
-		return true
-	})
-
-	return links
 }
 
 func (p *Processor) parseLinkNode(n *stdxhtml.Node) LinkInfo {

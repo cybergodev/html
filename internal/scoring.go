@@ -56,9 +56,10 @@ func collectContentMetrics(node *html.Node) contentMetrics {
 			data := n.Data
 			dataLen := len(data)
 
-			// Fast path: check if any NBSP present (UTF-8: 0xC2 0xA0)
-			// SECURITY: Use clear boundary condition i+1 < dataLen instead of i < dataLen-1
-			// to avoid potential underflow issues with empty strings and improve readability.
+			// Fast path: check if any NBSP present (UTF-8: 0xC2 0xA0).
+			// The i+1 < dataLen boundary (rather than i < dataLen-1) reads more
+			// naturally as "there is a pair starting at i" and sidesteps the
+			// dataLen == 0 edge case without a separate guard.
 			hasNBSP := false
 			for i := 0; i+1 < dataLen; i++ {
 				if data[i] == 0xC2 && data[i+1] == 0xA0 {

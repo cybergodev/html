@@ -107,7 +107,7 @@ func TestNewBlockElementsSpacing(t *testing.T) {
 		},
 		{
 			name: "figcaption element adds paragraph spacing",
-			html: `<img src=\"test.jpg\"><figcaption>Caption</figcaption><p>Text</p>`,
+			html: `<img src="test.jpg"><figcaption>Caption</figcaption><p>Text</p>`,
 			want: "[IMAGE:1]\nCaption\n\nText",
 			desc: "Figcaption elements should create paragraph separation",
 		},
@@ -168,7 +168,9 @@ func TestNewBlockElementsSpacing(t *testing.T) {
 		{
 			name: "tbody does not add paragraph spacing",
 			html: `<table><tr><td>Row 1</td></tr></table><p>Text</p>`,
-			want: "| Row 1 |\n| --- |\n\n\nText", // Table followed by text with paragraph spacing
+			// Headerless table (no <th>): an empty header row is synthesized so
+			// the real "Row 1" is rendered as data rather than promoted to a header.
+			want: "|       |\n| --- |\n| Row 1 |\n\n\nText",
 			desc: "Table structure should not add extra paragraph spacing",
 		},
 		{

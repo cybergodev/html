@@ -513,7 +513,7 @@ type AudioInfo struct {
 type LinkResource struct {
     URL   string
     Title string
-    Type  string // "css", "js", "image", "video", "audio", "icon", "link"
+    Type  string // "link", "image", "video", "audio", "css", "js", "icon", "media"
 }
 
 type NodeAttr struct {
@@ -608,7 +608,7 @@ type Config struct {
 ## 🔒 Security Features
 
 ### HTML Sanitization
-- **Dangerous Tag Removal**: `<script>`, `<style>`, `<noscript>`, `<iframe>`, `<embed>`, `<object>`, `<form>`, `<input>`, `<button>`, `<svg>`, `<math>`
+- **Dangerous Tag Removal**: `<script>`, `<style>`, `<noscript>`, `<iframe>`, `<embed>`, `<object>`, `<input>`, `<button>`, `<svg>`, `<math>` (the `<form>` container is intentionally preserved — only its controls are stripped)
 - **Event Handler Removal**: All `on*` attributes (onclick, onerror, onload, etc.)
 - **Dangerous Protocol Blocking**: `javascript:`, `vbscript:`, `data:` (except safe media types)
 - **XSS Protection**: Comprehensive sanitization

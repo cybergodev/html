@@ -5,6 +5,7 @@ package internal
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"regexp"
 	"strings"
@@ -473,20 +474,24 @@ func (ed *EncodingDetector) DetectCharsetSmart(data []byte) EncodingMatch {
 func (ed *EncodingDetector) ToUTF8(data []byte, charset string) ([]byte, error) {
 	charset = normalizeCharset(charset)
 
-	// If already UTF-8, return as-is
-	if charset == "utf-8" || charset == "utf8" {
+	// If already UTF-8, return as-is. ("utf8", "utf_8", and other aliases are
+	// normalized to "utf-8" by normalizeCharset above, so only the canonical
+	// form can reach this point.)
+	if charset == "utf-8" {
 		return data, nil
 	}
 
 	// Get the appropriate encoding
 	enc := getEncoding(charset)
 	if enc == nil {
-		// Unknown encoding, try to return as-is if valid UTF-8
+		// Unknown encoding. If the bytes are already valid UTF-8, return them
+		// unchanged; otherwise the data cannot be decoded safely. Surface an
+		// error rather than silently returning undecodable bytes that would
+		// masquerade as successfully converted content downstream.
 		if utf8.Valid(data) {
 			return data, nil
 		}
-		// Otherwise, return with a note that encoding couldn't be determined
-		return data, nil
+		return nil, fmt.Errorf("unsupported encoding %q", charset)
 	}
 
 	// Create a transformer
@@ -850,7 +855,7 @@ func (ed *EncodingDetector) scoreEncodingMatchOptimized(data []byte, charset str
 	}
 
 	// Score the decoded result
-	return ed.scoreDecodedData(decoded, data, normalizedCharset)
+	return ed.scoreDecodedData(decoded, normalizedCharset)
 }
 
 // scoreEncodingMatch scores how well a charset matches the data
@@ -880,9 +885,7 @@ func (ed *EncodingDetector) scoreUTF8(data []byte) int {
 }
 
 // scoreDecodedData scores decoded data from non-UTF-8 encodings.
-// The original parameter is reserved for future use (e.g., comparing decoded vs original
-// to detect encoding quality issues) and is currently unused.
-func (ed *EncodingDetector) scoreDecodedData(decoded, _ []byte, charset string) int {
+func (ed *EncodingDetector) scoreDecodedData(decoded []byte, charset string) int {
 	score := 0
 
 	// Base score for successful decoding
