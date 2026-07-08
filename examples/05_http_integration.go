@@ -107,7 +107,7 @@ func main() {
 
 	pages := make([][]byte, 3)
 	for i, path := range []string{"/article", "/blog", "/docs"} {
-		content, _ := fetchURL(server.URL + path)
+		content, _ := fetchURL(server.URL + path) // best-effort: mock server always returns valid bodies
 		pages[i] = content
 	}
 

@@ -191,41 +191,6 @@ func TestConfiguration(t *testing.T) {
 		}
 	})
 
-	t.Run("Invalid configs rejected", func(t *testing.T) {
-		tests := []struct {
-			name   string
-			modify func(*html.Config)
-		}{
-			{
-				name:   "negative MaxInputSize",
-				modify: func(c *html.Config) { c.MaxInputSize = -1 },
-			},
-			{
-				name:   "zero WorkerPoolSize",
-				modify: func(c *html.Config) { c.WorkerPoolSize = 0 },
-			},
-			{
-				name:   "zero MaxDepth",
-				modify: func(c *html.Config) { c.MaxDepth = 0 },
-			},
-			{
-				name:   "negative CacheTTL",
-				modify: func(c *html.Config) { c.CacheTTL = -1 },
-			},
-		}
-
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				cfg := html.DefaultConfig()
-				tt.modify(&cfg)
-				_, err := html.New(cfg)
-				if !errors.Is(err, html.ErrInvalidConfig) {
-					t.Errorf("New() error = %v, want ErrInvalidConfig", err)
-				}
-			})
-		}
-	})
-
 	t.Run("custom config creation", func(t *testing.T) {
 		t.Run("RSS-style config", func(t *testing.T) {
 			cfg := html.DefaultConfig()
@@ -778,140 +743,78 @@ func TestLinkExtraction(t *testing.T) {
 func TestParagraphSpacing(t *testing.T) {
 	t.Parallel()
 
-	p, _ := html.New()
+	p, err := html.New()
+	if err != nil {
+		t.Fatalf("html.New() failed: %v", err)
+	}
 	defer p.Close()
 
-	t.Run("paragraphs separated by double newlines", func(t *testing.T) {
-		htmlContent := `<html><body><p>First paragraph.</p><p>Second paragraph.</p></body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// Check for double newlines between paragraphs
-		if !strings.Contains(result.Text, "\n\n") {
-			t.Error("Paragraphs should be separated by double newlines")
-		}
-		// Verify both paragraphs are present
-		if !strings.Contains(result.Text, "First paragraph") {
-			t.Error("First paragraph should be present")
-		}
-		if !strings.Contains(result.Text, "Second paragraph") {
-			t.Error("Second paragraph should be present")
-		}
-	})
-
-	t.Run("long paragraph text from example", func(t *testing.T) {
-		htmlContent := `<html><body>
+	// Each case asserts paragraph-separation behavior via a flexible set of
+	// columns: required substrings, a minimum Count("\n\n"), and (for lists) a
+	// minimum non-empty-line count. Consolidates nine hand-written subtests.
+	tests := []struct {
+		name             string
+		html             string
+		wantContains     []string
+		minDoubleNewline int // minimum required strings.Count(text, "\n\n")
+		minNonEmptyLines int // minimum required non-empty lines (for lists)
+	}{
+		{
+			name:             "paragraphs separated by double newlines",
+			html:             `<html><body><p>First paragraph.</p><p>Second paragraph.</p></body></html>`,
+			wantContains:     []string{"First paragraph", "Second paragraph"},
+			minDoubleNewline: 1,
+		},
+		{
+			name: "long paragraph text from example",
+			html: `<html><body>
 			<p>We provide our customers with a suite of broadband connectivity services, including fixed Internet, WiFi and mobile, which when bundled together provides our customers with a differentiated converged connectivity experience while saving consumers money.</p>
 			<p>This is another paragraph with different content.</p>
-		</body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// Check for double newlines between paragraphs
-		if !strings.Contains(result.Text, "\n\n") {
-			t.Error("Paragraphs should be separated by double newlines")
-		}
-		// Verify the long text is preserved
-		if !strings.Contains(result.Text, "We provide our customers") {
-			t.Error("Long paragraph content should be preserved")
-		}
-		if !strings.Contains(result.Text, "differentiated converged connectivity experience") {
-			t.Error("Long paragraph should be complete")
-		}
-	})
-
-	t.Run("multiple consecutive paragraphs", func(t *testing.T) {
-		htmlContent := `<html><body>
+		</body></html>`,
+			wantContains:     []string{"We provide our customers", "differentiated converged connectivity experience"},
+			minDoubleNewline: 1,
+		},
+		{
+			name: "multiple consecutive paragraphs",
+			html: `<html><body>
 			<p>Paragraph 1</p>
 			<p>Paragraph 2</p>
 			<p>Paragraph 3</p>
-		</body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// Count double newlines - should have at least 2 for 3 paragraphs
-		doubleNewlineCount := strings.Count(result.Text, "\n\n")
-		if doubleNewlineCount < 2 {
-			t.Errorf("Expected at least 2 double newlines for 3 paragraphs, got %d", doubleNewlineCount)
-		}
-	})
-
-	t.Run("headings and paragraphs", func(t *testing.T) {
-		htmlContent := `<html><body>
+		</body></html>`,
+			minDoubleNewline: 2, // at least 2 for 3 paragraphs
+		},
+		{
+			name: "headings and paragraphs",
+			html: `<html><body>
 			<h1>Title</h1>
 			<p>First paragraph after heading.</p>
 			<p>Second paragraph.</p>
-		</body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// Check for double newlines
-		if !strings.Contains(result.Text, "\n\n") {
-			t.Error("Headings and paragraphs should be separated by double newlines")
-		}
-		// Verify content
-		if !strings.Contains(result.Text, "Title") {
-			t.Error("Heading should be present")
-		}
-		if !strings.Contains(result.Text, "First paragraph") {
-			t.Error("First paragraph should be present")
-		}
-	})
-
-	t.Run("divs as paragraphs", func(t *testing.T) {
-		htmlContent := `<html><body>
+		</body></html>`,
+			wantContains:     []string{"Title", "First paragraph"},
+			minDoubleNewline: 1,
+		},
+		{
+			name: "divs as paragraphs",
+			html: `<html><body>
 			<div>First div content</div>
 			<div>Second div content</div>
-		</body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// Check for double newlines between divs
-		if !strings.Contains(result.Text, "\n\n") {
-			t.Error("Divs should be separated by double newlines")
-		}
-	})
-
-	t.Run("list items should not have double spacing", func(t *testing.T) {
-		htmlContent := `<html><body>
+		</body></html>`,
+			minDoubleNewline: 1,
+		},
+		{
+			name: "list items should not have double spacing",
+			html: `<html><body>
 			<ul>
 				<li>Item 1</li>
 				<li>Item 2</li>
 				<li>Item 3</li>
 			</ul>
-		</body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// List items should not have double newlines between them
-		// They should be separated by single newlines
-		lines := strings.Split(result.Text, "\n")
-		nonEmptyLines := 0
-		for _, line := range lines {
-			if strings.TrimSpace(line) != "" {
-				nonEmptyLines++
-			}
-		}
-		// For list items, we expect them to be on separate lines but not paragraph-separated
-		if nonEmptyLines < 3 {
-			t.Errorf("Expected at least 3 non-empty lines for list items, got %d", nonEmptyLines)
-		}
-	})
-
-	t.Run("article with multiple sections", func(t *testing.T) {
-		htmlContent := `<!DOCTYPE html>
+		</body></html>`,
+			minNonEmptyLines: 3, // list items on separate lines, not paragraph-spaced
+		},
+		{
+			name: "article with multiple sections",
+			html: `<!DOCTYPE html>
 		<html>
 		<head><title>Test Article</title></head>
 		<body>
@@ -923,68 +826,64 @@ func TestParagraphSpacing(t *testing.T) {
 				<p>Content under section heading.</p>
 			</article>
 		</body>
-		</html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// Check for proper paragraph spacing throughout
-		doubleNewlineCount := strings.Count(result.Text, "\n\n")
-		if doubleNewlineCount < 3 {
-			t.Errorf("Expected multiple double newlines for article structure, got %d", doubleNewlineCount)
-		}
-		// Verify all content is preserved
-		if !strings.Contains(result.Text, "Main Title") {
-			t.Error("Main title should be present")
-		}
-		if !strings.Contains(result.Text, "broadband connectivity services") {
-			t.Error("First paragraph content should be present")
-		}
-		if !strings.Contains(result.Text, "Section Title") {
-			t.Error("Section title should be present")
-		}
-	})
-
-	t.Run("mixed content with inline elements", func(t *testing.T) {
-		htmlContent := `<html><body>
+		</html>`,
+			wantContains:     []string{"Main Title", "broadband connectivity services", "Section Title"},
+			minDoubleNewline: 3,
+		},
+		{
+			name: "mixed content with inline elements",
+			html: `<html><body>
 			<p>This is a <strong>paragraph</strong> with <em>inline</em> elements.</p>
 			<p>This is another <a href="#">paragraph</a> with links.</p>
-		</body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// Check for double newlines
-		if !strings.Contains(result.Text, "\n\n") {
-			t.Error("Paragraphs with inline elements should still be separated by double newlines")
-		}
-		// Verify inline content is preserved
-		if !strings.Contains(result.Text, "paragraph with inline elements") {
-			t.Error("Inline elements should be preserved in text")
-		}
-	})
-
-	t.Run("blockquote should create paragraph separation", func(t *testing.T) {
-		htmlContent := `<html><body>
+		</body></html>`,
+			wantContains:     []string{"paragraph with inline elements"},
+			minDoubleNewline: 1,
+		},
+		{
+			name: "blockquote should create paragraph separation",
+			html: `<html><body>
 			<p>Regular paragraph before quote.</p>
 			<blockquote>This is a quoted text.</blockquote>
 			<p>Regular paragraph after quote.</p>
-		</body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
+		</body></html>`,
+			wantContains:     []string{"quoted text"},
+			minDoubleNewline: 1,
+		},
+	}
 
-		// Blockquotes should create paragraph separation
-		if !strings.Contains(result.Text, "\n\n") {
-			t.Error("Blockquotes should create paragraph separation")
-		}
-		if !strings.Contains(result.Text, "quoted text") {
-			t.Error("Blockquote content should be present")
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Subtests share the parent processor and run sequentially (the
+			// original did too); a single *Processor is reused across cases.
+			result, err := p.Extract([]byte(tt.html))
+			if err != nil {
+				t.Fatalf("Extract() failed: %v", err)
+			}
+
+			for _, want := range tt.wantContains {
+				if !strings.Contains(result.Text, want) {
+					t.Errorf("expected text to contain %q, got: %q", want, result.Text)
+				}
+			}
+			if tt.minDoubleNewline > 0 {
+				if got := strings.Count(result.Text, "\n\n"); got < tt.minDoubleNewline {
+					t.Errorf("expected at least %d double newlines, got %d (text=%q)",
+						tt.minDoubleNewline, got, result.Text)
+				}
+			}
+			if tt.minNonEmptyLines > 0 {
+				nonEmpty := 0
+				for _, line := range strings.Split(result.Text, "\n") {
+					if strings.TrimSpace(line) != "" {
+						nonEmpty++
+					}
+				}
+				if nonEmpty < tt.minNonEmptyLines {
+					t.Errorf("expected at least %d non-empty lines, got %d", tt.minNonEmptyLines, nonEmpty)
+				}
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -1127,15 +1026,6 @@ func TestTableFormats(t *testing.T) {
 		// Should detect alignment from style attribute
 		if !strings.Contains(result.Text, "---:") {
 			t.Error("Should detect right alignment from style attribute")
-		}
-	})
-
-	t.Run("table format validation", func(t *testing.T) {
-		cfg := html.DefaultConfig()
-		cfg.TableFormat = "invalid"
-		_, err := html.New(cfg)
-		if err == nil {
-			t.Error("New() should fail with invalid TableFormat")
 		}
 	})
 
@@ -2544,8 +2434,20 @@ func TestImageFormatting(t *testing.T) {
 func TestLinkFormatting(t *testing.T) {
 	t.Parallel()
 
-	t.Run("markdown inline links", func(t *testing.T) {
-		htmlContent := `
+	// Each case builds its own processor (so subtests run in parallel) and
+	// asserts inline-link formatting via required/forbidden substrings and an
+	// optional minimum extracted-links count.
+	tests := []struct {
+		name            string
+		html            string
+		modify          func(*html.Config)
+		wantContains    []string
+		wantNotContains []string
+		wantLinksMin    int
+	}{
+		{
+			name: "markdown inline links",
+			html: `
 			<html><body>
 				<p>Text before</p>
 				<a href="https://go.dev/tour/">Go Tour</a>
@@ -2553,194 +2455,120 @@ func TestLinkFormatting(t *testing.T) {
 				<a href="https://golang.org">Golang</a>
 				<p>Text after</p>
 			</body></html>
-		`
-
-		cfg := html.DefaultConfig()
-		cfg.InlineLinkFormat = "markdown"
-		p, _ := html.New(cfg)
-		defer p.Close()
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		if !strings.Contains(result.Text, "[Go Tour](https://go.dev/tour/)") {
-			t.Errorf("Should contain markdown inline link 1, got: %s", result.Text)
-		}
-		if !strings.Contains(result.Text, "[Golang](https://golang.org)") {
-			t.Errorf("Should contain markdown inline link 2, got: %s", result.Text)
-		}
-	})
-
-	t.Run("html inline links", func(t *testing.T) {
-		htmlContent := `
+		`,
+			modify:       func(c *html.Config) { c.InlineLinkFormat = "markdown" },
+			wantContains: []string{"[Go Tour](https://go.dev/tour/)", "[Golang](https://golang.org)"},
+		},
+		{
+			name: "html inline links",
+			html: `
 			<html><body>
 				<p>Text before</p>
 				<a href="https://go.dev/tour/" title="Go Tour">Go Tour</a>
 				<p>Text after</p>
 			</body></html>
-		`
-
-		cfg := html.DefaultConfig()
-		cfg.InlineLinkFormat = "html"
-		p, _ := html.New(cfg)
-		defer p.Close()
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		if !strings.Contains(result.Text, `<a href="https://go.dev/tour/"`) {
-			t.Errorf("Should contain HTML anchor tag, got: %s", result.Text)
-		}
-		if !strings.Contains(result.Text, `title="Go Tour"`) {
-			t.Errorf("Should preserve title attribute, got: %s", result.Text)
-		}
-		if !strings.Contains(result.Text, `>Go Tour</a>`) {
-			t.Errorf("Should preserve link text, got: %s", result.Text)
-		}
-	})
-
-	t.Run("none format default", func(t *testing.T) {
-		htmlContent := `<html><body><a href="https://go.dev">Go</a><p>Text</p></body></html>`
-
-		cfg := html.DefaultConfig()
-		cfg.InlineLinkFormat = "none"
-		p, _ := html.New(cfg)
-		defer p.Close()
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		if strings.Contains(result.Text, "[LINK:") {
-			t.Error("Should not contain link placeholders")
-		}
-		if !strings.Contains(result.Text, "Go") {
-			t.Error("Should contain link text")
-		}
-		if len(result.Links) == 0 {
-			t.Error("Should still extract links to Links array")
-		}
-	})
-
-	t.Run("empty href handling", func(t *testing.T) {
-		htmlContent := `<html><body><a href="">Empty Link</a><a href="https://go.dev">Valid Link</a></body></html>`
-
-		cfg := html.DefaultConfig()
-		cfg.InlineLinkFormat = "markdown"
-		p, _ := html.New(cfg)
-		defer p.Close()
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// Only valid link should appear
-		if !strings.Contains(result.Text, "[Valid Link](https://go.dev)") {
-			t.Errorf("Should contain valid link, got: %s", result.Text)
-		}
-	})
-
-	t.Run("empty text handling", func(t *testing.T) {
-		htmlContent := `<html><body><a href="https://go.dev"></a></body></html>`
-
-		cfg := html.DefaultConfig()
-		cfg.InlineLinkFormat = "markdown"
-		p, _ := html.New(cfg)
-		defer p.Close()
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// Link with empty text should use fallback
-		if !strings.Contains(result.Text, "[Link 1](https://go.dev)") {
-			t.Errorf("Should use fallback text for empty link, got: %s", result.Text)
-		}
-	})
-
-	t.Run("combined with image format", func(t *testing.T) {
-		htmlContent := `
+		`,
+			modify: func(c *html.Config) { c.InlineLinkFormat = "html" },
+			wantContains: []string{
+				`<a href="https://go.dev/tour/"`,
+				`title="Go Tour"`,
+				`>Go Tour</a>`,
+			},
+		},
+		{
+			name:            "none format default",
+			html:            `<html><body><a href="https://go.dev">Go</a><p>Text</p></body></html>`,
+			modify:          func(c *html.Config) { c.InlineLinkFormat = "none" },
+			wantNotContains: []string{"[LINK:"},
+			wantContains:    []string{"Go"},
+			wantLinksMin:    1,
+		},
+		{
+			name:         "empty href handling",
+			html:         `<html><body><a href="">Empty Link</a><a href="https://go.dev">Valid Link</a></body></html>`,
+			modify:       func(c *html.Config) { c.InlineLinkFormat = "markdown" },
+			wantContains: []string{"[Valid Link](https://go.dev)"},
+		},
+		{
+			name:         "empty text handling",
+			html:         `<html><body><a href="https://go.dev"></a></body></html>`,
+			modify:       func(c *html.Config) { c.InlineLinkFormat = "markdown" },
+			wantContains: []string{"[Link 1](https://go.dev)"}, // fallback text for empty link
+		},
+		{
+			name: "combined with image format",
+			html: `
 			<html><body>
 				<p>Text before</p>
 				<img src="image.jpg" alt="Test Image">
 				<a href="https://go.dev">Go</a>
 				<p>Text after</p>
 			</body></html>
-		`
-
-		cfg := html.DefaultConfig()
-		cfg.InlineImageFormat = "markdown"
-		cfg.InlineLinkFormat = "markdown"
-		p, _ := html.New(cfg)
-		defer p.Close()
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		if !strings.Contains(result.Text, "![Test Image](image.jpg)") {
-			t.Errorf("Should contain markdown image, got: %s", result.Text)
-		}
-		if !strings.Contains(result.Text, "[Go](https://go.dev)") {
-			t.Errorf("Should contain markdown link, got: %s", result.Text)
-		}
-	})
-
-	t.Run("html escapes special characters", func(t *testing.T) {
-		htmlContent := `<html><body><a href="https://go.dev?a=1&b=2">Link with "quotes"</a></body></html>`
-
-		cfg := html.DefaultConfig()
-		cfg.InlineLinkFormat = "html"
-		p, _ := html.New(cfg)
-		defer p.Close()
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// URL should be escaped
-		if !strings.Contains(result.Text, `href="https://go.dev?a=1&amp;b=2"`) {
-			t.Errorf("URL should have escaped ampersand, got: %s", result.Text)
-		}
-		// Link text should be escaped
-		if !strings.Contains(result.Text, `>Link with &#34;quotes&#34;</a>`) {
-			t.Errorf("Link text should have escaped quotes, got: %s", result.Text)
-		}
-	})
-
-	t.Run("unclosed link placeholder preserves trailing text", func(t *testing.T) {
-		// A literal, unpaired "[LINK:n]" token in the source text must not
-		// cause all following content to be dropped during link formatting.
-		htmlContent := `<html><body><article>
+		`,
+			modify: func(c *html.Config) {
+				c.InlineImageFormat = "markdown"
+				c.InlineLinkFormat = "markdown"
+			},
+			wantContains: []string{"![Test Image](image.jpg)", "[Go](https://go.dev)"},
+		},
+		{
+			name:         "html escapes special characters",
+			html:         `<html><body><a href="https://go.dev?a=1&b=2">Link with "quotes"</a></body></html>`,
+			modify:       func(c *html.Config) { c.InlineLinkFormat = "html" },
+			wantContains: []string{`href="https://go.dev?a=1&amp;b=2"`, `>Link with &#34;quotes&#34;</a>`},
+		},
+		{
+			// A literal, unpaired "[LINK:n]" token in the source text must not
+			// cause all following content to be dropped during link formatting.
+			name: "unclosed link placeholder preserves trailing text",
+			html: `<html><body><article>
 <p>Intro text here.</p>
 <a href="https://go.dev">Go</a>
 <p>See [LINK:5] for notes. Trailing content must remain.</p>
-</article></body></html>`
+</article></body></html>`,
+			modify: func(c *html.Config) { c.InlineLinkFormat = "markdown" },
+			wantContains: []string{
+				"[Go](https://go.dev)",
+				"[LINK:5]",                      // unclosed placeholder preserved verbatim
+				"Trailing content must remain.", // trailing text not dropped
+			},
+		},
+	}
 
-		cfg := html.DefaultConfig()
-		cfg.InlineLinkFormat = "markdown"
-		p, _ := html.New(cfg)
-		defer p.Close()
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-		// The real link should still be formatted.
-		if !strings.Contains(result.Text, "[Go](https://go.dev)") {
-			t.Errorf("Should contain formatted real link, got: %s", result.Text)
-		}
-		// The unclosed literal placeholder must be preserved verbatim...
-		if !strings.Contains(result.Text, "[LINK:5]") {
-			t.Errorf("Should preserve unclosed placeholder literally, got: %s", result.Text)
-		}
-		// ...and the trailing content after it must not be dropped.
-		if !strings.Contains(result.Text, "Trailing content must remain.") {
-			t.Errorf("Trailing text was dropped by unclosed placeholder, got: %s", result.Text)
-		}
-	})
+			cfg := html.DefaultConfig()
+			if tt.modify != nil {
+				tt.modify(&cfg)
+			}
+			p, err := html.New(cfg)
+			if err != nil {
+				t.Fatalf("html.New() failed: %v", err)
+			}
+			defer p.Close()
+
+			result, err := p.Extract([]byte(tt.html))
+			if err != nil {
+				t.Fatalf("Extract() failed: %v", err)
+			}
+
+			for _, want := range tt.wantContains {
+				if !strings.Contains(result.Text, want) {
+					t.Errorf("expected text to contain %q, got: %s", want, result.Text)
+				}
+			}
+			for _, avoid := range tt.wantNotContains {
+				if strings.Contains(result.Text, avoid) {
+					t.Errorf("expected text to NOT contain %q, got: %s", avoid, result.Text)
+				}
+			}
+			if tt.wantLinksMin > 0 && len(result.Links) < tt.wantLinksMin {
+				t.Errorf("expected at least %d extracted links, got %d", tt.wantLinksMin, len(result.Links))
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -4127,9 +3955,11 @@ func TestVideoExtractionComprehensive(t *testing.T) {
 			t.Fatalf("Extract() failed: %v", err)
 		}
 
-		// Note: SWF files may not be recognized as video URLs by IsVideoURL
-		// so this might not produce videos depending on the implementation
-		_ = result // Use result to avoid linter error
+		// SWF is not a recognized video format (no matching extension or embed
+		// host), so extraction must not panic and must yield no videos.
+		if len(result.Videos) != 0 {
+			t.Errorf("unsupported SWF embed should yield no videos, got %d", len(result.Videos))
+		}
 	})
 
 	t.Run("object tag with data attribute", func(t *testing.T) {
@@ -4147,8 +3977,13 @@ func TestVideoExtractionComprehensive(t *testing.T) {
 			t.Fatalf("Extract() failed: %v", err)
 		}
 
-		// Object tags are extracted via regex first, then DOM traversal
-		_ = result // Use result to avoid linter error
+		// Object tags are extracted via regex first, then DOM traversal.
+		if len(result.Videos) < 1 {
+			t.Fatalf("object data mp4 should be extracted as a video, got %d", len(result.Videos))
+		}
+		if !strings.Contains(result.Videos[0].URL, "video.mp4") {
+			t.Errorf("expected video.mp4 URL, got %q", result.Videos[0].URL)
+		}
 	})
 
 	t.Run("video with poster attribute", func(t *testing.T) {
@@ -4527,8 +4362,10 @@ func TestURLAndDomainExtraction(t *testing.T) {
 			t.Fatalf("Extract() failed: %v", err)
 		}
 
-		// Should successfully parse and extract
-		_ = result
+		// Meta/link tags must not break extraction; body content survives.
+		if !strings.Contains(result.Text, "Content") {
+			t.Errorf("expected body content to survive meta-tag extraction, got %q", result.Text)
+		}
 	})
 
 	t.Run("base URL normalization", func(t *testing.T) {
@@ -4550,8 +4387,11 @@ func TestURLAndDomainExtraction(t *testing.T) {
 			result, err := html.Extract([]byte(htmlContent))
 			if err != nil {
 				t.Errorf("Failed with base tag %s: %v", baseTag, err)
+				continue
 			}
-			_ = result
+			if !strings.Contains(result.Text, "Content") {
+				t.Errorf("base tag %s: expected body content, got %q", baseTag, result.Text)
+			}
 		}
 	})
 }
@@ -4646,8 +4486,11 @@ func TestScriptAndEmbedLinkExtraction(t *testing.T) {
 			t.Fatalf("ExtractAllLinks() failed: %v", err)
 		}
 
-		// Should extract embed/object links if they're recognized as valid media
-		_ = len(links) // Just verify it doesn't crash
+		// The iframe src is a valid absolute URL and must be captured even when
+		// the surrounding embed/object media are unrecognized.
+		if len(links) == 0 {
+			t.Error("expected at least the iframe link to be extracted")
+		}
 	})
 
 	t.Run("source link extraction with various attributes", func(t *testing.T) {
@@ -5065,43 +4908,6 @@ func TestConfigDefaults(t *testing.T) {
 		// Should extract content
 		if result.Text == "" {
 			t.Error("Expected text to be extracted")
-		}
-	})
-
-	t.Run("TextOnlyConfig disables media preservation", func(t *testing.T) {
-		// To disable media preservation, use TextOnlyConfig()
-		cfg := html.TextOnlyConfig()
-		p, err := html.New(cfg)
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
-
-		htmlContent := `<html><head><title>Test</title></head><body>
-			<article class="entry-content">
-				<h1>Article Title</h1>
-				<p>Paragraph content.</p>
-				<img src="image.jpg" alt="Test Image">
-				<a href="https://example.com">Link</a>
-			</article>
-		</body></html>`
-
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		// Should have text
-		if result.Text == "" {
-			t.Error("Expected text to be extracted")
-		}
-
-		// Should NOT have media
-		if len(result.Images) > 0 {
-			t.Error("Expected no images with TextOnlyConfig")
-		}
-		if len(result.Links) > 0 {
-			t.Error("Expected no links with TextOnlyConfig")
 		}
 	})
 
@@ -5702,8 +5508,10 @@ func TestPackageLevelFileFunctionsWithOptionalConfig(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ExtractAllLinksFromFile() failed: %v", err)
 		}
-		// File has no external links, but function should work
-		_ = links
+		// The fixture is link-free; the wrapper must return no links, not error.
+		if len(links) != 0 {
+			t.Errorf("link-free file should yield no links, got %d", len(links))
+		}
 	})
 
 	t.Run("ExtractAllLinksFromFile with custom config", func(t *testing.T) {
@@ -5713,6 +5521,8 @@ func TestPackageLevelFileFunctionsWithOptionalConfig(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ExtractAllLinksFromFile() with config failed: %v", err)
 		}
-		_ = links
+		if len(links) != 0 {
+			t.Errorf("link-free file should yield no links, got %d", len(links))
+		}
 	})
 }

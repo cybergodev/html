@@ -359,7 +359,7 @@ type AudioInfo struct {
 type LinkResource struct {
     URL   string // Resource URL
     Title string // Display title
-    Type  string // Resource type: "link", "image", "video", "audio", "css", "js", "icon"
+    Type  string // Resource type: "link", "image", "video", "audio", "css", "js", "icon", "media"
 }
 ```
 

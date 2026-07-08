@@ -190,7 +190,9 @@ func main() {
 	concurrentTime := time.Since(start)
 
 	fmt.Printf("Processed %d docs concurrently in %v\n", numGoroutines*docsPerGoroutine, concurrentTime)
-	fmt.Printf("(%.2f docs/sec)\n\n", float64(numGoroutines*docsPerGoroutine)/concurrentTime.Seconds())
+	// Reuse docsPerSec (not a raw division) so a sub-microsecond run reports
+	// 0 docs/sec instead of +Inf — the helper exists for exactly this case.
+	fmt.Printf("(%.2f docs/sec)\n\n", docsPerSec(numGoroutines*docsPerGoroutine, concurrentTime))
 
 	// ============================================================
 	// 6. Configuration Tuning

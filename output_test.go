@@ -4,7 +4,9 @@ package html_test
 // This file tests ExtractToMarkdown, ExtractToJSON, and Result serialization.
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -308,4 +310,133 @@ func TestOutputWithProcessor(t *testing.T) {
 			t.Error("JSON should not be empty")
 		}
 	})
+}
+
+// TestOutputWrappers_ConfigErrors drives the two shared error branches that all
+// package-level ExtractToMarkdown*/ExtractToJSON* convenience wrappers funnel
+// through:
+//
+//  1. resolveConfig rejecting >=2 variadic configs (html.ErrMultipleConfigs) —
+//     the "multiple configs" subtests. Covers resolveConfig's default branch and
+//     each wrapper's `if err != nil` early return.
+//  2. withProcessor failing when New(cfg) rejects an invalid single config —
+//     the "invalid config" subtests (the New(cfg) error path). A negative
+//     MaxInputSize is rejected by Config.Validate, so the processor is never
+//     built.
+//
+// Both paths return before any I/O or context work, so the file path passed to
+// the *FromFile variants need not exist.
+func TestOutputWrappers_ConfigErrors(t *testing.T) {
+	t.Parallel()
+
+	valid := html.DefaultConfig()
+	invalid := html.DefaultConfig()
+	invalid.MaxInputSize = -1 // Config.Validate rejects this
+	ctx := context.Background()
+	htmlBytes := []byte("<p>x</p>")
+
+	wrappers := []struct {
+		name       string
+		multi      func() error // passes two configs -> ErrMultipleConfigs
+		oneInvalid func() error // passes one invalid config -> New() failure
+	}{
+		{"ExtractToMarkdown", func() error {
+			_, err := html.ExtractToMarkdown(htmlBytes, valid, valid)
+			return err
+		}, func() error {
+			_, err := html.ExtractToMarkdown(htmlBytes, invalid)
+			return err
+		}},
+		{"ExtractToMarkdownFromFile", func() error {
+			_, err := html.ExtractToMarkdownFromFile("does-not-exist.html", valid, valid)
+			return err
+		}, func() error {
+			_, err := html.ExtractToMarkdownFromFile("does-not-exist.html", invalid)
+			return err
+		}},
+		{"ExtractToJSON", func() error {
+			_, err := html.ExtractToJSON(htmlBytes, valid, valid)
+			return err
+		}, func() error {
+			_, err := html.ExtractToJSON(htmlBytes, invalid)
+			return err
+		}},
+		{"ExtractToJSONFromFile", func() error {
+			_, err := html.ExtractToJSONFromFile("does-not-exist.html", valid, valid)
+			return err
+		}, func() error {
+			_, err := html.ExtractToJSONFromFile("does-not-exist.html", invalid)
+			return err
+		}},
+		{"ExtractToMarkdownWithContext", func() error {
+			_, err := html.ExtractToMarkdownWithContext(ctx, htmlBytes, valid, valid)
+			return err
+		}, func() error {
+			_, err := html.ExtractToMarkdownWithContext(ctx, htmlBytes, invalid)
+			return err
+		}},
+		{"ExtractToMarkdownFromFileWithContext", func() error {
+			_, err := html.ExtractToMarkdownFromFileWithContext(ctx, "does-not-exist.html", valid, valid)
+			return err
+		}, func() error {
+			_, err := html.ExtractToMarkdownFromFileWithContext(ctx, "does-not-exist.html", invalid)
+			return err
+		}},
+		{"ExtractToJSONWithContext", func() error {
+			_, err := html.ExtractToJSONWithContext(ctx, htmlBytes, valid, valid)
+			return err
+		}, func() error {
+			_, err := html.ExtractToJSONWithContext(ctx, htmlBytes, invalid)
+			return err
+		}},
+		{"ExtractToJSONFromFileWithContext", func() error {
+			_, err := html.ExtractToJSONFromFileWithContext(ctx, "does-not-exist.html", valid, valid)
+			return err
+		}, func() error {
+			_, err := html.ExtractToJSONFromFileWithContext(ctx, "does-not-exist.html", invalid)
+			return err
+		}},
+	}
+
+	for _, w := range wrappers {
+		t.Run(w.name+"/multiple configs", func(t *testing.T) {
+			t.Parallel()
+			if err := w.multi(); err == nil {
+				t.Errorf("%s with two configs: expected ErrMultipleConfigs, got nil", w.name)
+			} else if !errors.Is(err, html.ErrMultipleConfigs) {
+				t.Errorf("%s with two configs: expected ErrMultipleConfigs, got %v", w.name, err)
+			}
+		})
+		t.Run(w.name+"/invalid config", func(t *testing.T) {
+			t.Parallel()
+			if err := w.oneInvalid(); err == nil {
+				t.Errorf("%s with invalid config: expected validation error, got nil", w.name)
+			}
+		})
+	}
+}
+
+// TestProcessorOutputMethod_ContextError covers the error-return branches of the
+// *Processor output methods that wrap ExtractWithContext. An already-canceled
+// context makes the underlying extraction return ctx.Err() before doing any
+// work, exercising each method's `if err != nil { return ..., err }` path
+// (output.go) that the happy-path tests never reach.
+func TestProcessorOutputMethod_ContextError(t *testing.T) {
+	t.Parallel()
+
+	p := testutil.NewTestProcessor(t)
+
+	htmlBytes := []byte("<html><body><p>content</p></body></html>")
+
+	// ExtractToJSONWithContext: wraps p.ExtractWithContext(ctx, htmlBytes).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately so the early ctx.Done() check in extractCore fires
+
+	jsonData, err := p.ExtractToJSONWithContext(ctx, htmlBytes)
+	if err == nil {
+		t.Fatal("ExtractToJSONWithContext: expected context error, got nil")
+	}
+	if jsonData != nil {
+		t.Errorf("ExtractToJSONWithContext: expected nil JSON on error, got %d bytes", len(jsonData))
+	}
 }

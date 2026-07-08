@@ -67,12 +67,18 @@ cfg.MaxDepth = 50 // Limit nesting to 50 levels
 - **Default**: Enabled by default
 - **Scope**: Dangerous content stripped from the parsed DOM tree during a dedicated sanitization pass
 
-**Removed Tags** (11 tags):
+**Removed Tags** (10 tags):
 - `<script>`, `<style>`, `<noscript>` - Script and style containers
 - `<iframe>`, `<embed>`, `<object>` - Embedded content (potential XSS vectors)
-- `<form>`, `<input>`, `<button>` - Form elements (potential CSRF/UI redress)
+- `<input>`, `<button>` - Form controls (potential CSRF/UI redress)
 - `<svg>` - Can contain JavaScript and event handlers
 - `<math>` - Can be abused for XSS in some browsers
+
+> **Note:** The `<form>` container is intentionally **not** removed. Server frameworks
+> (ASP.NET WebForms, JSF, JSP) commonly wrap the entire page body in a single
+> `<form>`, so removing it would discard all visible content. Text extraction never
+> renders or submits forms, so only the form controls (`<input>`/`<button>`) are
+> stripped while `<form>` content is preserved.
 
 ```go
 cfg := html.DefaultConfig()
@@ -565,6 +571,21 @@ func FuzzExtract(f *testing.F) {
 
 > This section highlights security-relevant changes per release. For the complete
 > change history (features, performance, bug fixes), see [CHANGES.md](../CHANGES.md).
+
+### v1.4.4 (2026-06-26)
+- `ExtractAllLinks` and link extraction now honor `ProcessingTimeout` via cooperative cancellation; a fired deadline surfaces as `ErrProcessingTimeout` instead of running to completion — DoS hardening for the link path
+- Zero-byte cache-key sentinel replaced with an explicit `hasCacheKey` flag — a legitimately all-zero hash was previously treated as "no key" (cache-integrity fix)
+- `<form>` content is now preserved (controls `<input>`/`<button>` still dropped) — fixes empty extraction on ASP.NET/JSF/JSP pages whose body is wrapped in `<form>`
+- `RestartCleanup` resets `cleanupOnce` under `cleanupMu` and documents the caller-serialization requirement, closing a latent race on the reset path
+
+### v1.4.3 (2026-06-24)
+- Background goroutines (audit sink write, cache TTL cleanup) now recover panics, so a panicking user-supplied `AuditSink` or an internal cleanup fault can no longer crash the process
+- Audit sink writes are now synchronous on the recording goroutine, removing the unbounded-goroutine amplification an adversarial document could cause (DoS hardening)
+
+### v1.4.2 (2026-06-17)
+- Cache miss no longer returns a result aliased with the cached entry — fixes a concurrent-mutation data race that could silently corrupt the cached value
+- Depth validation now runs **before** sanitization, bounding every recursive pass to `MaxDepth` (DoS hardening against pathologically deep documents)
+- Pooled (package-level) calls no longer stop and respawn the cache cleanup goroutine on every invocation, eliminating goroutine churn
 
 ### v1.4.1 (2026-05-07)
 - `AllowedBaseDir` config field restricts file operations to paths under a specified directory

@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"sync"
 	"testing"
+
+	"golang.org/x/net/html"
 )
 
 // TestGetBuilder tests getting a strings.Builder from the pool.
@@ -505,28 +507,140 @@ func TestSetPoolDebug(t *testing.T) {
 	SetPoolDebug(true, logger)
 	defer SetPoolDebug(false, nil)
 
-	BufferPool.Put("not a buffer") //lint:ignore SA6002 intentionally using non-pointer to test pool corruption handling
-	_ = GetBuffer()                // type-assertion fallback invokes logPoolCorruption
-
-	mu.Lock()
-	wasCalled := called
-	mu.Unlock()
+	// sync.Pool may evict its per-P local cache at any GC (documented behavior).
+	// The race detector is allocation-heavy, so GC fires often and a single
+	// Put→Get round-trip no longer reliably surfaces the corrupted item: Get()
+	// can fall through to New() and return a valid *bytes.Buffer, skipping the
+	// type-assertion failure that calls logPoolCorruption. Retry until the
+	// logger fires — each attempt hits the corruption path ~70% of the time
+	// under -race, so 100 attempts makes a miss astronomically unlikely while
+	// remaining instant when the cache survives (the common case without -race).
+	const maxCorruptAttempts = 100
+	wasCalled := false
+	for i := 0; i < maxCorruptAttempts; i++ {
+		BufferPool.Put("not a buffer") //lint:ignore SA6002 intentionally using non-pointer to test pool corruption handling
+		_ = GetBuffer()                // type-assertion fallback invokes logPoolCorruption
+		mu.Lock()
+		if called {
+			wasCalled = true
+		}
+		mu.Unlock()
+		if wasCalled {
+			break
+		}
+	}
 	if !wasCalled {
-		t.Fatal("logger was not invoked despite enabled debug logging and pool corruption")
+		t.Fatalf("logger was not invoked after %d corruption attempts despite enabled debug logging", maxCorruptAttempts)
 	}
 
 	// Disable debug logging; subsequent corruption must not invoke the logger.
+	// This path is GC-independent: logPoolCorruption returns early when
+	// poolDebug is false, before touching the logger, so a single attempt
+	// suffices — but a few more exercise the disabled state more thoroughly.
 	SetPoolDebug(false, nil)
 	mu.Lock()
 	called = false
 	mu.Unlock()
 
-	BufferPool.Put("not a buffer") //lint:ignore SA6002 intentionally using non-pointer to test pool corruption handling
-	_ = GetBuffer()
-
+	for i := 0; i < maxCorruptAttempts; i++ {
+		BufferPool.Put("not a buffer") //lint:ignore SA6002 intentionally using non-pointer to test pool corruption handling
+		_ = GetBuffer()
+	}
 	mu.Lock()
-	if called {
+	invokedAfterDisable := called
+	mu.Unlock()
+	if invokedAfterDisable {
 		t.Fatal("logger was invoked after SetPoolDebug(false, nil)")
 	}
-	mu.Unlock()
+}
+
+// checkByteBufPut verifies the shared []byte-pool Put contract: nil is a no-op,
+// oversized buffers (cap > maxPooledByteCap) are dropped rather than retained,
+// and a normal buffer is retained for reuse within the same P.
+func checkByteBufPut(t *testing.T, name string, get func() *[]byte, put func(*[]byte)) {
+	t.Helper()
+
+	put(nil) // must not panic
+
+	// Oversized buffer is dropped; a subsequent get must not hand back the
+	// multi-MB backing array (cap stays within the pooled ceiling).
+	big := make([]byte, 0, maxPooledByteCap+1024)
+	put(&big)
+	fresh := get()
+	if cap(*fresh) > maxPooledByteCap {
+		t.Errorf("%s: oversized buffer (cap=%d) was retained; got cap=%d > maxPooledByteCap=%d",
+			name, cap(big), cap(*fresh), maxPooledByteCap)
+	}
+	put(fresh)
+
+	// Normal buffer is retained and reused.
+	bp := get()
+	*bp = append(*bp, "payload"...)
+	put(bp)
+	again := get()
+	if cap(*again) < len("payload") {
+		t.Errorf("%s: normal buffer was not retained (cap=%d)", name, cap(*again))
+	}
+	put(again)
+}
+
+func TestPutByteBuf_Boundaries(t *testing.T) {
+	t.Parallel()
+	checkByteBufPut(t, "PutByteBuf", GetByteBuf, PutByteBuf)
+}
+
+func TestPutTransformBuffer_Boundaries(t *testing.T) {
+	t.Parallel()
+	checkByteBufPut(t, "PutTransformBuffer", GetTransformBuffer, PutTransformBuffer)
+}
+
+func TestPutBuffer_Boundaries(t *testing.T) {
+	t.Parallel()
+
+	PutBuffer(nil) // no-op
+
+	// Oversized bytes.Buffer is dropped.
+	big := bytes.NewBuffer(make([]byte, maxPooledByteCap+1024))
+	PutBuffer(big)
+	fresh := GetBuffer()
+	if cap(fresh.Bytes()) > maxPooledByteCap {
+		t.Errorf("PutBuffer: oversized buffer retained, cap=%d", cap(fresh.Bytes()))
+	}
+	PutBuffer(fresh)
+}
+
+func TestPutNodeSlice_Boundaries(t *testing.T) {
+	t.Parallel()
+
+	PutNodeSlice(nil) // no-op
+
+	// Oversized node slice is dropped.
+	big := make([]*html.Node, 0, maxPooledNodeSliceCap+8)
+	PutNodeSlice(&big)
+	fresh := GetNodeSlice()
+	if cap(*fresh) > maxPooledNodeSliceCap {
+		t.Errorf("PutNodeSlice: oversized slice retained, cap=%d", cap(*fresh))
+	}
+	PutNodeSlice(fresh)
+}
+
+// TestPutByteBufSecureClear tests that poolSecureClear properly zeros a byte
+// scratch buffer. Mirrors the per-Put secure-clear tests; this one was missing,
+// leaving PutByteBuf's secure-clear branch uncovered.
+func TestPutByteBufSecureClear(t *testing.T) {
+	t.Parallel()
+
+	SetPoolSecureClear(true)
+	defer SetPoolSecureClear(false)
+
+	bp := GetByteBuf()
+	sensitiveData := []byte("SENSITIVE_SCRATCH_12345")
+	*bp = append(*bp, sensitiveData...)
+
+	if !bytes.Equal(*bp, sensitiveData) {
+		t.Fatalf("Expected '%s', got '%s'", sensitiveData, *bp)
+	}
+
+	// Return to pool - the secure-clear path zeroes then resets (no panic).
+	PutByteBuf(bp)
 }

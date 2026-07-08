@@ -1,4 +1,13 @@
-// renderer.go contains the Renderer interface for pluggable table output formats.
+// renderer.go defines the table Renderer interface and the format→Renderer
+// registry that processor.go dispatches through.
+//
+// Only Markdown and HTML renderers ship today, which can read as over-engineering
+// for a two-way switch. The registry is retained deliberately: the exported
+// table.Renderer, table.MarkdownRenderer and table.HTMLRenderer types form an
+// extension point that lets callers add output formats without editing the
+// processor's dispatch, and the registry mutex keeps registration safe should
+// that ever be done at run time. The default renderers are registered once in
+// init() and are immutable thereafter.
 package table
 
 import (
@@ -10,7 +19,7 @@ import (
 // Different implementations can output tables in various formats (Markdown, HTML, etc.)
 type Renderer interface {
 	// Render renders the table data to the TrackedBuilder.
-	Render(tableData [][]CellData, tb *TrackedBuilder, maxCols int, colWidths []string)
+	Render(tableData [][]CellData, tb *TrackedBuilder, maxCols int)
 	// Format returns the format name (e.g., "markdown", "html").
 	Format() string
 }
@@ -55,8 +64,8 @@ func (r *MarkdownRenderer) Format() string {
 
 // Render renders the table data in Markdown format.
 // Delegates to extractTableAsMarkdown to avoid code duplication.
-func (r *MarkdownRenderer) Render(tableData [][]CellData, tb *TrackedBuilder, maxCols int, colWidths []string) {
-	extractTableAsMarkdown(tableData, tb, maxCols, colWidths)
+func (r *MarkdownRenderer) Render(tableData [][]CellData, tb *TrackedBuilder, maxCols int) {
+	extractTableAsMarkdown(tableData, tb, maxCols)
 }
 
 // HTMLRenderer renders tables in HTML format.
@@ -69,7 +78,7 @@ func (r *HTMLRenderer) Format() string {
 
 // Render renders the table data in HTML format.
 // Delegates to extractTableAsHTML to avoid code duplication.
-func (r *HTMLRenderer) Render(tableData [][]CellData, tb *TrackedBuilder, maxCols int, colWidths []string) {
+func (r *HTMLRenderer) Render(tableData [][]CellData, tb *TrackedBuilder, maxCols int) {
 	extractTableAsHTML(tableData, tb)
 }
 

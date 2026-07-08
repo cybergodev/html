@@ -120,6 +120,67 @@ func TestExtractListMarkers(t *testing.T) {
 	}
 }
 
+// TestNestedTablesNotFlattened verifies that a "layout" table — a <table> used
+// only to wrap another <table> inside a <td> for visual layout, as commonly
+// seen on financial sites such as Finviz — does not flatten the inner data
+// table into run-on text. The inner table's rows must survive as separate
+// Markdown rows. See containsNestedTable and the table dispatch in
+// extractTextWithStructure.
+func TestNestedTablesNotFlattened(t *testing.T) {
+	t.Parallel()
+
+	// Outer layout table wraps a real 2-column, 2-row data table in its cell.
+	src := `<table><tr><td>` +
+		`<table><tr><td>A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></table>` +
+		`</td></tr></table>`
+
+	doc, err := html.Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var sb strings.Builder
+	ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
+
+	// ExtractTextWithStructureAndImages does not run CleanText, so column
+	// padding introduces runs of spaces. Collapse them for stable assertions.
+	out := collapseSpaces(sb.String())
+
+	// Inner data table must render as Markdown rows, not flattened text.
+	if !strings.Contains(out, "| A | B |") {
+		t.Errorf("expected inner table row '| A | B |', got:\n%s", out)
+	}
+	if !strings.Contains(out, "| C | D |") {
+		t.Errorf("expected inner table row '| C | D |', got:\n%s", out)
+	}
+	// The pre-fix symptom: GetTextContent concatenated adjacent cells without
+	// any separator, producing "AB" / "CD".
+	if strings.Contains(out, "AB") || strings.Contains(out, "CD") {
+		t.Errorf("inner table cells were flattened/concatenated:\n%s", out)
+	}
+}
+
+// collapseSpaces collapses runs of spaces/tabs into a single space. It mirrors
+// the whitespace compression CleanText applies, stabilizing assertions against
+// Markdown table column padding emitted by the table processor.
+func collapseSpaces(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inSpace := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ' ' || c == '\t' {
+			if !inSpace {
+				b.WriteByte(' ')
+				inSpace = true
+			}
+			continue
+		}
+		inSpace = false
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 func TestExtractTextWithStructureAndImages(t *testing.T) {
 	t.Parallel()
 

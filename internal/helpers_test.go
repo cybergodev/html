@@ -963,3 +963,140 @@ func TestReplaceEntityAt(t *testing.T) {
 		})
 	}
 }
+
+// TestReplaceNumericEntity covers decimal/hex decoding, the NBSP special case,
+// surrogate pairs, out-of-range code points, and every rejection path (no '#',
+// no semicolon, empty entity, oversized entity, invalid hex/decimal digits,
+// empty hex payload, truncated input).
+func TestReplaceNumericEntity(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		text         string
+		start        int
+		wantRepl     string
+		wantConsumed int
+	}{
+		{"decimal A", "&#65;", 0, "A", 5},
+		{"hex A lowercase", "&#x41;", 0, "A", 6},
+		{"hex A uppercase X", "&#X41;", 0, "A", 6},
+		{"nbsp becomes space", "&#160;", 0, " ", 6},
+		{"tab", "&#9;", 0, "\t", 4},
+		{"surrogate -> REPLACEMENT", "&#xD800;", 0, "�", 8},
+		{"out of range preserved as-is", "&#1114112;", 0, "&#1114112;", 10},
+		{"empty entity preserved", "&#;", 0, "&#;", 3},
+		{"hex with no digits preserved", "&#x;", 0, "&#x;", 4},
+		{"oversized entity preserved", "&#12345678901234;", 0, "&#12345678901234;", 17},
+		{"invalid hex digit preserved", "&#xZZ;", 0, "&#xZZ;", 6},
+		{"invalid decimal digit preserved", "&#12a;", 0, "&#12a;", 6},
+		{"no semicolon", "&#65", 0, "&", 1},
+		{"not a numeric entity", "&amp;", 0, "&", 1},
+		{"lone ampersand", "&", 0, "&", 1},
+		{"truncated after hash", "&#", 0, "&", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			repl, consumed := replaceNumericEntity(tt.text, tt.start)
+			if repl != tt.wantRepl || consumed != tt.wantConsumed {
+				t.Errorf("replaceNumericEntity(%q, %d) = (%q, %d), want (%q, %d)",
+					tt.text, tt.start, repl, consumed, tt.wantRepl, tt.wantConsumed)
+			}
+		})
+	}
+}
+
+// TestIsValidEntityName covers empty, alphanumeric-valid, and several invalid
+// character cases (separator, dash, non-ASCII).
+func TestIsValidEntityName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"empty", "", false},
+		{"lowercase", "amp", true},
+		{"uppercase", "AMP", true},
+		{"alphanumeric", "amp123", true},
+		{"digits only", "123", true},
+		{"semicolon invalid", "amp;", false},
+		{"dash invalid", "amp-lt", false},
+		{"non-ascii invalid", "café", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isValidEntityName(tt.in); got != tt.want {
+				t.Errorf("isValidEntityName(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExtractPaddingLeft covers nil/non-element rejection, missing/empty style,
+// no padding-left rule, and integer parsing with truncation.
+func TestExtractPaddingLeft(t *testing.T) {
+	t.Parallel()
+
+	styled := func(style string) *html.Node {
+		return &html.Node{
+			Type: html.ElementNode,
+			Data: "li",
+			Attr: []html.Attribute{{Key: "style", Val: style}},
+		}
+	}
+
+	tests := []struct {
+		name string
+		node *html.Node
+		want int
+	}{
+		{"nil node", nil, 0},
+		{"text node", &html.Node{Type: html.TextNode, Data: "x"}, 0},
+		{"element no attrs", &html.Node{Type: html.ElementNode, Data: "p"}, 0},
+		{"empty style", styled(""), 0},
+		{"style without padding-left", styled("color: red"), 0},
+		{"padding-left 40pt", styled("padding-left: 40pt"), 40},
+		{"padding-left truncates decimal", styled("padding-left: 18.9pt"), 18},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := extractPaddingLeft(tt.node); got != tt.want {
+				t.Errorf("extractPaddingLeft() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNormalizeText covers the empty fast path, the no-modification fast path,
+// the ampersand-only delegation path, and the combined NBSP/newline/entity path.
+func TestNormalizeText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"no modification", "hello world", "hello world"},
+		{"newline to space", "line1\nline2", "line1 line2"},
+		{"carriage return dropped", "a\rb", "ab"},
+		{"cr lf pair", "a\r\nb", "a b"},
+		{"nbsp to space", "a b", "a b"},
+		{"ampersand only path", "a&amp;b", "a&b"},
+		{"combined entity and newline", "x&amp;\ny", "x& y"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := normalizeText(tt.in); got != tt.want {
+				t.Errorf("normalizeText(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

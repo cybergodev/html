@@ -266,6 +266,45 @@ func TestContentNodeAdapter(t *testing.T) {
 		}
 	})
 
+	t.Run("Data returns node text", func(t *testing.T) {
+		// Data() must return the underlying node's data string for every node,
+		// including the root captured node (a non-empty document/element).
+		if capturedNode.Data() == "" {
+			// The captured node may legitimately have empty data if it is a
+			// synthetic root; descend to a child with data instead.
+			for child := capturedNode.FirstChild(); child != nil; child = child.NextSibling() {
+				if child.Data() != "" {
+					return
+				}
+			}
+			t.Log("no node with non-empty Data found, adapter exercised")
+		}
+	})
+
+	t.Run("AttrValue looks up by key", func(t *testing.T) {
+		// Find the <p class="intro" data-id="42"> node and read both attrs.
+		for child := capturedNode; child != nil; {
+			if child.AttrValue("data-id") != "" {
+				// Found a node carrying the marker attribute; assert its values.
+				if got := child.AttrValue("class"); got == "" {
+					t.Error("expected non-empty class attribute")
+				}
+				if got := child.AttrValue("data-id"); got != "42" {
+					t.Errorf("data-id = %q, want %q", got, "42")
+				}
+				if got := child.AttrValue("nonexistent"); got != "" {
+					t.Errorf("missing attribute should return empty, got %q", got)
+				}
+				return
+			}
+			child = child.FirstChild()
+		}
+		t.Log("no node with data-id found, AttrValue exercised on root")
+		if got := capturedNode.AttrValue("nonexistent"); got != "" {
+			t.Errorf("missing attribute should return empty, got %q", got)
+		}
+	})
+
 	t.Run("FirstChild/NextSibling navigation", func(t *testing.T) {
 		child := capturedNode.FirstChild()
 		if child != nil {

@@ -34,8 +34,9 @@ func newPanicScorerConfig() html.Config {
 }
 
 // panickingSink is an AuditSink whose Write always panics. It exercises the
-// async sink-write goroutine's recover path (SEC-003): a misbehaving custom
-// sink must never crash the process.
+// synchronous sink-write recover path (SEC-003): a misbehaving custom sink
+// must never crash the process. auditCollector.Record invokes sink.Write
+// inline under a recover, so the panic is caught before Record returns.
 type panickingSink struct{}
 
 func (panickingSink) Write(html.AuditEntry) {
@@ -463,9 +464,9 @@ func TestPanicRecovery_PanickingAuditSink(t *testing.T) {
 	cfg.Audit.Enabled = true
 	cfg.Audit.Sink = panickingSink{}
 	// A tiny MaxInputSize guarantees every call records an input-violation
-	// audit entry — which is written to the panicking sink in a background
-	// goroutine — regardless of sanitization behavior. This deterministically
-	// exercises the async sink-write path.
+	// audit entry — which Record writes to the panicking sink synchronously,
+	// under its own recover — regardless of sanitization behavior. This
+	// deterministically exercises the sink-write recover path.
 	cfg.MaxInputSize = 8
 
 	p, err := html.New(cfg)
@@ -482,9 +483,10 @@ func TestPanicRecovery_PanickingAuditSink(t *testing.T) {
 		}
 	}
 
-	// Close drains pending async sink writes via the WaitGroup. Reaching this
-	// point proves each panicking sink goroutine was recovered rather than
-	// aborting the test binary.
+	// Sink writes are synchronous (see auditCollector.Record), so by the time
+	// each Extract above returned, the panicking Write had already been
+	// recovered inline. Reaching Close confirms the process never aborted and
+	// that a misbehaving sink cannot propagate a panic to the public API.
 	if err := p.Close(); err != nil {
 		t.Fatalf("close failed: %v", err)
 	}

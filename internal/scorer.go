@@ -99,7 +99,9 @@ func DefaultScoringConfig() *ScoringConfig {
 			"section": 300,
 			"body":    100,
 			"div":     50,
-			"p":       0,
+			// "p" is intentionally absent: Score() short-circuits to 0 for <p>
+			// via the node.Data == "p" early return, so a base score here would
+			// be unreachable. getTagScore also defaults unknown tags to 0.
 		},
 	}
 }
@@ -283,11 +285,9 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 				}
 			}
 		case "style":
-			lowerStyle := strings.ToLower(attr.Val)
-			if strings.Contains(lowerStyle, "display:none") ||
-				strings.Contains(lowerStyle, "display: none") ||
-				strings.Contains(lowerStyle, "visibility:hidden") ||
-				strings.Contains(lowerStyle, "visibility: hidden") {
+			compact := compactCSS(attr.Val)
+			if strings.Contains(compact, "display:none") ||
+				strings.Contains(compact, "visibility:hidden") {
 				return true
 			}
 		case "hidden":
@@ -295,6 +295,29 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 		}
 	}
 	return false
+}
+
+// compactCSS lowercases a CSS declaration and strips ASCII whitespace so that
+// "display:  none", "display:\tnone", "display :none", and "DISPLAY:NONE" all
+// collapse to the single form "display:none". ShouldRemove checks hidden
+// declarations against these compacted forms; without compaction, an element
+// hidden via a style with extra whitespace or a space around the colon bypassed
+// removal and leaked into extracted content.
+func compactCSS(s string) string {
+	lower := strings.ToLower(s)
+	if !strings.ContainsAny(lower, " \t\n\r\f\v") {
+		return lower
+	}
+	var b strings.Builder
+	b.Grow(len(lower))
+	for i := 0; i < len(lower); i++ {
+		c := lower[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v' {
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
 }
 
 // isPrimaryContentContainer reports whether the node unambiguously represents

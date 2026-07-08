@@ -58,7 +58,7 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 	}
 
 	// Step 1: Extract all row data from table
-	tableData, colWidths := p.extractTableData(table, tableFormat)
+	tableData := p.extractTableData(table, tableFormat)
 
 	if len(tableData) == 0 {
 		return
@@ -69,10 +69,10 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 
 	// Step 3: Render in requested format using registry
 	if renderer := globalRegistry.get(tableFormat); renderer != nil {
-		renderer.Render(tableData, tb, maxCols, colWidths)
+		renderer.Render(tableData, tb, maxCols)
 	} else {
 		// Fallback to markdown for unknown formats
-		extractTableAsMarkdown(tableData, tb, maxCols, colWidths)
+		extractTableAsMarkdown(tableData, tb, maxCols)
 	}
 
 	// Ensure blank line after table for proper Markdown parsing
@@ -83,9 +83,10 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 }
 
 // extractTableData walks through table rows and extracts cell data.
-func (p *Processor) extractTableData(table *html.Node, tableFormat string) ([][]CellData, []string) {
-	var tableData [][]CellData
-	colWidths := make([]string, 0, initialColWidthsCap)
+func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]CellData {
+	// Typical tables have several rows; pre-size to avoid the first outer-slice
+	// doublings (16 → 32 → …). Grows naturally for larger tables.
+	tableData := make([][]CellData, 0, 8)
 
 	p.nodeWalker.Walk(table, func(node *html.Node) bool {
 		if node.Type != html.ElementNode || node.Data != "tr" {
@@ -107,11 +108,6 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) ([][]
 			cells = expandColspanCells(rawCells)
 		}
 
-		// Collect column widths from structure rows
-		if isStructureRow {
-			colWidths = collectColumnWidths(rawCells, colWidths)
-		}
-
 		// Add row to table data (skip structure rows for Markdown)
 		if tableFormat == "html" {
 			tableData = append(tableData, cells)
@@ -122,7 +118,7 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) ([][]
 		return false
 	})
 
-	return tableData, colWidths
+	return tableData
 }
 
 // extractRowCells extracts all cell data from a single table row (tr element).

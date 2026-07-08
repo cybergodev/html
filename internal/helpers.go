@@ -81,6 +81,25 @@ func normalizeNonBreakingSpaces(s string) string {
 	return strings.ReplaceAll(s, "\u00a0", " ")
 }
 
+// textNeedsNormalization reports whether s contains any byte sequence that
+// GetTextContent's normalization pass would rewrite: a newline/CR, an '&'
+// (potential entity), or an NBSP (UTF-8 0xC2 0xA0). When it returns false, the
+// text passes through unchanged apart from edge trimming, so GetTextContent can
+// skip its pooled buffer and tree walk entirely.
+func textNeedsNormalization(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\n', '\r', '&':
+			return true
+		case 0xC2:
+			if i+1 < len(s) && s[i+1] == 0xA0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // normalizeText performs text normalization in a single pass.
 // It handles NBSP replacement, line break normalization, and HTML entity replacement.
 // This is more efficient than calling the individual functions sequentially.
@@ -477,6 +496,25 @@ func FindElementByTag(doc *html.Node, tagName string) *html.Node {
 }
 
 func GetTextContent(node *html.Node) string {
+	if node == nil {
+		return ""
+	}
+
+	// Fast path: an element whose only child is a single text node that needs no
+	// normalization (no newline, '&', or NBSP) yields just the trimmed text — no
+	// tree walk, pooled buffer, or closure. GetTextContent is the hottest
+	// allocator in extraction (invoked once per <a>, table cell, and title
+	// candidate), and the common <a>link</a> / <td>cell</td> shape hits this path,
+	// skipping a closure heap-escape and two pool round-trips per call with zero
+	// allocations. Output is identical to the general path for this subtree shape.
+	if node.Type == html.ElementNode {
+		if c := node.FirstChild; c != nil && c.NextSibling == nil && c.Type == html.TextNode {
+			if data := c.Data; !textNeedsNormalization(data) {
+				return strings.TrimSpace(data)
+			}
+		}
+	}
+
 	// Use a capacity-retaining pooled []byte rather than BuilderPool: a pooled
 	// []byte keeps its backing array across calls (reset with [:0]), whereas
 	// strings.Builder.Reset() drops the buffer, forcing a fresh allocation on
@@ -1072,6 +1110,29 @@ func IsValidURL(url string) bool {
 	}
 
 	return false
+}
+
+// imgHasValidSrc reports whether an <img> node carries a src attribute whose
+// value is a valid URL. It mirrors the src validation in parseImageNode
+// (extract.go): any src whose value fails IsValidURL yields false, and a node
+// with no src at all yields false. The text-extraction pass uses this to decide
+// whether to emit an [IMAGE:n] placeholder, keeping its count in lockstep with
+// extractImagesAndLinks (which assigns positions only to imgs that
+// parseImageNode accepts) so unmatched placeholders cannot leak into output.
+func imgHasValidSrc(n *html.Node) bool {
+	if n == nil {
+		return false
+	}
+	hasSrc := false
+	for _, attr := range n.Attr {
+		if attr.Key == "src" {
+			if !IsValidURL(attr.Val) {
+				return false
+			}
+			hasSrc = true
+		}
+	}
+	return hasSrc
 }
 
 func SelectBestCandidate(candidates map[*html.Node]int) *html.Node {

@@ -1,31 +1,11 @@
 package table
 
 import (
+	"html"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
-
-const (
-	// initialColWidthsCap is the initial capacity for table column widths.
-	initialColWidthsCap = 12
-)
-
-// ensureColWidthCapacity ensures the colWidths slice can hold the given index.
-func ensureColWidthCapacity(colWidths []string, index int) []string {
-	if index < len(colWidths) {
-		return colWidths
-	}
-	// Grow the slice to accommodate the index
-	newCap := index + 1
-	if cap(colWidths) >= newCap {
-		// Extend to available capacity
-		return colWidths[:newCap]
-	}
-	// Allocate new slice with larger capacity
-	newSlice := make([]string, newCap, newCap+initialColWidthsCap)
-	copy(newSlice, colWidths)
-	return newSlice
-}
 
 // isStructureRow determines if a row contains only width definitions (no real content).
 // Structure rows are used in Markdown tables to specify column widths.
@@ -37,7 +17,7 @@ func isStructureRow(cells []CellData) bool {
 		if cell.Width == "" {
 			hasWidthDefinitions = false
 		}
-		if cell.Text != " " && cell.Text != "" && cell.Text != "\u00a0" {
+		if cell.Text != " " && cell.Text != "" {
 			hasRealContent = true
 		}
 	}
@@ -73,15 +53,92 @@ func expandColspanCells(rawCells []CellData) []CellData {
 	return cells
 }
 
-// collectColumnWidths extracts width definitions from a structure row.
-func collectColumnWidths(cells []CellData, colWidths []string) []string {
-	for i, cell := range cells {
-		colWidths = ensureColWidthCapacity(colWidths, i)
-		if cell.Width != "" {
-			colWidths[i] = cell.Width
-		}
+// applyRowspanGrid rebuilds the table so a cell with rowspan > 1 occupies its
+// column in the rows it spans. Markdown tables are strictly rectangular — they
+// cannot express rowspan — so without this grid a spanned cell appears only in
+// its declared row and every later row's cells shift one column left, landing
+// under the wrong header. Each position a rowspan covers is filled by repeating
+// the originating cell's text (the convention used by Pandoc and other
+// converters).
+//
+// colspan is already expanded into separate CellData entries by
+// expandColspanCells, so each entry in a row represents exactly one column.
+// The grid places entries left-to-right, skipping columns already occupied by
+// a rowspan from an earlier row (filling them with the repeated text). Rows
+// shorter than maxCols are padded with empty cells; rows longer than maxCols
+// have their excess cells dropped, matching the renderer, which only emits
+// maxCols columns.
+func applyRowspanGrid(tableData [][]CellData, maxCols int) [][]CellData {
+	if len(tableData) == 0 || maxCols <= 0 {
+		return tableData
 	}
-	return colWidths
+
+	numRows := len(tableData)
+	// Flatten the two scratch grids into single 1-D buffers of length
+	// numRows*maxCols, indexed [r*maxCols+c]: occupied marks a column already
+	// taken by a rowspan from an earlier row; fillText holds the originating
+	// cell's text to repeat there. This replaces 2*numRows per-row slice
+	// allocations with two flat slices while keeping the grid logic identical.
+	occupied := make([]bool, numRows*maxCols)
+	fillText := make([]string, numRows*maxCols)
+
+	grid := make([][]CellData, numRows)
+	for r := 0; r < numRows; r++ {
+		row := make([]CellData, maxCols)
+		base := r * maxCols
+		col := 0
+		for _, cell := range tableData[r] {
+			// Skip columns occupied by a rowspan from above, filling them with
+			// the repeated originating text.
+			for col < maxCols && occupied[base+col] {
+				row[col] = spannedFill(fillText[base+col])
+				col++
+			}
+			if col >= maxCols {
+				break // more cells than columns; drop the rest (matches renderer)
+			}
+			row[col] = cell
+			// Reserve this column in the rows the rowspan covers, carrying the
+			// cell's text so each spanned position repeats it.
+			if rs := cell.Rowspan; rs > 1 {
+				for rr := 1; rr < rs && r+rr < numRows; rr++ {
+					occupied[(r+rr)*maxCols+col] = true
+					fillText[(r+rr)*maxCols+col] = cell.Text
+				}
+			}
+			col++
+		}
+		// Fill any trailing occupied columns, then pad the remainder with empty
+		// cells so the row is exactly maxCols wide.
+		for col < maxCols {
+			if occupied[base+col] {
+				row[col] = spannedFill(fillText[base+col])
+			} else {
+				row[col] = CellData{Text: " ", Align: AlignDefault}
+			}
+			col++
+		}
+		grid[r] = row
+	}
+	return grid
+}
+
+// spannedFill builds a Markdown cell that repeats a rowspan origin's text in a
+// spanned row. Alignment is left at AlignDefault so the cell does not
+// participate in the column's majority-alignment vote — the originating cell
+// already votes once from its own row, and letting every spanned copy vote
+// would over-weight that alignment by the rowspan count.
+func spannedFill(text string) CellData {
+	if text == "" {
+		text = " "
+	}
+	return CellData{
+		Text:            text,
+		Align:           AlignDefault,
+		Colspan:         1,
+		Rowspan:         1,
+		OriginalColspan: 1,
+	}
 }
 
 // calculateMaxColumns finds the maximum number of columns across all rows.
@@ -96,18 +153,24 @@ func calculateMaxColumns(tableData [][]CellData) int {
 }
 
 // extractTableAsMarkdown outputs table in Markdown format with alignment.
-// Note: Column widths are included as HTML comments since Markdown doesn't support column widths.
-func extractTableAsMarkdown(tableData [][]CellData, tb *TrackedBuilder, maxCols int, structureRowWidths []string) {
+func extractTableAsMarkdown(tableData [][]CellData, tb *TrackedBuilder, maxCols int) {
+	// Apply a rowspan grid so a cell with rowspan > 1 keeps its column in the
+	// rows it spans, instead of letting later rows' cells shift left into the
+	// wrong column. Markdown cannot express rowspan, so each spanned position
+	// repeats the originating cell's text (the Pandoc convention). This must
+	// run before width/alignment calculation, which depend on correct column
+	// positions. The HTML path is unaffected — it emits rowspan as an attribute.
+	tableData = applyRowspanGrid(tableData, maxCols)
+
 	// Pad rows to have consistent column count
 	tableData = padTableColumns(tableData, maxCols)
 
 	// Calculate column properties
-	colAligns := calculateColumnAlignments(tableData, maxCols, structureRowWidths)
+	colAligns := calculateColumnAlignments(tableData, maxCols)
 	colMaxWidths := calculateMaxColumnWidths(tableData, maxCols)
 
 	// Filter out columns that are entirely empty expanded cells
 	newToOldCol := filterExpandedColumns(tableData, maxCols)
-	numIncludedCols := len(newToOldCol)
 
 	// Build arrays for included columns only
 	includedColAligns := filterArray(colAligns, newToOldCol)
@@ -122,19 +185,51 @@ func extractTableAsMarkdown(tableData [][]CellData, tb *TrackedBuilder, maxCols 
 
 	// Render table rows with alignment separator after the first row
 	if len(tableData) > 0 {
-		// Render first row (header)
-		renderMarkdownRow(tb, tableData[0], newToOldCol, includedColAligns, includedColMaxWidths, numIncludedCols)
-
-		// Add alignment separator after header row (required by Markdown)
-		_, _ = tb.WriteString("| ")
-		_, _ = tb.WriteString(strings.Join(includedColAligns, " | "))
-		_, _ = tb.WriteString(" |\n")
-
-		// Render remaining rows
-		for i := 1; i < len(tableData); i++ {
-			renderMarkdownRow(tb, tableData[i], newToOldCol, includedColAligns, includedColMaxWidths, numIncludedCols)
+		// Markdown pipe tables require a header row followed by an alignment
+		// separator. When the source table has no <th> cells, there is no real
+		// header: synthesize an empty header row instead of promoting the first
+		// data row, which would otherwise mislabel real data as column headers.
+		if tableHasHeader(tableData) {
+			// Render first row (header)
+			renderMarkdownRow(tb, tableData[0], newToOldCol, includedColAligns, includedColMaxWidths)
+			writeMarkdownSeparator(tb, includedColAligns)
+			// Render remaining rows
+			for i := 1; i < len(tableData); i++ {
+				renderMarkdownRow(tb, tableData[i], newToOldCol, includedColAligns, includedColMaxWidths)
+			}
+		} else {
+			// No <th> anywhere: synthesize an empty header row and render every
+			// real row (including the former first row) as data.
+			emptyHeader := make([]CellData, maxCols)
+			renderMarkdownRow(tb, emptyHeader, newToOldCol, includedColAligns, includedColMaxWidths)
+			writeMarkdownSeparator(tb, includedColAligns)
+			for i := 0; i < len(tableData); i++ {
+				renderMarkdownRow(tb, tableData[i], newToOldCol, includedColAligns, includedColMaxWidths)
+			}
 		}
 	}
+}
+
+// tableHasHeader reports whether any cell in the table is a <th> header cell.
+// When false, the Markdown renderer must synthesize an empty header row rather
+// than treating the first data row as a header.
+func tableHasHeader(tableData [][]CellData) bool {
+	for _, row := range tableData {
+		for _, cell := range row {
+			if cell.IsHeader {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// writeMarkdownSeparator writes the Markdown alignment separator row
+// (e.g. "| :--- | ---: |") that must follow a table's header row.
+func writeMarkdownSeparator(tb *TrackedBuilder, includedColAligns []string) {
+	_, _ = tb.WriteString("| ")
+	_, _ = tb.WriteString(strings.Join(includedColAligns, " | "))
+	_, _ = tb.WriteString(" |\n")
 }
 
 // padTableColumns ensures all rows have the same number of columns.
@@ -150,7 +245,7 @@ func padTableColumns(tableData [][]CellData, maxCols int) [][]CellData {
 // calculateColumnAlignments determines column alignment using majority voting.
 // Returns alignment strings in Markdown format (:---, :--:, ---:, etc.)
 // Optimized with pre-allocated slices.
-func calculateColumnAlignments(tableData [][]CellData, maxCols int, structureRowWidths []string) []string {
+func calculateColumnAlignments(tableData [][]CellData, maxCols int) []string {
 	colAligns := make([]string, maxCols)
 	// Pre-allocate alignCounts with exact capacity needed
 	alignCounts := make([]AlignCount, maxCols)
@@ -168,8 +263,6 @@ func calculateColumnAlignments(tableData [][]CellData, maxCols int, structureRow
 					alignCounts[i].Right++
 				case AlignJustify:
 					alignCounts[i].Justify++
-				default:
-					alignCounts[i].DefaultCount++
 				}
 			}
 		}
@@ -246,7 +339,7 @@ func calculateMaxColumnWidths(tableData [][]CellData, maxCols int) []int {
 	colMaxWidths := make([]int, maxCols)
 	for _, row := range tableData {
 		for j := 0; j < maxCols && j < len(row); j++ {
-			textLen := len(row[j].Text)
+			textLen := utf8.RuneCountInString(row[j].Text)
 			if textLen > colMaxWidths[j] {
 				colMaxWidths[j] = textLen
 			}
@@ -335,7 +428,7 @@ func writePadding(tb *TrackedBuilder, n int) {
 
 // renderMarkdownRow renders a single table row in Markdown format.
 func renderMarkdownRow(tb *TrackedBuilder, row []CellData, newToOldCol []int,
-	colAligns []string, colMaxWidths []int, numCols int) {
+	colAligns []string, colMaxWidths []int) {
 
 	_, _ = tb.WriteString("| ")
 	for newJ, oldJ := range newToOldCol {
@@ -345,33 +438,57 @@ func renderMarkdownRow(tb *TrackedBuilder, row []CellData, newToOldCol []int,
 		}
 
 		maxWidth := colMaxWidths[newJ]
-		textLen := len(cellText)
+		textLen := utf8.RuneCountInString(cellText)
 		pad := maxWidth - textLen
 
-		// Apply alignment-based padding
+		// Apply alignment-based padding. Cell text is written through
+		// writeMarkdownCellText so a literal '|' cannot end the cell early and
+		// spill into the next column, and a literal '\' cannot escape the
+		// following delimiter character.
 		switch colAligns[newJ] {
 		case ":---": // left
-			_, _ = tb.WriteString(cellText)
+			writeMarkdownCellText(tb, cellText)
 			writePadding(tb, pad)
 		case "---:": // right
 			writePadding(tb, pad)
-			_, _ = tb.WriteString(cellText)
+			writeMarkdownCellText(tb, cellText)
 		case ":--:": // center
 			leftPad := pad / 2
 			rightPad := pad - leftPad
 			writePadding(tb, leftPad)
-			_, _ = tb.WriteString(cellText)
+			writeMarkdownCellText(tb, cellText)
 			writePadding(tb, rightPad)
 		default: // left (default)
-			_, _ = tb.WriteString(cellText)
+			writeMarkdownCellText(tb, cellText)
 			writePadding(tb, pad)
 		}
 
-		if newJ < numCols-1 {
+		if newJ < len(newToOldCol)-1 {
 			_, _ = tb.WriteString(" | ")
 		}
 	}
 	_, _ = tb.WriteString(" |\n")
+}
+
+// writeMarkdownCellText writes cell text into a Markdown table cell, escaping
+// the characters that are structural in Markdown tables or serve as escape
+// introducers. A literal '|' would prematurely end the cell (and can spill into
+// subsequent columns); a literal '\' would escape the following character. Both
+// are backslash-escaped so the cell content is preserved verbatim. Newlines are
+// replaced with spaces, since a Markdown table row cannot span multiple lines.
+func writeMarkdownCellText(tb *TrackedBuilder, text string) {
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		switch c {
+		case '\\', '|':
+			_ = tb.WriteByte('\\')
+			_ = tb.WriteByte(c)
+		case '\n', '\r':
+			_ = tb.WriteByte(' ')
+		default:
+			_ = tb.WriteByte(c)
+		}
+	}
 }
 
 // extractTableAsHTML outputs table in HTML format with proper attributes.
@@ -421,9 +538,13 @@ func renderHTMLCell(tb *TrackedBuilder, cell CellData) {
 		_, _ = tb.WriteString(`"`)
 	}
 
-	// Write cell content
+	// Write cell content. Escape the text so that characters meaningful in HTML
+	// (<, >, &, ") cannot break the cell's structure or inject markup. This
+	// mirrors the inline image/link path in extract.go, which escapes its HTML
+	// output via htmlstd.EscapeString. The Markdown path escapes via
+	// writeMarkdownCellText (| and \) in renderMarkdownRow.
 	_, _ = tb.WriteString(">")
-	_, _ = tb.WriteString(cell.Text)
+	_, _ = tb.WriteString(html.EscapeString(cell.Text))
 	_, _ = tb.WriteString("</")
 	_, _ = tb.WriteString(tag)
 	_, _ = tb.WriteString(">\n")
@@ -448,8 +569,37 @@ func buildCellStyle(cell CellData) string {
 	}
 
 	if cell.Width != "" && !cell.IsExpanded {
-		styleParts = append(styleParts, "width:"+cell.Width)
+		// cell.Width originates from an HTML width attribute or inline style and
+		// is emitted into a style="..." attribute, so sanitize it to CSS-length
+		// characters to prevent attribute breakout or CSS property injection.
+		if w := sanitizeCSSWidth(cell.Width); w != "" {
+			styleParts = append(styleParts, "width:"+w)
+		}
 	}
 
 	return strings.Join(styleParts, ";")
+}
+
+// sanitizeCSSWidth reduces a width value to the characters permitted in a CSS
+// length (digits, '.', '%', and ASCII letters for units such as px/em/rem).
+// Any '"', ';', ':', '(', ')', or whitespace — which could otherwise break out
+// of the style attribute or inject CSS properties — is dropped. A result of ""
+// means the value was not a recognizable length and the width declaration is
+// omitted entirely.
+func sanitizeCSSWidth(w string) string {
+	if w == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(w))
+	for i := 0; i < len(w); i++ {
+		c := w[i]
+		switch {
+		case c >= '0' && c <= '9', c == '.', c == '%':
+			b.WriteByte(c)
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }

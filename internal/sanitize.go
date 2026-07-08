@@ -239,7 +239,7 @@ func RemoveTagContent(content, tag string) string {
 	}
 
 	// Quick check: if tag is not present, return as-is
-	if !containsTagIgnoreCase(content, "<"+tag) {
+	if indexASCIIFold(content, "<"+tag) == -1 {
 		return content
 	}
 
@@ -264,17 +264,6 @@ func asciiEqualFold(a, b string) bool {
 		}
 	}
 	return true
-}
-
-// containsTagIgnoreCase checks if content contains the given tag prefix case-insensitively.
-func containsTagIgnoreCase(content, tagPrefix string) bool {
-	prefixLen := len(tagPrefix)
-	for i := 0; i <= len(content)-prefixLen; i++ {
-		if asciiEqualFold(content[i:i+prefixLen], tagPrefix) {
-			return true
-		}
-	}
-	return false
 }
 
 // indexASCIIFold finds the case-insensitive index of target in s (ASCII only).
@@ -402,6 +391,16 @@ func isSafeURIWithAudit(uri string, audit AuditRecorder) bool {
 
 	trimmed := strings.TrimSpace(normalized)
 	lowerURI := strings.ToLower(trimmed)
+
+	// SECURITY: Reject oversized non-data URIs to bound the work spent parsing a
+	// hostile attribute and to keep sanitization consistent with IsValidURL's
+	// MaxURLLength ceiling. data: URLs are exempt: they have a separate, larger
+	// ceiling (MaxDataURILength) enforced in the data: branch below, and
+	// legitimate base64 images routinely exceed MaxURLLength.
+	if len(uri) > MaxURLLength && !strings.HasPrefix(lowerURI, "data:") {
+		audit.RecordBlockedURL(truncateAuditURL(uri), "URL exceeds size limit")
+		return false
+	}
 
 	// SECURITY: Check for dangerous schemes with multiple Unicode attack vectors
 
@@ -533,17 +532,26 @@ func isValidDataURLWithAudit(url string, audit AuditRecorder) bool {
 			if semicolonIdx > 0 {
 				mediaType = mediaPart[:semicolonIdx]
 			}
-			// If semicolonIdx == 0, mediaType remains empty (will be handled by validation below)
+			// semicolonIdx == 0 leaves mediaType empty; handled by the empty-MIME
+			// rejection below.
 		} else {
 			mediaType = mediaPart
 		}
 
+		// A data URL must declare an explicit, whitelisted media type. An empty
+		// mediaType — e.g. "data:;base64,<payload>" or "data:;...,..." — used to
+		// skip both checks below and bypass the safeMediaTypes whitelist entirely,
+		// letting arbitrary base64-encoded content through. Reject it outright.
+		if mediaType == "" {
+			audit.RecordBlockedURL(truncateAuditURL(url), "missing media type in data URL")
+			return false
+		}
 		// Validate media type and check against whitelist of safe types
-		if mediaType != "" && !isValidMediaType(mediaType) {
+		if !isValidMediaType(mediaType) {
 			audit.RecordBlockedURL(truncateAuditURL(url), "invalid media type in data URL")
 			return false
 		}
-		if mediaType != "" && !isSafeMediaType(mediaType) {
+		if !isSafeMediaType(mediaType) {
 			audit.RecordBlockedURL(truncateAuditURL(url), "unsafe media type in data URL: "+mediaType)
 			return false
 		}

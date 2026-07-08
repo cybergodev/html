@@ -43,10 +43,18 @@ type CellData struct {
 
 // AlignCount tracks the number of cells with each alignment type for a column.
 type AlignCount struct {
-	Left, Center, Right, Justify, DefaultCount int
+	Left, Center, Right, Justify int
 }
 
-// TrackedBuilder is a strings.Builder that tracks the last written character.
+// TrackedBuilder is a strings.Builder that remembers the last byte written, so
+// callers can inspect the trailing byte without re-reading the buffer.
+//
+// LastChar holds that trailing byte. It is a byte, not a rune: for multi-byte
+// UTF-8 input it is the final byte of the encoding (a leading or continuation
+// byte), which is meaningful only for the ASCII single-byte comparisons the
+// callers rely on — newline/space detection in EnsureNewline/EnsureSpacing and
+// tests asserting the last byte of ASCII output. Code that writes non-ASCII
+// content should not interpret LastChar as a character.
 type TrackedBuilder struct {
 	*strings.Builder
 	LastChar byte
@@ -60,13 +68,14 @@ func NewTrackedBuilder(sb *strings.Builder) *TrackedBuilder {
 	}
 }
 
-// WriteByte writes a single byte and updates the last character tracker.
+// WriteByte writes a single byte and records it in LastChar.
 func (tb *TrackedBuilder) WriteByte(c byte) error {
 	tb.LastChar = c
 	return tb.Builder.WriteByte(c)
 }
 
-// WriteString writes a string and updates the last character tracker.
+// WriteString writes a string and, when at least one byte was written, records
+// the final byte of s in LastChar.
 func (tb *TrackedBuilder) WriteString(s string) (int, error) {
 	n, err := tb.Builder.WriteString(s)
 	if n > 0 && err == nil {

@@ -346,6 +346,33 @@ func TestResolveURL(t *testing.T) {
 			want:        "http://example.com/path/#section",
 		},
 		{
+			// RFC 3986 §5.3: a fragment-only reference preserves the base path.
+			// A file-style base must NOT be treated as a directory here, or the
+			// last segment ("page.html") is dropped.
+			name:        "fragment against file-style base preserves path",
+			baseURL:     "http://example.com/path/page.html",
+			relativeURL: "#top",
+			want:        "http://example.com/path/page.html#top",
+		},
+		{
+			name:        "query against file-style base preserves path",
+			baseURL:     "http://example.com/path/page.html",
+			relativeURL: "?q=1",
+			want:        "http://example.com/path/page.html?q=1",
+		},
+		{
+			name:        "query against base with existing query replaces query",
+			baseURL:     "http://example.com/path/page.html?old=1",
+			relativeURL: "?new=2",
+			want:        "http://example.com/path/page.html?new=2",
+		},
+		{
+			name:        "fragment against base with existing fragment replaces fragment",
+			baseURL:     "http://example.com/path/page.html#old",
+			relativeURL: "#new",
+			want:        "http://example.com/path/page.html#new",
+		},
+		{
 			// Absolute path against a base that has a scheme but no path after
 			// the domain: the domain has no trailing '/', so the base is reused
 			// verbatim and the absolute path appended to it.
