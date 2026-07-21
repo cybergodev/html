@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	stdxhtml "golang.org/x/net/html"
+
+	"github.com/cybergodev/html/internal/table"
 )
 
 // TestComprehensiveHTMLEntityConversion is a comprehensive test that verifies
@@ -255,6 +257,15 @@ func TestHTMLEntityByteRepresentation(t *testing.T) {
 		{"euro", "&euro;100", "€100"},
 		{"mdash", "Hello&mdash;World", "Hello—World"},
 		{"hellip", "Wait&hellip;", "Wait…"},
+
+		// Cases merged from the former TestGetTextContentHTMLEntities: these assert
+		// exact equality (and therefore correct UTF-8 bytes) for multi-entity and
+		// paragraph inputs that substring-based checks cannot pin down. GetTextContent
+		// trims leading/trailing whitespace, so the expected values are trimmed.
+		{"multiple_nbsp", "A&nbsp;&nbsp;B", "A  B"},
+		{"mixed_entities", "&nbsp;&copy;&nbsp;&euro;&nbsp;", "© €"},
+		{"numeric_nbsp", "A&#160;B&#xa0;C", "A B C"},
+		{"complex_paragraph", "<p>&nbsp;&copy; 2025&nbsp;&mdash;&nbsp;All rights reserved&nbsp;</p>", "© 2025 — All rights reserved"},
 	}
 
 	for _, tc := range testCases {
@@ -285,65 +296,6 @@ func TestHTMLEntityByteRepresentation(t *testing.T) {
 					t.Errorf("Byte mismatch at position %d: got 0x%02x, expected 0x%02x",
 						i, resultBytes[i], expectedBytes[i])
 				}
-			}
-		})
-	}
-}
-
-// TestGetTextContentHTMLEntities tests the GetTextContent function specifically
-// for HTML entity conversion.
-func TestGetTextContentHTMLEntities(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		html     string
-		expected string
-	}{
-		{
-			name:     "nbsp_conversion",
-			html:     "Hello&nbsp;World",
-			expected: "Hello World",
-		},
-		{
-			name:     "multiple_nbsp",
-			html:     "A&nbsp;&nbsp;B",
-			expected: "A  B",
-		},
-		{
-			name:     "mixed_entities",
-			html:     "&nbsp;&copy;&nbsp;&euro;&nbsp;",
-			expected: "© €", // TrimSpace removes leading/trailing spaces
-		},
-		{
-			name:     "numeric_nbsp",
-			html:     "A&#160;B&#xa0;C",
-			expected: "A B C",
-		},
-		{
-			name:     "complex_paragraph",
-			html:     "<p>&nbsp;&copy; 2025&nbsp;&mdash;&nbsp;All rights reserved&nbsp;</p>",
-			expected: "© 2025 — All rights reserved", // TrimSpace removes leading/trailing spaces
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			doc, err := stdxhtml.Parse(strings.NewReader(tt.html))
-			if err != nil {
-				t.Fatalf("Failed to parse HTML: %v", err)
-			}
-
-			result := GetTextContent(doc)
-
-			if result != tt.expected {
-				t.Errorf("GetTextContent() = %q (% x), expected %q (% x)",
-					result, result, tt.expected, tt.expected)
-			}
-
-			// Verify no non-breaking spaces
-			if strings.Contains(result, "\u00a0") {
-				t.Errorf("Result contains non-breaking space (U+00A0): %q", result)
 			}
 		})
 	}
@@ -393,9 +345,9 @@ func TestExtractTextWithStructureHTMLEntities(t *testing.T) {
 				t.Fatalf("Failed to parse HTML: %v", err)
 			}
 
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-			result := CleanText(sb.String(), nil)
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			result := CleanText(tb.String())
 
 			for _, mustContain := range tt.contains {
 				if !strings.Contains(result, mustContain) {

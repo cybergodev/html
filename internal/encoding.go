@@ -408,14 +408,51 @@ func (ed *EncodingDetector) DetectCharsetBasic(data []byte) string {
 	return "windows-1252"
 }
 
+// sampleSizeOrDefault returns the configured statistical-analysis sample size,
+// falling back to the default documented on MaxSampleSize when unset (<=0). It
+// centralizes the bound shared by DetectCharsetSmart and tryAllEncodings so the
+// two sampling paths cannot drift.
+func (ed *EncodingDetector) sampleSizeOrDefault() int {
+	if ed.MaxSampleSize > 0 {
+		return ed.MaxSampleSize
+	}
+	return 10240
+}
+
 // DetectCharsetSmart performs intelligent charset detection using statistical analysis
 func (ed *EncodingDetector) DetectCharsetSmart(data []byte) EncodingMatch {
+	// Honor an explicit override first, mirroring DetectCharset. Without this a
+	// direct caller of DetectCharsetSmart with ForcedEncoding set got
+	// auto-detection instead; DetectAndConvert used to short-circuit this
+	// externally, but the method's contract is self-consistent only if it honors
+	// the override itself.
+	if ed.ForcedEncoding != "" {
+		c := normalizeCharset(ed.ForcedEncoding)
+		return EncodingMatch{
+			Charset:    c,
+			Confidence: 100,
+			Score:      100,
+			Valid:      utf8.Valid(data),
+		}
+	}
+
 	// First, try basic detection
 	basicCharset := ed.DetectCharsetBasic(data)
 
 	// Step 1: Quick validation of basic detection
 	// For meta-tag declared UTF-8, give it high priority
-	score := ed.scoreEncodingMatch(data, basicCharset)
+	//
+	// Bound the statistical scoring to MaxSampleSize bytes, exactly as
+	// tryAllEncodings does below: scoring is statistical (printable/CJK/control
+	// ratios) and the leading sample is representative. Without this bound a
+	// large non-UTF-8 document is fully decoded here (scoreEncodingMatch's
+	// io.ReadAll) on top of the ~13-candidate pass in tryAllEncodings,
+	// amplifying a big non-ASCII input's memory cost before that pass even runs.
+	scoringSample := data
+	if maxSample := ed.sampleSizeOrDefault(); len(scoringSample) > maxSample {
+		scoringSample = scoringSample[:maxSample]
+	}
+	score := ed.scoreEncodingMatch(scoringSample, basicCharset)
 
 	// Check if basic detection came from meta tag
 	if basicCharset == "utf-8" && score >= 70 {
@@ -445,6 +482,12 @@ func (ed *EncodingDetector) DetectCharsetSmart(data []byte) EncodingMatch {
 		if matches[i].Charset == basicCharset {
 			matches[i].Score += 10
 			matches[i].Confidence += 5
+			// Confidence is documented as 0-100; clamp after the boost so a
+			// match already at 100 cannot surface as 105 to callers that
+			// treat it as a percentage.
+			if matches[i].Confidence > 100 {
+				matches[i].Confidence = 100
+			}
 			break
 		}
 	}
@@ -509,10 +552,12 @@ func (ed *EncodingDetector) ToUTF8(data []byte, charset string) ([]byte, error) 
 
 // DetectAndConvert detects charset and converts to UTF-8 in one step
 func (ed *EncodingDetector) DetectAndConvert(data []byte) ([]byte, string, error) {
+	// Both detection branches honor ForcedEncoding (DetectCharsetSmart now does
+	// so directly, as DetectCharset always has), so an explicit override is
+	// respected regardless of whether smart detection is enabled.
 	var charset string
 	if ed.EnableSmartDetection {
-		match := ed.DetectCharsetSmart(data)
-		charset = match.Charset
+		charset = ed.DetectCharsetSmart(data).Charset
 	} else {
 		charset = ed.DetectCharset(data)
 	}
@@ -782,6 +827,15 @@ func isPureASCII(data []byte) bool {
 // tryAllEncodings attempts to decode the data with multiple encodings and scores each result.
 // Optimized to avoid redundant UTF-8 validation and conversions.
 func (ed *EncodingDetector) tryAllEncodings(data []byte) []EncodingMatch {
+	// Bound the statistical analysis to MaxSampleSize bytes. Scoring is
+	// statistical (printable/CJK/control-char ratios), so the leading sample is
+	// representative; without this, each of ~13 candidate encodings decodes and
+	// full-scans the entire document, amplifying a large non-ASCII input ~13×.
+	// This also makes the previously write-only MaxSampleSize field effective.
+	if maxSample := ed.sampleSizeOrDefault(); len(data) > maxSample {
+		data = data[:maxSample]
+	}
+
 	// Common encodings to try, ordered by likelihood
 	candidateEncodings := []struct {
 		name string

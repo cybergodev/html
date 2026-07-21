@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"golang.org/x/net/html"
+
+	"github.com/cybergodev/html/internal/table"
 )
 
 // TestBlockElementClassification verifies that block elements are properly classified.
@@ -194,10 +196,10 @@ func TestNewBlockElementsSpacing(t *testing.T) {
 				t.Fatalf("Failed to parse HTML: %v", err)
 			}
 
-			var sb strings.Builder
+			tb := table.NewTrackedBuilder()
 			imageCounter := 0
-			ExtractTextWithStructureAndImages(doc, &sb, &imageCounter, nil, "markdown")
-			got := strings.TrimSpace(sb.String())
+			ExtractTextWithStructureAndImages(doc, tb, &imageCounter, nil, "markdown")
+			got := strings.TrimSpace(tb.String())
 
 			// Normalize newlines for comparison
 			got = strings.ReplaceAll(got, "\r\n", "\n")
@@ -225,9 +227,9 @@ func TestTableStructureElementsSpacing(t *testing.T) {
 		t.Fatalf("Failed to parse HTML: %v", err)
 	}
 
-	var sb strings.Builder
-	ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-	result := sb.String()
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	result := tb.String()
 
 	// Verify table is rendered correctly with proper structure
 	expectedParts := []string{"Header 1", "Header 2", "Data 1", "Data 2", "Footer 1", "Footer 2"}
@@ -276,9 +278,9 @@ func TestDefinitionListFormatting(t *testing.T) {
 				t.Fatalf("Failed to parse HTML: %v", err)
 			}
 
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-			got := strings.TrimSpace(sb.String())
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			got := strings.TrimSpace(tb.String())
 
 			if got != tt.want {
 				t.Errorf("Got:\n%s\n\nWant:\n%s", got, tt.want)
@@ -306,9 +308,9 @@ func TestInteractiveElementsSpacing(t *testing.T) {
 		t.Fatalf("Failed to parse HTML: %v", err)
 	}
 
-	var sb strings.Builder
-	ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-	result := strings.TrimSpace(sb.String())
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	result := strings.TrimSpace(tb.String())
 
 	// Verify paragraph spacing between elements
 	paragraphCount := 0
@@ -372,9 +374,9 @@ func TestBRElementBehavior(t *testing.T) {
 				t.Fatalf("Failed to parse HTML: %v", err)
 			}
 
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-			got := strings.TrimSpace(sb.String())
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			got := strings.TrimSpace(tb.String())
 
 			if got != tt.want {
 				t.Errorf("Got:\n%s\n\nWant:\n%s", got, tt.want)
@@ -401,7 +403,7 @@ func BenchmarkNewBlockElementExtraction(b *testing.B) {
 			b.Fatalf("Failed to parse HTML: %v", err)
 		}
 
-		var sb strings.Builder
-		ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
+		tb := table.NewTrackedBuilder()
+		ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
 	}
 }

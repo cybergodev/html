@@ -1036,3 +1036,42 @@ func TestSharedDefaultScorer(t *testing.T) {
 		t.Fatal("NewDefaultScorer() returned nil")
 	}
 }
+
+// TestIsHiddenByStyle verifies the style-based hidden-element detection used by
+// ShouldRemove. It pins the tokenized property-name comparison so that CSS
+// custom properties are not false positives and CSS-escaped names are not false
+// negatives.
+func TestIsHiddenByStyle(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		style string
+		want  bool
+	}{
+		{"display none", "display:none", true},
+		{"display none with spaces", "display: none", true},
+		{"display none uppercase", "DISPLAY: NONE", true},
+		{"display none in declaration list", "color:red;display:none", true},
+		{"visibility hidden", "visibility:hidden", true},
+		{"visibility hidden with space", "visibility: hidden", true},
+		{"display block", "display:block", false},
+		{"color only", "color:red", false},
+		{"empty", "", false},
+		// Custom property whose name merely ends in "display" must NOT be
+		// treated as display:none (previous substring match false positive).
+		{"custom property ending in display", "--my-display:none", false},
+		// CSS escape in the property name (di\splay == display) must still hide.
+		{"escaped display name", `di\splay:none`, true},
+		{"escaped visibility name", `vi\sibility:hidden`, true},
+		// A bare colon / empty property is not a hidden declaration.
+		{"no property before colon", ":none", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isHiddenByStyle(tt.style); got != tt.want {
+				t.Errorf("isHiddenByStyle(%q) = %v, want %v", tt.style, got, tt.want)
+			}
+		})
+	}
+}

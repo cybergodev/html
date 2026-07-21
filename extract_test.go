@@ -145,3 +145,40 @@ func TestPackageLevelWrappers_ConfigErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestEscapeMarkdownText pins both branches of escapeMarkdownText. The fast path
+// (input contains none of '\', '[', ']') returns the string unchanged without
+// invoking the replacer; otherwise the replacer escapes those three characters so
+// they cannot break Markdown link/image syntax. Link/image text almost never
+// contains them, so the fast path is the hot one — both must be correct.
+func TestEscapeMarkdownText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// fast path: no escapable characters
+		{"empty", "", ""},
+		{"plain ascii", `plain text`, `plain text`},
+		{"digits and spaces", `page 1 of 10`, `page 1 of 10`},
+		{"unicode no escapable", `Hello 世界 café`, `Hello 世界 café`},
+		// replacer path
+		{"backslash", `a\b`, `a\\b`},
+		{"open bracket", `a[b`, `a\[b`},
+		{"close bracket", `a]b`, `a\]b`},
+		{"all three", `a\b[c]d`, `a\\b\[c\]d`},
+		{"only brackets", `[]`, `\[\]`},
+		{"only backslash", `\`, `\\`},
+		{"link-like text", `See [Section 5] \ref`, `See \[Section 5\] \\ref`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := escapeMarkdownText(tt.in); got != tt.want {
+				t.Errorf("escapeMarkdownText(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

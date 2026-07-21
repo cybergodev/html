@@ -213,12 +213,13 @@ func getCellWidth(n *html.Node) string {
 	for _, attr := range n.Attr {
 		if strings.ToLower(attr.Key) == "style" {
 			style := attr.Val
-			// Find "width:" case-insensitively with an index valid for the
-			// original style string. Searching the original rather than a
-			// strings.ToLower copy keeps the index correct even when lowercasing
-			// would change byte length (some non-ASCII runes fold to a different
-			// number of bytes), and preserves the value's original case.
-			if idx := asciiFoldIndex(style, "width:"); idx >= 0 {
+			// Find "width:" case-insensitively, requiring it to start at a CSS
+			// boundary so it is not matched inside "border-width:", "max-width:",
+			// or "min-width:". Searching the original rather than a strings.ToLower
+			// copy keeps the index correct even when lowercasing would change byte
+			// length (some non-ASCII runes fold to a different number of bytes),
+			// and preserves the value's original case.
+			if idx := asciiFoldIndexWord(style, "width:"); idx >= 0 {
 				start := idx + len("width:")
 				for start < len(style) && (style[start] == ' ' || style[start] == '\t') {
 					start++
@@ -241,20 +242,26 @@ func getCellWidth(n *html.Node) string {
 	return ""
 }
 
-// asciiFoldIndex returns the byte index of the first ASCII-case-insensitive
-// occurrence of substr within s, or -1 if none. The returned index is valid for
-// slicing the original s: unlike strings.Index on a strings.ToLower copy, it
-// stays correct when lowercasing would change the byte length of s (some
-// non-ASCII runes fold to a different number of bytes). substr must be non-empty
-// and lowercase ASCII (the "width:" caller satisfies both).
-func asciiFoldIndex(s, substr string) int {
-	if len(substr) == 0 {
+// asciiFoldIndexWord returns the index of the first occurrence of substr in s
+// (ASCII case-insensitive) that begins at a CSS word boundary — either at the
+// start of s or immediately after a CSS boundary character. It mirrors the
+// boundary discipline of hasWordBoundary but returns an index. getCellWidth
+// uses it so "width:" is not matched inside "border-width:", "max-width:", or
+// "min-width:" (which a plain substring search would catch), matching the
+// boundary-aware behavior getCellAlign already uses for text-align.
+func asciiFoldIndexWord(s, substr string) int {
+	sl := len(substr)
+	if sl == 0 {
 		return 0
 	}
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if asciiFoldHasPrefix(s[i:], substr) {
-			return i
+	for i := 0; i+sl <= len(s); i++ {
+		if !asciiFoldHasPrefix(s[i:], substr) {
+			continue
 		}
+		if i > 0 && !isBoundaryChar(s[i-1], boundaryCSS) {
+			continue
+		}
+		return i
 	}
 	return -1
 }

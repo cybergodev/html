@@ -556,7 +556,7 @@ fmt.Printf("Cache hit rate: %.1f%%\n",
 
 ## Examples
 
-See the `examples/` directory for complete examples:
+See the `examples/` directory for complete examples (each is a self-contained `main` program guarded by a per-file `exampleNN` build tag):
 
 - `01_quick_start.go` - Basic usage
 - `02_content_extraction.go` - Content extraction features
@@ -566,6 +566,11 @@ See the `examples/` directory for complete examples:
 - `06_advanced_usage.go` - Advanced features
 - `07_error_handling.go` - Error handling patterns
 - `08_real_world.go` - Real-world scenarios
+- `09_context_cancellation.go` - Context cancellation and timeouts
+- `10_secure_file_processing.go` - AllowedBaseDir sandbox and secure file reads
+- `11_encoding.go` - Character encoding detection and override
+
+Run any one with its build tag, e.g. `go run -tags example01 ./examples/`.
 
 ## FAQ
 

@@ -691,7 +691,7 @@ processor, _ := html.New(config)
 
 ## 📁 示例代码
 
-完整的可运行示例请参见 [examples/](examples) 目录：
+完整的可运行示例请参见 [examples/](examples)：
 
 | 示例 | 描述 |
 |------|------|
@@ -703,12 +703,9 @@ processor, _ := html.New(config)
 | [06_advanced_usage.go](examples/06_advanced_usage.go) | 自定义评分器、审计日志、安全配置 |
 | [07_error_handling.go](examples/07_error_handling.go) | 错误处理模式 |
 | [08_real_world.go](examples/08_real_world.go) | 实际应用案例 |
-
-每个示例都是受 `examples` 构建标签保护的独立 `main` 程序，因此不会包含在 `go build ./...` 中，也不会影响库的构建。直接指定文件名即可运行任意示例：
-
-```bash
-go run examples/01_quick_start.go
-```
+| [09_context_cancellation.go](examples/09_context_cancellation.go) | 上下文取消与超时 |
+| [10_secure_file_processing.go](examples/10_secure_file_processing.go) | AllowedBaseDir 沙箱与安全文件读取 |
+| [11_encoding.go](examples/11_encoding.go) | 字符编码检测与覆盖 |
 
 ---
 

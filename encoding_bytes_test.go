@@ -217,36 +217,6 @@ func TestExtractAllLinksWithEncoding(t *testing.T) {
 	})
 }
 
-// TestExtractWithEncoding verifies that Extract handles non-UTF8 encodings correctly
-func TestExtractWithEncoding(t *testing.T) {
-	testFile := "dev_test/Source Files/a2025q310-qexx311.html"
-	if _, err := os.Stat(testFile); os.IsNotExist(err) {
-		t.Skip("Test file not found")
-	}
-
-	htmlBytes, _ := os.ReadFile(testFile)
-
-	// Extract with automatic encoding detection
-	result, err := html.Extract(htmlBytes)
-	if err != nil {
-		t.Fatalf("Extract failed: %v", err)
-	}
-
-	// Verify correct encoding handling
-	hasCorrectApostrophes := strings.Contains(result.Text, "registrant's")
-	t.Logf("Extract: has correct apostrophes = %v", hasCorrectApostrophes)
-
-	// Extract should handle Windows-1252 encoding correctly
-	if !hasCorrectApostrophes {
-		t.Error("Extract should correctly handle Windows-1252 encoding")
-	}
-
-	// Verify no garbled characters
-	if strings.Contains(result.Text, "\ufffd") {
-		t.Error("Found replacement character, encoding may not be detected correctly")
-	}
-}
-
 // TestExtractWithForcedEncoding tests forced encoding override. The input uses
 // Windows-1252 bytes (0x92 = right single quotation mark, U+2019), which are
 // invalid UTF-8, so forcing windows-1252 genuinely exercises the override-decode

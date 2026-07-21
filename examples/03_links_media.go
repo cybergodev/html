@@ -99,6 +99,27 @@ func main() {
 	filteredLinks, _ := filterProcessor.ExtractAllLinks([]byte(htmlContent))
 	fmt.Printf("Content links only (CSS/JS excluded): %d\n", len(filteredLinks))
 
+	// Internal links only: IncludeExternalLinks=false drops every link whose
+	// host differs from the (detected) BaseURL. The fixture's one external
+	// link — https://golang.org — disappears from the result.
+	internalCfg := html.DefaultConfig()
+	internalCfg.IncludeExternalLinks = false
+	internalProcessor, err := html.New(internalCfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer internalProcessor.Close()
+
+	internalLinks, _ := internalProcessor.ExtractAllLinks([]byte(htmlContent))
+	hasExternal := false
+	for _, l := range internalLinks {
+		if strings.Contains(l.URL, "golang.org") {
+			hasExternal = true
+		}
+	}
+	fmt.Printf("Internal links only (external excluded): %d (golang.org present: %v)\n",
+		len(internalLinks), hasExternal)
+
 	// ============================================================
 	// PART 3: Image extraction
 	// ============================================================

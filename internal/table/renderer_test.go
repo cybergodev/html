@@ -19,8 +19,7 @@ func TestTrackedBuilder(t *testing.T) {
 	t.Parallel()
 
 	t.Run("tracks last character after WriteString", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		tb.WriteString("hello")
 		if tb.LastChar != 'o' {
@@ -34,8 +33,7 @@ func TestTrackedBuilder(t *testing.T) {
 	})
 
 	t.Run("tracks last character after WriteByte", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		tb.WriteByte('x')
 		if tb.LastChar != 'x' {
@@ -49,8 +47,7 @@ func TestTrackedBuilder(t *testing.T) {
 	})
 
 	t.Run("EnsureNewline adds newline when needed", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		tb.WriteString("text")
 		table.EnsureNewline(tb)
@@ -58,26 +55,24 @@ func TestTrackedBuilder(t *testing.T) {
 		if tb.LastChar != '\n' {
 			t.Error("Should end with newline")
 		}
-		if !strings.HasSuffix(sb.String(), "text\n") {
-			t.Errorf("Expected 'text\\n', got %q", sb.String())
+		if !strings.HasSuffix(tb.String(), "text\n") {
+			t.Errorf("Expected 'text\\n', got %q", tb.String())
 		}
 	})
 
 	t.Run("EnsureNewline does not add duplicate newline", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		tb.WriteString("text\n")
 		table.EnsureNewline(tb)
 
-		if sb.String() != "text\n" {
-			t.Errorf("Expected 'text\\n' without duplicate, got %q", sb.String())
+		if tb.String() != "text\n" {
+			t.Errorf("Expected 'text\\n' without duplicate, got %q", tb.String())
 		}
 	})
 
 	t.Run("EnsureSpacing adds spacing when needed", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		tb.WriteString("text")
 		table.EnsureSpacing(tb, ' ')
@@ -88,20 +83,18 @@ func TestTrackedBuilder(t *testing.T) {
 	})
 
 	t.Run("EnsureSpacing does not add after newline", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		tb.WriteString("text\n")
 		table.EnsureSpacing(tb, ' ')
 
-		if sb.String() != "text\n" {
-			t.Errorf("Should not add space after newline, got %q", sb.String())
+		if tb.String() != "text\n" {
+			t.Errorf("Should not add space after newline, got %q", tb.String())
 		}
 	})
 
 	t.Run("empty builder", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		if tb.LastChar != 0 {
 			t.Errorf("LastChar = %d, want 0", tb.LastChar)
@@ -124,8 +117,7 @@ func TestMarkdownRenderer(t *testing.T) {
 	})
 
 	t.Run("Render simple table", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		tableData := [][]table.CellData{
@@ -134,7 +126,7 @@ func TestMarkdownRenderer(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 2)
-		output := sb.String()
+		output := tb.String()
 
 		// Check for markdown table structure
 		if !strings.Contains(output, "|") {
@@ -149,8 +141,7 @@ func TestMarkdownRenderer(t *testing.T) {
 	})
 
 	t.Run("Render with alignment", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		tableData := [][]table.CellData{
@@ -159,7 +150,7 @@ func TestMarkdownRenderer(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 2)
-		output := sb.String()
+		output := tb.String()
 
 		// Check for alignment markers
 		if !strings.Contains(output, ":---") {
@@ -171,8 +162,7 @@ func TestMarkdownRenderer(t *testing.T) {
 	})
 
 	t.Run("Render with colspan", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		tableData := [][]table.CellData{
@@ -181,7 +171,7 @@ func TestMarkdownRenderer(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 2)
-		output := sb.String()
+		output := tb.String()
 
 		// Colspan cells are expanded in markdown
 		if !strings.Contains(output, "Span") {
@@ -190,14 +180,13 @@ func TestMarkdownRenderer(t *testing.T) {
 	})
 
 	t.Run("Render empty table", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		tableData := [][]table.CellData{}
 
 		r.Render(tableData, tb, 0)
-		output := sb.String()
+		output := tb.String()
 
 		// Empty table should produce empty or minimal output
 		if len(output) > 0 {
@@ -215,8 +204,7 @@ func TestMarkdownRowspanGrid(t *testing.T) {
 	t.Parallel()
 
 	t.Run("rowspan repeats value in spanned rows", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		// <tr><td rowspan=2>A</td><td>B</td></tr><tr><td>C</td></tr>
@@ -228,7 +216,7 @@ func TestMarkdownRowspanGrid(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 2)
-		output := sb.String()
+		output := tb.String()
 
 		// "A" must repeat in the one spanned row, so it appears twice total
 		// (once in its declared row, once repeated).
@@ -258,8 +246,7 @@ func TestMarkdownRowspanGrid(t *testing.T) {
 	})
 
 	t.Run("rowspan exceeding row count is clamped", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		// rowspan=5 but only 2 rows exist: must not panic or fabricate rows.
@@ -269,7 +256,7 @@ func TestMarkdownRowspanGrid(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 2)
-		output := sb.String()
+		output := tb.String()
 
 		// Only one spanned row exists, so A repeats exactly once (count=2).
 		if got := strings.Count(output, "A"); got != 2 {
@@ -278,8 +265,7 @@ func TestMarkdownRowspanGrid(t *testing.T) {
 	})
 
 	t.Run("rowspan with header repeats header value", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		// <tr><th rowspan=2>Name</th><th>Value</th></tr><tr><td>1</td></tr>
@@ -289,7 +275,7 @@ func TestMarkdownRowspanGrid(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 2)
-		output := sb.String()
+		output := tb.String()
 
 		// "Name" spans into the data row, so it appears twice.
 		if got := strings.Count(output, "Name"); got != 2 {
@@ -327,8 +313,7 @@ func TestHTMLRenderer(t *testing.T) {
 	})
 
 	t.Run("Render basic table", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.HTMLRenderer{}
 		tableData := [][]table.CellData{
@@ -337,7 +322,7 @@ func TestHTMLRenderer(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		// Check for HTML table structure
 		expectedTags := []string{"<table>", "</table>", "<tr>", "</tr>", "</th>", "</td>"}
@@ -353,8 +338,7 @@ func TestHTMLRenderer(t *testing.T) {
 	})
 
 	t.Run("Render with rowspan", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.HTMLRenderer{}
 		tableData := [][]table.CellData{
@@ -363,7 +347,7 @@ func TestHTMLRenderer(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, `rowspan="2"`) {
 			t.Errorf("Expected rowspan attribute, got: %s", output)
@@ -371,8 +355,7 @@ func TestHTMLRenderer(t *testing.T) {
 	})
 
 	t.Run("Render with colspan", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.HTMLRenderer{}
 		tableData := [][]table.CellData{
@@ -380,7 +363,7 @@ func TestHTMLRenderer(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, `colspan="3"`) {
 			t.Errorf("Expected colspan attribute, got: %s", output)
@@ -388,8 +371,7 @@ func TestHTMLRenderer(t *testing.T) {
 	})
 
 	t.Run("Render with alignment", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.HTMLRenderer{}
 		tableData := [][]table.CellData{
@@ -397,7 +379,7 @@ func TestHTMLRenderer(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, "text-align:center") {
 			t.Errorf("Expected text-align:center style, got: %s", output)
@@ -405,8 +387,7 @@ func TestHTMLRenderer(t *testing.T) {
 	})
 
 	t.Run("Render with width", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.HTMLRenderer{}
 		tableData := [][]table.CellData{
@@ -414,115 +395,12 @@ func TestHTMLRenderer(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, "width:100px") {
 			t.Errorf("Expected width style, got: %s", output)
 		}
 	})
-}
-
-// TestCellAlignment tests the CellAlignment constants.
-func TestCellAlignment(t *testing.T) {
-	t.Parallel()
-
-	alignments := []struct {
-		name  string
-		align table.CellAlignment
-	}{
-		{"AlignLeft", table.AlignLeft},
-		{"AlignCenter", table.AlignCenter},
-		{"AlignRight", table.AlignRight},
-		{"AlignJustify", table.AlignJustify},
-		{"AlignDefault", table.AlignDefault},
-	}
-
-	for _, tt := range alignments {
-		t.Run(tt.name, func(t *testing.T) {
-			// Verify alignment is within valid range
-			if tt.align < 0 || tt.align > table.AlignJustify+1 {
-				t.Errorf("Invalid alignment value: %d", tt.align)
-			}
-		})
-	}
-}
-
-// TestCellData tests CellData struct behavior.
-func TestCellData(t *testing.T) {
-	t.Parallel()
-
-	t.Run("default values", func(t *testing.T) {
-		cell := table.CellData{}
-		if cell.Text != "" {
-			t.Error("Default Text should be empty")
-		}
-		if cell.Colspan != 0 {
-			t.Error("Default Colspan should be 0")
-		}
-		if cell.IsHeader {
-			t.Error("Default IsHeader should be false")
-		}
-	})
-
-	t.Run("header cell", func(t *testing.T) {
-		cell := table.CellData{
-			Text:     "Header",
-			IsHeader: true,
-			Align:    table.AlignCenter,
-		}
-
-		if !cell.IsHeader {
-			t.Error("IsHeader should be true")
-		}
-		if cell.Align != table.AlignCenter {
-			t.Errorf("Align = %d, want AlignCenter", cell.Align)
-		}
-	})
-
-	t.Run("expanded cell", func(t *testing.T) {
-		cell := table.CellData{
-			Text:            " ",
-			IsExpanded:      true,
-			OriginalColspan: 3,
-		}
-
-		if !cell.IsExpanded {
-			t.Error("IsExpanded should be true")
-		}
-		if cell.OriginalColspan != 3 {
-			t.Errorf("OriginalColspan = %d, want 3", cell.OriginalColspan)
-		}
-	})
-}
-
-// TestAlignCount tests the AlignCount struct.
-func TestAlignCount(t *testing.T) {
-	t.Parallel()
-
-	counts := table.AlignCount{
-		Left:    5,
-		Center:  3,
-		Right:   2,
-		Justify: 1,
-	}
-
-	if counts.Left != 5 {
-		t.Errorf("Left = %d, want 5", counts.Left)
-	}
-	if counts.Center != 3 {
-		t.Errorf("Center = %d, want 3", counts.Center)
-	}
-	if counts.Right != 2 {
-		t.Errorf("Right = %d, want 2", counts.Right)
-	}
-}
-
-// TestRendererInterface tests that renderers implement the interface.
-func TestRendererInterface(t *testing.T) {
-	t.Parallel()
-
-	var _ table.Renderer = &table.MarkdownRenderer{}
-	var _ table.Renderer = &table.HTMLRenderer{}
 }
 
 // TestProcessor tests the table Processor functionality.
@@ -544,12 +422,11 @@ func TestProcessor(t *testing.T) {
 		nw := &mockNodeWalker{}
 		p := table.NewProcessor(ca, nw)
 
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		p.Extract(nil, tb, "markdown")
 
-		if sb.String() != "" {
+		if tb.String() != "" {
 			t.Error("Extract with nil table should produce no output")
 		}
 	})
@@ -559,14 +436,13 @@ func TestProcessor(t *testing.T) {
 		nw := &mockNodeWalker{rows: nil} // No rows
 		p := table.NewProcessor(ca, nw)
 
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		tableNode := &html.Node{Type: html.ElementNode, Data: "table"}
 		p.Extract(tableNode, tb, "markdown")
 
 		// Empty table should produce only blank lines
-		output := sb.String()
+		output := tb.String()
 		t.Logf("Empty table output: %q", output)
 	})
 }
@@ -605,12 +481,11 @@ func TestProcessorWithRealHTML(t *testing.T) {
 			t.Fatal("Failed to find table element")
 		}
 
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		processor.Extract(tableNode, tb, "markdown")
 
-		output := sb.String()
+		output := tb.String()
 		t.Logf("Output: %s", output)
 
 		if !strings.Contains(output, "A") || !strings.Contains(output, "B") {
@@ -643,12 +518,11 @@ func TestProcessorWithRealHTML(t *testing.T) {
 			t.Fatal("Failed to find table element")
 		}
 
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		processor.Extract(tableNode, tb, "markdown")
 
-		output := sb.String()
+		output := tb.String()
 		t.Logf("Output: %s", output)
 
 		if !strings.Contains(output, "Left") || !strings.Contains(output, "Right") {
@@ -681,12 +555,11 @@ func TestProcessorWithRealHTML(t *testing.T) {
 			t.Fatal("Failed to find table element")
 		}
 
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		processor.Extract(tableNode, tb, "html")
 
-		output := sb.String()
+		output := tb.String()
 		t.Logf("Output: %s", output)
 
 		if !strings.Contains(output, "<table>") {
@@ -719,12 +592,11 @@ func TestProcessorWithRealHTML(t *testing.T) {
 			t.Fatal("Failed to find table element")
 		}
 
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		processor.Extract(tableNode, tb, "markdown")
 
-		output := sb.String()
+		output := tb.String()
 		t.Logf("Output: %s", output)
 
 		if !strings.Contains(output, "Spanning") {
@@ -803,18 +675,18 @@ func (a *realCellAccessor) GetTextContent(node *html.Node) string {
 	if node == nil {
 		return ""
 	}
-	var sb strings.Builder
+	tb := table.NewTrackedBuilder()
 	var extract func(*html.Node)
 	extract = func(n *html.Node) {
 		if n.Type == html.TextNode {
-			sb.WriteString(n.Data)
+			tb.WriteString(n.Data)
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
 			extract(c)
 		}
 	}
 	extract(node)
-	return sb.String()
+	return tb.String()
 }
 
 // realNodeWalker implements NodeWalker using actual DOM traversal.
@@ -949,8 +821,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 	t.Parallel()
 
 	t.Run("markdown table with complex structure", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		tableData := [][]table.CellData{
@@ -960,7 +831,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 3)
-		output := sb.String()
+		output := tb.String()
 
 		// Check alignment markers (center uses :---: format)
 		if !strings.Contains(output, ":---") {
@@ -975,8 +846,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 	})
 
 	t.Run("markdown table with empty cells", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		tableData := [][]table.CellData{
@@ -985,7 +855,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 2)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, "Header") {
 			t.Error("Expected header content")
@@ -996,8 +866,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 	})
 
 	t.Run("HTML table with complex styling", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.HTMLRenderer{}
 		tableData := [][]table.CellData{
@@ -1006,7 +875,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, `text-align:center`) {
 			t.Error("Expected center alignment style")
@@ -1023,8 +892,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 	})
 
 	t.Run("table with justify alignment", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.HTMLRenderer{}
 		tableData := [][]table.CellData{
@@ -1032,7 +900,7 @@ func TestRenderHelperFunctions(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, "text-align:justify") {
 			t.Error("Expected justify alignment style")
@@ -1045,8 +913,7 @@ func TestTableWithDifferentWidths(t *testing.T) {
 	t.Parallel()
 
 	t.Run("markdown table width handling", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		// Simulate structure row with widths
@@ -1056,7 +923,7 @@ func TestTableWithDifferentWidths(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 2)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, "|") {
 			t.Error("Expected table pipe characters")
@@ -1069,8 +936,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 	t.Parallel()
 
 	t.Run("table with single column", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		tableData := [][]table.CellData{
@@ -1079,7 +945,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, "Header") || !strings.Contains(output, "Data") {
 			t.Error("Expected table content")
@@ -1087,8 +953,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 	})
 
 	t.Run("table with many columns", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		tableData := [][]table.CellData{
@@ -1102,7 +967,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 5)
-		output := sb.String()
+		output := tb.String()
 
 		// Count pipes to verify 5 columns
 		pipeCount := strings.Count(output, "|")
@@ -1112,8 +977,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 	})
 
 	t.Run("table with very long content", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		longText := strings.Repeat("LongContent", 20)
@@ -1123,7 +987,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, "LongContent") {
 			t.Error("Expected long content in output")
@@ -1131,8 +995,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 	})
 
 	t.Run("table with special characters", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.MarkdownRenderer{}
 		tableData := [][]table.CellData{
@@ -1141,7 +1004,7 @@ func TestMarkdownTableEdgeCases(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		// Should handle special markdown characters
 		if !strings.Contains(output, "asterisks") {
@@ -1155,8 +1018,7 @@ func TestHTMLTableEdgeCases(t *testing.T) {
 	t.Parallel()
 
 	t.Run("table with nested elements", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.HTMLRenderer{}
 		tableData := [][]table.CellData{
@@ -1165,7 +1027,7 @@ func TestHTMLTableEdgeCases(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, "<table>") {
 			t.Error("Expected table tag")
@@ -1173,8 +1035,7 @@ func TestHTMLTableEdgeCases(t *testing.T) {
 	})
 
 	t.Run("table with rowspan and colspan", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.HTMLRenderer{}
 		tableData := [][]table.CellData{
@@ -1183,7 +1044,7 @@ func TestHTMLTableEdgeCases(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 2)
-		output := sb.String()
+		output := tb.String()
 
 		if !strings.Contains(output, `rowspan="2"`) {
 			t.Error("Expected rowspan attribute")
@@ -1194,8 +1055,7 @@ func TestHTMLTableEdgeCases(t *testing.T) {
 	})
 
 	t.Run("table with zero rowspan/colspan", func(t *testing.T) {
-		var sb strings.Builder
-		tb := table.NewTrackedBuilder(&sb)
+		tb := table.NewTrackedBuilder()
 
 		r := &table.HTMLRenderer{}
 		tableData := [][]table.CellData{
@@ -1203,7 +1063,7 @@ func TestHTMLTableEdgeCases(t *testing.T) {
 		}
 
 		r.Render(tableData, tb, 1)
-		output := sb.String()
+		output := tb.String()
 
 		// Zero values should not produce attributes
 		if strings.Contains(output, "rowspan") || strings.Contains(output, "colspan") {

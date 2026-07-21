@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 func TestDetectCharset(t *testing.T) {
@@ -343,6 +345,35 @@ func TestForcedEncoding(t *testing.T) {
 	expected := "Test\u2019\u201C\u201D" // 0x92->', 0x93->", 0x94->"
 	if string(converted) != expected {
 		t.Errorf("Forced encoding conversion = %q, want %q", string(converted), expected)
+	}
+}
+
+// TestForcedEncodingOverridesSmartDetection is a regression test for a bug
+// where DetectAndConvert bypassed ForcedEncoding whenever smart detection was
+// enabled (the default), silently ignoring Config.Encoding. The existing
+// TestForcedEncoding used an input whose bytes smart detection coincidentally
+// classified as windows-1252, so it passed even with the bypass. GBK bytes are
+// not reliably identified as GBK by statistical detection, so this input
+// decodes correctly only when the forced encoding actually wins.
+func TestForcedEncodingOverridesSmartDetection(t *testing.T) {
+	utf8 := []byte("<html><body>\u4F60\u597D\u4E16\u754C</body></html>")
+	gbk, err := simplifiedchinese.GBK.NewEncoder().Bytes(utf8)
+	if err != nil {
+		t.Fatalf("encode GBK: %v", err)
+	}
+
+	ed := NewEncodingDetector() // EnableSmartDetection defaults to true
+	ed.ForcedEncoding = "gbk"
+
+	converted, charset, err := ed.DetectAndConvert(gbk)
+	if err != nil {
+		t.Fatalf("DetectAndConvert() error = %v", err)
+	}
+	if charset != "gbk" {
+		t.Errorf("charset = %q, want %q (forced encoding was bypassed)", charset, "gbk")
+	}
+	if want := string(utf8); string(converted) != want {
+		t.Errorf("converted = %q, want %q", string(converted), want)
 	}
 }
 

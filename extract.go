@@ -326,11 +326,17 @@ func (p *Processor) extractCoreWithContext(ctx context.Context, htmlBytes []byte
 		return nil, err
 	}
 
-	// Check cache only if caching is enabled. hasCacheKey tracks whether a key
-	// was generated for this input so the result is cached on the miss path
-	// without relying on the key being non-zero — a hash could, in principle,
-	// be all zero bytes, which the old `cacheKey != ([16]byte{})` guard would
-	// wrongly treat as "no key" and skip caching.
+	// Check the cache only when caching is enabled. hasCacheKey records that a
+	// key was generated for this input so the freshly computed result is stored
+	// on the miss path. It is equivalent to (MaxCacheEntries > 0) here, but kept
+	// as an explicit flag so the "was a key produced?" intent reads clearly at
+	// both the lookup below and the store after processing.
+	//
+	// Note: Cache.Get/Set treat the zero key ([16]byte{}) as "no key" and reject
+	// it, so in the astronomically unlikely event (2^-128) that this hash comes
+	// out all zero, that input is simply a permanent cache miss — reprocessed on
+	// every call. This is an accepted tradeoff, not something hasCacheKey can or
+	// needs to remedy.
 	var cacheKey [16]byte
 	hasCacheKey := false
 	if p.config.MaxCacheEntries > 0 {
@@ -752,13 +758,12 @@ func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string) 
 			result.Links = links
 		}
 
-		sb := internal.GetBuilder()
-		sb.Grow(initialTextSize)
+		tb := internal.GetTrackedBuilder()
 		imageCounter := 0
 		linkCounter := 0
-		internal.ExtractTextWithStructureAndImages(contentNode, sb, &imageCounter, &linkCounter, p.config.TableFormat)
-		textWithPlaceholders := internal.CleanText(sb.String(), nil)
-		internal.PutBuilder(sb)
+		internal.ExtractTextWithStructureAndImages(contentNode, tb, &imageCounter, &linkCounter, p.config.TableFormat)
+		textWithPlaceholders := internal.CleanText(tb.String())
+		internal.PutTrackedBuilder(tb)
 
 		// Apply formatters in order: images first, then links
 		result.Text = p.formatInlineImages(textWithPlaceholders, images, imageFormat)
@@ -840,24 +845,33 @@ func (p *Processor) extractArticleNode(doc *stdxhtml.Node) *stdxhtml.Node {
 	if doc == nil {
 		return nil
 	}
-	// Pre-allocate map with initial capacity to reduce resizing
-	candidates := make(map[*stdxhtml.Node]int, initialMapCap)
 
-	internal.WalkNodes(doc, func(n *stdxhtml.Node) bool {
-		// Only score elements that can plausibly be an article root. Inline/
-		// phrasing/media tags (a, span, em, img, br, …) have tiny subtrees that
-		// never win SelectBestCandidate, and Score() walks the full subtree of
-		// every candidate (collectContentMetrics), so skipping them avoids an
-		// O(N×subtree) traversal surge with no change to the selected node. Score
-		// already short-circuits 'p' and IsNonContentElement tags the same way;
-		// this only broadens that skip. Custom/namespaced/block tags still score.
-		if n.Type == stdxhtml.ElementNode && !internal.IsInlineElement(n.Data) {
-			if score := p.scorer.Score(n); score > 0 {
-				candidates[n] = score
+	// Fast path: the built-in DefaultScorer can score all candidates from a single
+	// bottom-up metrics pass (ScoreArticleCandidates), avoiding the O(N²) per-
+	// candidate subtree re-walk that Score+collectContentMetrics would otherwise
+	// repeat for every non-inline element. Custom scorers lack that method and
+	// fall back to the per-node Score() loop, whose behavior is unchanged.
+	var candidates map[*stdxhtml.Node]int
+	if ds, ok := p.scorer.(*internal.DefaultScorer); ok {
+		candidates = ds.ScoreArticleCandidates(doc)
+	} else {
+		candidates = make(map[*stdxhtml.Node]int, initialMapCap)
+		internal.WalkNodes(doc, func(n *stdxhtml.Node) bool {
+			// Only score elements that can plausibly be an article root. Inline/
+			// phrasing/media tags (a, span, em, img, br, …) have tiny subtrees that
+			// never win SelectBestCandidate, and Score() walks the full subtree of
+			// every candidate (collectContentMetrics), so skipping them avoids an
+			// O(N×subtree) traversal surge with no change to the selected node. Score
+			// already short-circuits 'p' and IsNonContentElement tags the same way;
+			// this only broadens that skip. Custom/namespaced/block tags still score.
+			if n.Type == stdxhtml.ElementNode && !internal.IsInlineElement(n.Data) {
+				if score := p.scorer.Score(n); score > 0 {
+					candidates[n] = score
+				}
 			}
-		}
-		return true
-	})
+			return true
+		})
+	}
 	if bestNode := internal.SelectBestCandidate(candidates); bestNode != nil {
 		return bestNode
 	}
@@ -865,11 +879,14 @@ func (p *Processor) extractArticleNode(doc *stdxhtml.Node) *stdxhtml.Node {
 }
 
 func (p *Processor) extractTextContent(node *stdxhtml.Node, tableFormat string) string {
-	sb := internal.GetBuilder()
-	sb.Grow(initialTextSize)
-	internal.ExtractTextWithStructureAndImages(node, sb, nil, nil, tableFormat)
-	result := internal.CleanText(sb.String(), nil)
-	internal.PutBuilder(sb)
+	// A pooled TrackedBuilder retains its capacity across calls (unlike a pooled
+	// *strings.Builder, whose Reset nils the buffer), so the document-length text
+	// is appended into a buffer that is already large enough after warmup — no
+	// per-call growth allocations or the GC churn they cause.
+	tb := internal.GetTrackedBuilder()
+	internal.ExtractTextWithStructureAndImages(node, tb, nil, nil, tableFormat)
+	result := internal.CleanText(tb.String())
+	internal.PutTrackedBuilder(tb)
 	return result
 }
 
@@ -1063,7 +1080,7 @@ func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantL
 		images = make([]ImageInfo, 0, initialSliceCap)
 	}
 	if wantLinks {
-		links = make([]LinkInfo, 0, initialSliceCap)
+		links = make([]LinkInfo, 0, linksInitialCap)
 	}
 	if !wantImages && !wantLinks {
 		return images, links

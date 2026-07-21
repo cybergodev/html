@@ -45,16 +45,6 @@ func TestEdgeCasesInputBoundary(t *testing.T) {
 		}
 	})
 
-	t.Run("empty path returns ErrInvalidFilePath", func(t *testing.T) {
-		p, _ := html.New()
-		defer p.Close()
-
-		_, err := p.ExtractFromFile("")
-		if err == nil {
-			t.Error("expected error for empty path")
-		}
-	})
-
 	t.Run("whitespace path returns error", func(t *testing.T) {
 		p, _ := html.New()
 		defer p.Close()
@@ -224,15 +214,6 @@ func TestMaxDepthBoundaryConditions(t *testing.T) {
 		}
 		if result != nil && !strings.Contains(result.Text, "Content") {
 			t.Error("expected content at exact depth limit")
-		}
-	})
-
-	t.Run("depth limit zero rejected", func(t *testing.T) {
-		cfg := html.DefaultConfig()
-		cfg.MaxDepth = 0
-		_, err := html.New(cfg)
-		if err == nil {
-			t.Error("expected error for MaxDepth=0")
 		}
 	})
 

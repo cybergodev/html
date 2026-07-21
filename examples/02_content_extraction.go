@@ -89,40 +89,46 @@ func main() {
 	fmt.Printf("Images: %d, Links: %d\n\n", len(result.Images), len(result.Links))
 
 	// ============================================================
-	// 3. Image Format Options
+	// 3. Inline Format Options (Images & Links)
 	// ============================================================
-	fmt.Println("3. Image Format Options")
-	fmt.Println("-----------------------")
+	fmt.Println("3. Inline Format Options (Images & Links)")
+	fmt.Println("-------------------------------------------")
 
+	// InlineImageFormat controls how <img> is rendered in Text.
 	imageHTML := `<img src="photo.jpg" alt="Photo" width="800">`
-	formats := []string{"none", "markdown", "html", "placeholder"}
-
-	for _, format := range formats {
+	for _, format := range []string{"none", "markdown", "html", "placeholder"} {
 		cfg := html.DefaultConfig()
 		cfg.InlineImageFormat = format
 		r, _ := html.Extract([]byte(imageHTML), cfg)
-		fmt.Printf("  %-12s: %s\n", format, r.Text)
+		fmt.Printf("  image %-11s: %s\n", format, r.Text)
 	}
+
+	// InlineLinkFormat controls how <a> is rendered in Text.
+	linkHTML := `<p>See the <a href="https://go.dev">Go site</a> for docs.</p>`
+	for _, format := range []string{"none", "markdown", "html"} {
+		cfg := html.DefaultConfig()
+		cfg.InlineLinkFormat = format
+		r, _ := html.Extract([]byte(linkHTML), cfg)
+		fmt.Printf("  link  %-11s: %s\n", format, r.Text)
+	}
+	fmt.Println()
 
 	// ============================================================
 	// 4. Table Format Options
 	// ============================================================
-	fmt.Println("\n4. Table Format Options")
+	fmt.Println("4. Table Format Options")
 	fmt.Println("-----------------------")
 
-	// Markdown table (default)
-	fmt.Println("Markdown table (default):")
-	mdProcessor2, err := html.New(html.MarkdownConfig())
-	if err != nil {
-		log.Fatal(err)
+	// A table-only fixture keeps the rendering comparison free of unrelated
+	// image/link noise. Markdown (default) is compact; html preserves the tags.
+	tableHTML := "<table><tr><th>Lang</th><th>Year</th></tr><tr><td>Go</td><td>2009</td></tr></table>"
+	for _, format := range []string{"markdown", "html"} {
+		cfg := html.DefaultConfig()
+		cfg.TableFormat = format
+		r, _ := html.Extract([]byte(tableHTML), cfg)
+		fmt.Printf("  TableFormat=%-9s:\n%s\n", format, r.Text)
 	}
-	defer mdProcessor2.Close()
-	mdResult2, _ := mdProcessor2.Extract([]byte(sampleHTML))
-	if len(mdResult2.Text) > 150 {
-		fmt.Printf("%s...\n\n", mdResult2.Text[:150])
-	} else {
-		fmt.Printf("%s\n\n", mdResult2.Text)
-	}
+	fmt.Println()
 
 	// ============================================================
 	// 5. JSON Output
@@ -204,5 +210,10 @@ func main() {
 	fmt.Println("  processor, _ := html.New(cfg)")
 	fmt.Println()
 	fmt.Println("Image formats:  none | markdown | html | placeholder")
+	fmt.Println("Link formats:   none | markdown | html")
+	fmt.Println("Table formats:  markdown | html")
 	fmt.Println("Output methods: Extract(), ExtractToJSON(), ExtractToMarkdown()")
+	fmt.Println()
+	fmt.Println("Scope: ExtractArticle (default true) auto-detects the main content node;")
+	fmt.Println("       set false to extract the whole <body> instead.")
 }

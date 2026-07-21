@@ -42,6 +42,17 @@ var dangerousCSSPatterns = []string{
 	"vbscript:",
 }
 
+// c0ControlOrSpace is the byte set browsers strip from the leading and trailing
+// edge of a URL before scheme resolution (WHATWG URL Standard: "Remove any
+// leading and trailing C0 control or space from input"): the C0 controls
+// U+0000–U+001F plus ASCII space U+0020. strings.TrimSpace covers Unicode
+// whitespace but not most C0 controls, so a leading byte such as "\x01" must be
+// trimmed explicitly or it disguises a dangerous scheme from HasPrefix checks
+// ("\x01javascript:…" is not detected) while the browser strips it and executes
+// "javascript:".
+const c0ControlOrSpace = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f" +
+	"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f "
+
 // maxAuditURLLength limits the URL value passed to audit RecordBlockedURL.
 // Data URLs can contain large base64 payloads; logging the full content
 // wastes disk space and risks leaking embedded sensitive content.
@@ -141,17 +152,19 @@ func SanitizeHTMLWithAudit(htmlContent string, audit AuditRecorder) string {
 	return buf.String()
 }
 
-// findBodyElement locates the body element in the parsed HTML document
+// findBodyElement locates the body element in the parsed HTML document.
+// html.Parse nests <body> under <html> (Document → html → {head, body}), so
+// <body> is a grandchild of the document node rather than a direct child; a
+// direct-children walk (the old implementation) therefore returned nil for
+// every real document and forced SanitizeHTMLWithAudit onto its fragment
+// fallback, leaking <html><head>… into output when head carried surviving
+// content. FindElementByTag descends the subtree to locate it correctly. The
+// DocumentNode guard above is retained so non-document input still returns nil.
 func findBodyElement(doc *html.Node) *html.Node {
 	if doc.Type != html.DocumentNode {
 		return nil
 	}
-	for child := doc.FirstChild; child != nil; child = child.NextSibling {
-		if child.Type == html.ElementNode && child.Data == "body" {
-			return child
-		}
-	}
-	return nil
+	return FindElementByTag(doc, "body")
 }
 
 func sanitizeNodeWithAudit(n *html.Node, audit AuditRecorder) {
@@ -230,150 +243,6 @@ func removeNode(n *html.Node) {
 	}
 }
 
-// RemoveTagContent removes all occurrences of the specified HTML tag and its content.
-// This function uses string-based parsing as the primary method to handle edge cases
-// like unclosed tags, malformed HTML, and to preserve original character case.
-func RemoveTagContent(content, tag string) string {
-	if content == "" || tag == "" {
-		return content
-	}
-
-	// Quick check: if tag is not present, return as-is
-	if indexASCIIFold(content, "<"+tag) == -1 {
-		return content
-	}
-
-	return removeTagContentStringBased(content, tag)
-}
-
-// asciiEqualFold checks if two ASCII strings are equal case-insensitively.
-func asciiEqualFold(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		ca, cb := a[i], b[i]
-		if ca >= 'A' && ca <= 'Z' {
-			ca += 32
-		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 32
-		}
-		if ca != cb {
-			return false
-		}
-	}
-	return true
-}
-
-// indexASCIIFold finds the case-insensitive index of target in s (ASCII only).
-// Optimized to use strings.IndexByte for fast first-character scanning.
-func indexASCIIFold(s, target string) int {
-	targetLen := len(target)
-	sLen := len(s)
-	if targetLen == 0 {
-		return 0
-	}
-	if sLen < targetLen {
-		return -1
-	}
-	// Use IndexByte to scan for the first character (SIMD-optimized)
-	firstByte := target[0]
-	pos := 0
-	for pos <= sLen-targetLen {
-		idx := strings.IndexByte(s[pos:], firstByte)
-		if idx < 0 {
-			// Also check uppercase variant
-			var upperByte byte
-			if firstByte >= 'a' && firstByte <= 'z' {
-				upperByte = firstByte - 32
-			} else {
-				break
-			}
-			idx = strings.IndexByte(s[pos:], upperByte)
-			if idx < 0 {
-				break
-			}
-		}
-		idx += pos
-		if idx+targetLen > sLen {
-			return -1
-		}
-		if asciiEqualFold(s[idx:idx+targetLen], target) {
-			return idx
-		}
-		pos = idx + 1
-	}
-	return -1
-}
-
-// removeTagContentStringBased removes tags using string operations.
-// This approach preserves character case and handles malformed HTML better than DOM parsing.
-// Uses BuilderPool for memory efficiency to reduce allocations during string building.
-// Optimized to avoid strings.ToLower copy of full content.
-func removeTagContentStringBased(content, tag string) string {
-	openTag := "<" + strings.ToLower(tag)
-	closeTag := "</" + strings.ToLower(tag) + ">"
-
-	// Use pooled builder for better memory efficiency
-	sb := GetBuilder()
-	defer PutBuilder(sb)
-
-	sb.Grow(len(content))
-
-	pos := 0
-	for pos < len(content) {
-		// Find the next opening tag (case-insensitive) without creating a lowercase copy
-		start := indexASCIIFold(content[pos:], openTag)
-		if start == -1 {
-			sb.WriteString(content[pos:])
-			break
-		}
-		start += pos
-
-		// Verify this is actually the tag we're looking for
-		tagNameLen := len(tag) + 1 // +1 for the '<'
-		if start+tagNameLen < len(content) {
-			nextChar := content[start+tagNameLen]
-			lc := nextChar
-			if lc >= 'A' && lc <= 'Z' {
-				lc += 32
-			}
-			if lc != ' ' && lc != '>' && lc != '\t' && lc != '\n' && lc != '/' {
-				sb.WriteString(content[pos : start+tagNameLen])
-				pos = start + tagNameLen
-				continue
-			}
-		}
-
-		// Write content before the tag
-		sb.WriteString(content[pos:start])
-
-		// Find the end of the opening tag
-		tagEnd := strings.IndexByte(content[start:], '>')
-		if tagEnd == -1 {
-			sb.WriteString(content[start:])
-			break
-		}
-		tagEnd += start + 1
-		if tagEnd > len(content) {
-			tagEnd = len(content)
-		}
-
-		// Look for the corresponding closing tag (case-insensitive, no copy)
-		if end := indexASCIIFold(content[tagEnd:], closeTag); end != -1 {
-			// Found closing tag, skip everything between opening and closing
-			pos = tagEnd + end + len(closeTag)
-		} else {
-			// No closing tag found, this is malformed HTML
-			// Skip the opening tag and continue
-			pos = tagEnd
-		}
-	}
-
-	return sb.String()
-}
-
 func isSafeURIWithAudit(uri string, audit AuditRecorder) bool {
 	if uri == "" {
 		return true
@@ -390,7 +259,25 @@ func isSafeURIWithAudit(uri string, audit AuditRecorder) bool {
 	normalized := normalizeURIForSecurity(uri)
 
 	trimmed := strings.TrimSpace(normalized)
-	lowerURI := strings.ToLower(trimmed)
+	// SECURITY: Browsers strip tab/LF/CR anywhere in a URL while parsing
+	// (WHATWG URL Standard). A scheme split by those bytes — e.g.
+	// "java\tscript:alert(1)" — survives NFC + TrimSpace (which only touch
+	// Unicode form and the string's edges) and evades the HasPrefix scheme
+	// checks below, yet is reassembled to "javascript:" and executed by every
+	// conformant browser. Strip the three bytes before any scheme detection so
+	// the lowerURI used by isDangerousScheme and the "data:" prefix test cannot
+	// be disguised this way.
+	//
+	// SECURITY: Browsers also strip leading/trailing C0 control bytes
+	// (U+0000–U+001F) and ASCII space before scheme resolution. TrimSpace
+	// covers Unicode whitespace but not most C0 controls, so a leading byte
+	// such as "\x01" would otherwise survive and disguise a dangerous scheme
+	// ("\x01javascript:…" defeats every HasPrefix check below) while the
+	// browser strips it and executes "javascript:". schemeStripped feeds scheme
+	// detection; trimmed (un-stripped) is still passed to the data-URL body
+	// parser below, since bytes there are content, not scheme.
+	schemeStripped := strings.Trim(trimmed, c0ControlOrSpace)
+	lowerURI := strings.ToLower(stripURLWhitespace(schemeStripped))
 
 	// SECURITY: Reject oversized non-data URIs to bound the work spent parsing a
 	// hostile attribute and to keep sanitization consistent with IsValidURL's
@@ -459,6 +346,28 @@ func normalizeURIForSecurity(uri string) string {
 	return norm.NFC.String(uri)
 }
 
+// stripURLWhitespace removes the bytes that browsers delete while parsing a
+// URL — tab (U+0009), LF (U+000A), and CR (U+000D) per the WHATWG URL Standard.
+// It is applied before scheme detection so a dangerous scheme cannot be
+// disguised by interleaving these bytes (e.g. "java\tscript:"). The fast path
+// returns the input unchanged (zero allocation) when none of the bytes are
+// present, which is the case for the overwhelming majority of real URLs.
+func stripURLWhitespace(s string) string {
+	if !strings.ContainsAny(s, "\t\n\r") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\t', '\n', '\r':
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
 // isDangerousScheme checks if a URI starts with a dangerous scheme,
 // accounting for various Unicode attack vectors including fullwidth characters.
 func isDangerousScheme(lowerURI, scheme string) bool {
@@ -500,6 +409,55 @@ func normalizeFullwidthToASCII(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// containsDangerousScheme reports whether uri begins with a scheme — or a
+// protocol-relative form — that a browser may execute or that reaches the local
+// filesystem: javascript:, vbscript:, file: (and //data:, //javascript:, …).
+//
+// It is a focused "is the scheme dangerous?" predicate, not a full URL
+// allowlist: callers keep accepting http(s), relative paths, fragments,
+// mailto/tel, and (via their own branch) safe data: URLs. The point is to close
+// the defense-in-depth gap in IsValidURL, which is used by code paths that
+// deliberately bypass the DOM sanitizer — ExtractAllLinks skips sanitization,
+// and the raw-HTML video/audio scan reads pre-sanitization HTML — so a URL such
+// as "javascript:alert(1).mp4" otherwise sailed through merely because its first
+// byte 'j' is alphanumeric.
+//
+// The normalization pipeline mirrors isSafeURIWithAudit exactly (NFC, trim,
+// leading/trailing C0+space strip, tab/LF/CR removal, ASCII-case fold, plus
+// fullwidth folding) so a disguised scheme cannot pass here while the sanitizer
+// blocks it — the two enforce one scheme policy.
+func containsDangerousScheme(uri string) bool {
+	if uri == "" {
+		return false
+	}
+
+	normalized := normalizeURIForSecurity(uri)
+	trimmed := strings.TrimSpace(normalized)
+	schemeStripped := strings.Trim(trimmed, c0ControlOrSpace)
+	lowerURI := strings.ToLower(stripURLWhitespace(schemeStripped))
+
+	if isDangerousScheme(lowerURI, "javascript:") ||
+		isDangerousScheme(lowerURI, "vbscript:") ||
+		isDangerousScheme(lowerURI, "file:") {
+		return true
+	}
+
+	// Protocol-relative dangerous forms: //javascript:, //vbscript:, //data:,
+	// //file:. Match the sanitizer's protocol-relative branch (including the
+	// TrimLeft of ASCII whitespace after the //) so the two stay consistent.
+	if strings.HasPrefix(trimmed, "//") {
+		restLower := strings.ToLower(strings.TrimLeft(trimmed[2:], " \t\n\r"))
+		if isDangerousScheme(restLower, "javascript:") ||
+			isDangerousScheme(restLower, "vbscript:") ||
+			isDangerousScheme(restLower, "data:") ||
+			isDangerousScheme(restLower, "file:") {
+			return true
+		}
+	}
+
+	return false
 }
 
 func isValidDataURLWithAudit(url string, audit AuditRecorder) bool {

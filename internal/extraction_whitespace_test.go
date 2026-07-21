@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"golang.org/x/net/html"
+
+	"github.com/cybergodev/html/internal/table"
 )
 
 // TestWhitespacePreservation tests that whitespace is correctly preserved
@@ -64,9 +66,9 @@ func TestWhitespacePreservation(t *testing.T) {
 				t.Fatalf("Failed to parse HTML: %v", err)
 			}
 
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-			result := strings.TrimSpace(sb.String())
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			result := strings.TrimSpace(tb.String())
 
 			if result != tt.expected {
 				t.Errorf("Expected %q, got %q", tt.expected, result)
@@ -84,9 +86,9 @@ func TestOriginalSECCase(t *testing.T) {
 		t.Fatalf("Failed to parse HTML: %v", err)
 	}
 
-	var sb strings.Builder
-	ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-	result := strings.TrimSpace(sb.String())
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	result := strings.TrimSpace(tb.String())
 
 	// Based on current logic: the span element adds spacing after itself
 	// which causes ") " text node to see a space as previous char

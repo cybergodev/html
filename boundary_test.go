@@ -15,6 +15,18 @@ import (
 
 const boundaryTestHTML = `<html><head><title>Boundary Test</title></head><body><article><p>Content</p></article></body></html>`
 
+// writeTempHTML writes content to a fresh temp .html file and returns its path.
+// It replaces the repeated tmpDir/tmpFile/os.WriteFile boilerplate across the
+// *FromFile* tests in this file.
+func writeTempHTML(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "test.html")
+	if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp html: %v", err)
+	}
+	return p
+}
+
 // TestPackageLevelWithContextFunctions tests the package-level WithContext functions
 // that had 0% coverage.
 func TestPackageLevelWithContextFunctions(t *testing.T) {
@@ -41,9 +53,7 @@ func TestPackageLevelWithContextFunctions(t *testing.T) {
 	})
 
 	t.Run("ExtractFromFileWithContext", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		tmpFile := filepath.Join(tmpDir, "test.html")
-		os.WriteFile(tmpFile, []byte(boundaryTestHTML), 0644)
+		tmpFile := writeTempHTML(t, boundaryTestHTML)
 
 		result, err := html.ExtractFromFileWithContext(context.Background(), tmpFile)
 		if err != nil {
@@ -55,9 +65,7 @@ func TestPackageLevelWithContextFunctions(t *testing.T) {
 	})
 
 	t.Run("ExtractTextFromFileWithContext", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		tmpFile := filepath.Join(tmpDir, "test.html")
-		os.WriteFile(tmpFile, []byte(boundaryTestHTML), 0644)
+		tmpFile := writeTempHTML(t, boundaryTestHTML)
 
 		text, err := html.ExtractTextFromFileWithContext(context.Background(), tmpFile)
 		if err != nil {
@@ -140,9 +148,7 @@ func TestPackageLevelOutputWithContext(t *testing.T) {
 	})
 
 	t.Run("ExtractToMarkdownFromFileWithContext", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		tmpFile := filepath.Join(tmpDir, "test.html")
-		os.WriteFile(tmpFile, []byte(boundaryTestHTML), 0644)
+		tmpFile := writeTempHTML(t, boundaryTestHTML)
 
 		md, err := html.ExtractToMarkdownFromFileWithContext(context.Background(), tmpFile)
 		if err != nil {
@@ -164,9 +170,7 @@ func TestPackageLevelOutputWithContext(t *testing.T) {
 	})
 
 	t.Run("ExtractToJSONFromFileWithContext", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		tmpFile := filepath.Join(tmpDir, "test.html")
-		os.WriteFile(tmpFile, []byte(boundaryTestHTML), 0644)
+		tmpFile := writeTempHTML(t, boundaryTestHTML)
 
 		jsonData, err := html.ExtractToJSONFromFileWithContext(context.Background(), tmpFile)
 		if err != nil {
@@ -196,9 +200,7 @@ func TestPackageLevelLinksWithContext(t *testing.T) {
 	})
 
 	t.Run("ExtractAllLinksFromFileWithContext", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		tmpFile := filepath.Join(tmpDir, "test.html")
-		os.WriteFile(tmpFile, []byte(linkHTML), 0644)
+		tmpFile := writeTempHTML(t, linkHTML)
 
 		links, err := html.ExtractAllLinksFromFileWithContext(context.Background(), tmpFile)
 		if err != nil {

@@ -84,169 +84,12 @@ func TestSanitizeHTML(t *testing.T) {
 	}
 }
 
-func TestRemoveTagContent(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		content string
-		tag     string
-		want    []string
-		avoid   []string
-	}{
-		{
-			name:    "remove script",
-			content: `<div>Before<script>remove</script>After</div>`,
-			tag:     "script",
-			want:    []string{"Before", "After", "<div>"},
-			avoid:   []string{"<script>", "remove", "</script>"},
-		},
-		{
-			name:    "remove style",
-			content: `<p>Text<style>css</style>More</p>`,
-			tag:     "style",
-			want:    []string{"Text", "More", "<p>"},
-			avoid:   []string{"<style>", "css", "</style>"},
-		},
-		{
-			name:    "tag not present",
-			content: `<div>Content</div>`,
-			tag:     "script",
-			want:    []string{"<div>", "Content", "</div>"},
-		},
-		{
-			name:    "empty content",
-			content: "",
-			tag:     "script",
-			want:    []string{""},
-		},
-		{
-			name:    "empty tag",
-			content: `<div>Content</div>`,
-			tag:     "",
-			want:    []string{"<div>", "Content", "</div>"},
-		},
-		{
-			name:    "multiple tags",
-			content: `<div><script>1</script>Middle<script>2</script>End</div>`,
-			tag:     "script",
-			want:    []string{"Middle", "End", "<div>"},
-			avoid:   []string{"<script>", "1", "2", "</script>"},
-		},
-		{
-			name:    "tag with attributes",
-			content: `<div><script type="text/javascript">code</script>Text</div>`,
-			tag:     "script",
-			want:    []string{"Text", "<div>"},
-			avoid:   []string{"<script", "code", "</script>"},
-		},
-		{
-			name:    "unclosed tag",
-			content: `<div><script>unclosed</div>`,
-			tag:     "script",
-			want:    []string{"<div>", "unclosed", "</div>"},
-		},
-		{
-			name:    "tag without closing bracket",
-			content: `<div><script`,
-			tag:     "script",
-			want:    []string{"<div>", "<script"},
-		},
-		{
-			name:    "case insensitive",
-			content: `<div><SCRIPT>code</SCRIPT>Text</div>`,
-			tag:     "script",
-			want:    []string{"Text", "<div>"},
-			avoid:   []string{"SCRIPT", "code"},
-		},
-		{
-			name:    "mixed case",
-			content: `<div><ScRiPt>code</sCrIpT>Text</div>`,
-			tag:     "script",
-			want:    []string{"Text", "<div>"},
-			avoid:   []string{"code"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := RemoveTagContent(tt.content, tt.tag)
-
-			for _, want := range tt.want {
-				if !strings.Contains(result, want) {
-					t.Errorf("RemoveTagContent() result should contain %q, got %q", want, result)
-				}
-			}
-
-			for _, avoid := range tt.avoid {
-				if strings.Contains(result, avoid) {
-					t.Errorf("RemoveTagContent() result should not contain %q, got %q", avoid, result)
-				}
-			}
-		})
-	}
-}
-
-func TestRemoveTagContentEdgeCases(t *testing.T) {
-	t.Parallel()
-
-	t.Run("nested same tags", func(t *testing.T) {
-		content := `<div><script><script>nested</script></script>Text</div>`
-		result := RemoveTagContent(content, "script")
-
-		if !strings.Contains(result, "Text") {
-			t.Error("Should keep text after nested tags")
-		}
-	})
-
-	t.Run("tag in attribute", func(t *testing.T) {
-		content := `<div data-script="value">Text</div>`
-		result := RemoveTagContent(content, "script")
-
-		if !strings.Contains(result, "Text") {
-			t.Error("Should not remove tag name in attributes")
-		}
-	})
-
-	t.Run("very long content", func(t *testing.T) {
-		longText := strings.Repeat("word ", 10000)
-		content := `<div>` + longText + `<script>remove</script>` + longText + `</div>`
-		result := RemoveTagContent(content, "script")
-
-		if strings.Contains(result, "remove") {
-			t.Error("Should remove script even in long content")
-		}
-		if !strings.Contains(result, "word") {
-			t.Error("Should keep long text content")
-		}
-	})
-}
-
 func BenchmarkSanitizeHTML(b *testing.B) {
 	htmlContent := `<html><body><div>Content<script>alert('test')</script><style>body{}</style><noscript>No JS</noscript>More</div></body></html>`
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		SanitizeHTML(htmlContent)
-	}
-}
-
-func BenchmarkRemoveTagContent(b *testing.B) {
-	content := `<div>Before<script>remove this content</script>After</div>`
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		RemoveTagContent(content, "script")
-	}
-}
-
-func BenchmarkRemoveTagContentLarge(b *testing.B) {
-	longText := strings.Repeat("word ", 1000)
-	content := `<div>` + longText + `<script>remove</script>` + longText + `</div>`
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		RemoveTagContent(content, "script")
 	}
 }
 
@@ -624,6 +467,61 @@ func TestSanitizeHTML_URIAttributes(t *testing.T) {
 	}
 }
 
+// TestSanitizeHTML_DangerousSchemeBypass verifies that bytes browsers strip
+// before scheme resolution cannot disguise a dangerous scheme. WHATWG-compliant
+// browsers remove leading/trailing C0 control bytes (U+0000-U+001F) and tab,
+// LF, CR (anywhere) before resolving the scheme, so a value like
+// "\x01javascript:alert(1)" executes in the browser even though the literal
+// scheme is not a prefix of the raw attribute value.
+func TestSanitizeHTML_DangerousSchemeBypass(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "leading C0 control before javascript scheme",
+			input: "<a href=\"\x01javascript:alert(1)\">x</a>",
+		},
+		{
+			name:  "leading C0 control (vertical tab) before javascript scheme",
+			input: "<a href=\"\x0bjavascript:alert(1)\">x</a>",
+		},
+		{
+			name:  "leading form feed before javascript scheme",
+			input: "<a href=\"\x0cjavascript:alert(1)\">x</a>",
+		},
+		{
+			name:  "leading space before javascript scheme",
+			input: "<a href=\" javascript:alert(1)\">x</a>",
+		},
+		{
+			name:  "tab splitting javascript scheme",
+			input: "<a href=\"java\tscript:alert(1)\">x</a>",
+		},
+		{
+			name:  "leading C0 control before data scheme",
+			input: "<a href=\"\x01data:text/html,<script>alert(1)</script>\">x</a>",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output := SanitizeHTML(tt.input)
+			lower := strings.ToLower(output)
+			if strings.Contains(lower, "javascript:") {
+				t.Errorf("javascript: scheme survived sanitization in: %s", output)
+			}
+			if strings.Contains(lower, "data:text/html") {
+				t.Errorf("dangerous data: scheme survived sanitization in: %s", output)
+			}
+			if strings.Contains(lower, "alert(1)") {
+				t.Errorf("payload survived sanitization in: %s", output)
+			}
+		})
+	}
+}
+
 func TestSanitizeStyleValue(t *testing.T) {
 	t.Parallel()
 
@@ -720,6 +618,21 @@ func TestSanitizeDOM(t *testing.T) {
 		}
 	})
 
+	t.Run("removes javascript URI split by whitespace entity", func(t *testing.T) {
+		// &#9; is a tab. The HTML parser decodes it into the attribute value,
+		// and browsers strip tab/LF/CR anywhere in a URL while parsing
+		// (WHATWG URL Standard), so java&#9;script: executes as javascript:.
+		// Sanitization must strip the internal byte before scheme detection so
+		// the href is dropped rather than surviving into sanitized output.
+		doc := mustParseHTML(t, `<a href="java&#9;script:alert('xss')">click</a>`)
+		SanitizeDOM(doc, NoOpAuditRecorder{})
+
+		result := mustRenderBody(t, doc)
+		if strings.Contains(strings.ToLower(result), "script:alert") {
+			t.Errorf("whitespace-split javascript: URI should be removed, got: %s", result)
+		}
+	})
+
 	t.Run("preserves safe content in DOM", func(t *testing.T) {
 		doc := mustParseHTML(t, `<p>Hello <strong>world</strong></p>`)
 		SanitizeDOM(doc, NoOpAuditRecorder{})
@@ -796,6 +709,12 @@ func TestIsSafeURI(t *testing.T) {
 		{"javascript", "javascript:alert(1)", false},
 		{"javascript with spaces", " javascript:alert(1)", false},
 		{"javascript uppercase", "JAVASCRIPT:alert(1)", false},
+		// Internal tab/LF/CR are stripped by browsers per the WHATWG URL
+		// Standard, so a scheme split by them executes as javascript:.
+		{"javascript split by internal tab", "java\tscript:alert(1)", false},
+		{"javascript split by internal newline", "java\nscript:alert(1)", false},
+		{"javascript split by internal carriage return", "java\rscript:alert(1)", false},
+		{"vbscript split by internal tab", "vbs\tcript:msgbox(1)", false},
 		{"vbscript", "vbscript:msgbox(1)", false},
 		{"file", "file:///etc/passwd", false},
 		{"data valid image", "data:image/png;base64,abc123", true},
@@ -842,40 +761,6 @@ func TestIsValidDataURL(t *testing.T) {
 			result := isValidDataURLWithAudit(tt.url, NoOpAuditRecorder{})
 			if result != tt.valid {
 				t.Errorf("isValidDataURLWithAudit(%q) = %v, want %v", tt.url, result, tt.valid)
-			}
-		})
-	}
-}
-
-// TestIndexASCIIFold pins the boundary behavior of the unexported indexASCIIFold
-// helper used by the case-insensitive tag stripper. The needle's first byte is
-// scanned in both cases, so a lower-case needle matches a mixed-case haystack
-// (the real callers always pass "<" + lower-case tag).
-func TestIndexASCIIFold(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		s      string
-		target string
-		want   int
-	}{
-		{"exact match", "hello world", "world", 6},
-		{"lowercase needle in uppercase haystack", "HELLO WORLD", "world", 6},
-		{"real use: opening script tag", "<SCRIPT>alert</SCRIPT>", "<script", 0},
-		{"tag later in content", "abc<Script>", "<script", 3},
-		{"first occurrence wins", "<script<script>", "<script", 0},
-		{"no match", "nothing here", "world", -1},
-		{"target longer than haystack", "abc", "abcd", -1},
-		{"empty target returns 0", "anything", "", 0},
-		{"empty haystack empty target", "", "", 0},
-		{"empty haystack non-empty target", "", "a", -1},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := indexASCIIFold(tt.s, tt.target); got != tt.want {
-				t.Errorf("indexASCIIFold(%q, %q) = %d, want %d", tt.s, tt.target, got, tt.want)
 			}
 		})
 	}

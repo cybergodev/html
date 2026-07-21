@@ -84,9 +84,22 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 
 // extractTableData walks through table rows and extracts cell data.
 func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]CellData {
+	// Config.Validate accepts TableFormat case-insensitively and the renderer
+	// registry lowercases on lookup, so normalize once here to keep the
+	// colspan-expansion / structure-row branches (which compare case-sensitively
+	// below) consistent with both. Without this, "HTML" renders via the HTML
+	// renderer but takes the Markdown data path (colspans expanded into separate
+	// cells, width-definition rows dropped), silently producing wrong tables.
+	tableFormat = strings.ToLower(tableFormat)
 	// Typical tables have several rows; pre-size to avoid the first outer-slice
 	// doublings (16 → 32 → …). Grows naturally for larger tables.
 	tableData := make([][]CellData, 0, 8)
+	// scratch is reused across rows: extractRowCells resets it to [:0] and appends
+	// into it each row, replacing a per-row make([]CellData, 0, 4). The Markdown
+	// path consumes the row via expandColspanCells (a fresh slice), leaving the
+	// scratch free to reuse; the HTML path copies the row out of scratch before
+	// storing it, because the next row overwrites the same backing array.
+	var scratch []CellData
 
 	p.nodeWalker.Walk(table, func(node *html.Node) bool {
 		if node.Type != html.ElementNode || node.Data != "tr" {
@@ -94,7 +107,7 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 		}
 
 		// Extract cells from this row
-		rawCells := p.extractRowCells(node)
+		rawCells := p.extractRowCells(node, &scratch)
 		if len(rawCells) == 0 {
 			return false
 		}
@@ -102,16 +115,22 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 		// Determine if this is a structure row (width definitions only, no real content)
 		isStructureRow := isStructureRow(rawCells)
 
-		// Expand cells with colspan for Markdown format
-		cells := rawCells
-		if tableFormat != "html" {
-			cells = expandColspanCells(rawCells)
+		// HTML keeps colspan as an attribute (no expansion). The row is stored
+		// into tableData, so it must own its backing — copy it out of scratch,
+		// which the next row resets with [:0]. (Structure rows are a Markdown
+		// concept and are always kept for HTML, matching the prior behavior.)
+		if tableFormat == "html" {
+			cells := make([]CellData, len(rawCells))
+			copy(cells, rawCells)
+			tableData = append(tableData, cells)
+			return false
 		}
 
-		// Add row to table data (skip structure rows for Markdown)
-		if tableFormat == "html" {
-			tableData = append(tableData, cells)
-		} else if !isStructureRow {
+		// Markdown: expand colspans into separate cells. expandColspanCells
+		// allocates a fresh slice, so scratch is dead here and reused next row.
+		// Skip structure rows (width definitions only).
+		cells := expandColspanCells(rawCells)
+		if !isStructureRow {
 			tableData = append(tableData, cells)
 		}
 
@@ -122,8 +141,14 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 }
 
 // extractRowCells extracts all cell data from a single table row (tr element).
-func (p *Processor) extractRowCells(rowNode *html.Node) []CellData {
-	cells := make([]CellData, 0, 4)
+// It appends into the caller-provided scratch buffer (reset to [:0] first) and
+// returns a slice that shares that backing array. Because the next row reuses the
+// same scratch, a caller that retains the returned slice across rows — e.g. by
+// storing it in tableData — must copy it first. extractTableData does this for
+// the HTML path; the Markdown path consumes the row via expandColspanCells,
+// which allocates a fresh slice and leaves scratch free to reuse.
+func (p *Processor) extractRowCells(rowNode *html.Node, scratch *[]CellData) []CellData {
+	cells := (*scratch)[:0]
 
 	for child := rowNode.FirstChild; child != nil; child = child.NextSibling {
 		if child.Type != html.ElementNode || (child.Data != "td" && child.Data != "th") {
@@ -149,6 +174,9 @@ func (p *Processor) extractRowCells(rowNode *html.Node) []CellData {
 		})
 	}
 
+	// Propagate any capacity growth back to the scratch holder so later rows
+	// benefit from it rather than re-growing from the original cap.
+	*scratch = cells
 	return cells
 }
 

@@ -186,6 +186,38 @@ func normalizeText(s string) string {
 	return sb.String()
 }
 
+// commonHTMLEntities lists the ten most frequent HTML entities, ordered roughly
+// by frequency. It is the single source of truth shared by replaceEntityAt and
+// fastReplaceCommonEntities; previously the same ten mappings were hand-copied
+// across three switches, so adding an entity required editing all three in
+// sync. Each entry is the full entity token (including & and ;) and its
+// replacement.
+var commonHTMLEntities = [...]struct {
+	token string
+	repl  string
+}{
+	{"&amp;", "&"},
+	{"&nbsp;", " "},
+	{"&lt;", "<"},
+	{"&gt;", ">"},
+	{"&quot;", "\""},
+	{"&apos;", "'"},
+	{"&copy;", "©"},
+	{"&reg;", "®"},
+	{"&mdash;", "—"},
+	{"&ndash;", "–"},
+}
+
+// maxEntityScanLen bounds how far the entity decoders look ahead for a
+// terminating ';'. HTML named character references are at most 32 characters
+// long (e.g. &CounterClockwiseContourIntegral;), so an ampersand with no ';'
+// within '&' + 32 + ';' = 34 bytes cannot begin a valid entity and is treated
+// as a literal '&'. The bound also converts what was an O(n²) scan over
+// ampersand-heavy input — every bare '&' re-scanned the whole tail for a ';'
+// via strings.IndexByte — into O(n). Numeric references are far shorter, so the
+// same bound safely covers them too.
+const maxEntityScanLen = 34
+
 // replaceEntityAt handles an HTML entity starting at position pos.
 // Returns the replacement string and the number of bytes consumed.
 func replaceEntityAt(text string, pos int) (string, int) {
@@ -200,29 +232,12 @@ func replaceEntityAt(text string, pos int) (string, int) {
 		return "&", 1
 	}
 
-	// Check for common entities first (most frequent case)
+	// Check for common entities first (most frequent case), table-driven.
 	remainingLen := textLen - pos
-	switch {
-	case remainingLen >= 5 && text[pos:pos+5] == "&amp;":
-		return "&", 5
-	case remainingLen >= 6 && text[pos:pos+6] == "&nbsp;":
-		return " ", 6
-	case remainingLen >= 4 && text[pos:pos+4] == "&lt;":
-		return "<", 4
-	case remainingLen >= 4 && text[pos:pos+4] == "&gt;":
-		return ">", 4
-	case remainingLen >= 6 && text[pos:pos+6] == "&quot;":
-		return "\"", 6
-	case remainingLen >= 6 && text[pos:pos+6] == "&apos;":
-		return "'", 6
-	case remainingLen >= 6 && text[pos:pos+6] == "&copy;":
-		return "©", 6
-	case remainingLen >= 5 && text[pos:pos+5] == "&reg;":
-		return "®", 5
-	case remainingLen >= 7 && text[pos:pos+7] == "&mdash;":
-		return "—", 7
-	case remainingLen >= 7 && text[pos:pos+7] == "&ndash;":
-		return "–", 7
+	for _, e := range commonHTMLEntities {
+		if remainingLen >= len(e.token) && text[pos:pos+len(e.token)] == e.token {
+			return e.repl, len(e.token)
+		}
 	}
 
 	// Check for numeric entity
@@ -230,8 +245,15 @@ func replaceEntityAt(text string, pos int) (string, int) {
 		return replaceNumericEntity(text, pos)
 	}
 
-	// Find semicolon for named entity
-	semi := strings.IndexByte(text[pos:], ';')
+	// Find the semicolon for a named entity. Bound the scan to maxEntityScanLen:
+	// a valid named reference is at most 32 chars, so a ';' beyond this window
+	// cannot terminate an entity starting at pos. Without the bound, a run of N
+	// bare ampersands (no ';') made this O(N²) — each '&' re-scanned the tail.
+	scanEnd := pos + maxEntityScanLen
+	if scanEnd > textLen {
+		scanEnd = textLen
+	}
+	semi := strings.IndexByte(text[pos:scanEnd], ';')
 	if semi == -1 {
 		return "&", 1
 	}
@@ -254,7 +276,7 @@ var unwantedCharReplacer = strings.NewReplacer(
 	"☑", "[X]",
 )
 
-func CleanText(text string, whitespaceRegex *regexp.Regexp) string {
+func CleanText(text string) string {
 	if text == "" {
 		return ""
 	}
@@ -298,6 +320,15 @@ func CleanText(text string, whitespaceRegex *regexp.Regexp) string {
 			return ReplaceHTMLEntities(text)
 		}
 		return text
+	}
+
+	// Normalize NBSP (U+00A0, UTF-8 0xC2 0xA0) to a regular space, matching
+	// normalizeText and GetTextContent. hasNBSP routed us here, but the body
+	// below only matches ' ' and '\t', so without this the NBSP bytes passed
+	// through verbatim — inconsistent with the other normalizers.
+	if hasNBSP {
+		text = strings.ReplaceAll(text, " ", " ")
+		n = len(text)
 	}
 
 	sb := GetBuilder()
@@ -483,6 +514,8 @@ func WalkNodesWithTruncation(node *html.Node, fn func(*html.Node) bool) (truncat
 	return false, visitedCount
 }
 
+// FindElementByTag returns the first element node with the given tag name found
+// in a pre-order traversal of doc, or nil if none exists.
 func FindElementByTag(doc *html.Node, tagName string) *html.Node {
 	var result *html.Node
 	WalkNodes(doc, func(n *html.Node) bool {
@@ -495,6 +528,8 @@ func FindElementByTag(doc *html.Node, tagName string) *html.Node {
 	return result
 }
 
+// GetTextContent returns the concatenated text of node and its descendants
+// with surrounding whitespace trimmed. It returns "" for a nil node.
 func GetTextContent(node *html.Node) string {
 	if node == nil {
 		return ""
@@ -628,45 +663,6 @@ func GetTextContent(node *html.Node) string {
 	return string(*bp)
 }
 
-func GetTextLength(node *html.Node) int {
-	length := 0
-	WalkNodes(node, func(n *html.Node) bool {
-		if n.Type == html.TextNode {
-			length += len(strings.TrimSpace(normalizeText(n.Data)))
-		}
-		return true
-	})
-	return length
-}
-
-func GetLinkDensity(node *html.Node) float64 {
-	if node == nil {
-		return 0.0
-	}
-
-	textLength := 0
-	linkTextLength := 0
-
-	WalkNodes(node, func(n *html.Node) bool {
-		if n.Type == html.TextNode {
-			length := len(strings.TrimSpace(normalizeText(n.Data)))
-			textLength += length
-			for parent := n.Parent; parent != nil; parent = parent.Parent {
-				if parent.Type == html.ElementNode && parent.Data == "a" {
-					linkTextLength += length
-					break
-				}
-			}
-		}
-		return true
-	})
-
-	if textLength == 0 {
-		return 0.0
-	}
-	return float64(linkTextLength) / float64(textLength)
-}
-
 var entityReplacer = strings.NewReplacer(
 	// Note: Common entities (&amp;, &nbsp;, &lt;, &gt;, &quot;, &apos;, &copy;, &reg;, &mdash;, &ndash;)
 	// are handled in fastReplaceCommonEntities() for better performance.
@@ -757,30 +753,14 @@ func fastReplaceCommonEntities(text string) string {
 			if firstAmpersand == -1 {
 				firstAmpersand = i
 			}
-			// Immediately check for common entity at this position
+			// Immediately check for a common entity at this position (table-driven).
 			if !hasCommonEntity {
 				remLen := textLen - i
-				switch {
-				case remLen >= 5 && text[i:i+5] == "&amp;":
-					hasCommonEntity = true
-				case remLen >= 6 && text[i:i+6] == "&nbsp;":
-					hasCommonEntity = true
-				case remLen >= 4 && text[i:i+4] == "&lt;":
-					hasCommonEntity = true
-				case remLen >= 4 && text[i:i+4] == "&gt;":
-					hasCommonEntity = true
-				case remLen >= 6 && text[i:i+6] == "&quot;":
-					hasCommonEntity = true
-				case remLen >= 6 && text[i:i+6] == "&apos;":
-					hasCommonEntity = true
-				case remLen >= 6 && text[i:i+6] == "&copy;":
-					hasCommonEntity = true
-				case remLen >= 5 && text[i:i+5] == "&reg;":
-					hasCommonEntity = true
-				case remLen >= 7 && text[i:i+7] == "&mdash;":
-					hasCommonEntity = true
-				case remLen >= 7 && text[i:i+7] == "&ndash;":
-					hasCommonEntity = true
+				for _, e := range commonHTMLEntities {
+					if remLen >= len(e.token) && text[i:i+len(e.token)] == e.token {
+						hasCommonEntity = true
+						break
+					}
 				}
 			}
 		}
@@ -823,40 +803,18 @@ func fastReplaceCommonEntities(text string) string {
 			continue
 		}
 
-		// Fast switch for common entities (ordered by frequency)
-		// Each case checks bounds before slicing to prevent panic
-		switch {
-		case remainingLen >= 5 && text[i:i+5] == "&amp;":
-			sb.WriteByte('&')
-			i += 5
-		case remainingLen >= 6 && text[i:i+6] == "&nbsp;":
-			sb.WriteByte(' ')
-			i += 6
-		case remainingLen >= 4 && text[i:i+4] == "&lt;":
-			sb.WriteByte('<')
-			i += 4
-		case remainingLen >= 4 && text[i:i+4] == "&gt;":
-			sb.WriteByte('>')
-			i += 4
-		case remainingLen >= 6 && text[i:i+6] == "&quot;":
-			sb.WriteByte('"')
-			i += 6
-		case remainingLen >= 6 && text[i:i+6] == "&apos;":
-			sb.WriteByte('\'')
-			i += 6
-		case remainingLen >= 6 && text[i:i+6] == "&copy;":
-			sb.WriteString("©")
-			i += 6
-		case remainingLen >= 5 && text[i:i+5] == "&reg;":
-			sb.WriteString("®")
-			i += 5
-		case remainingLen >= 7 && text[i:i+7] == "&mdash;":
-			sb.WriteString("—")
-			i += 7
-		case remainingLen >= 7 && text[i:i+7] == "&ndash;":
-			sb.WriteString("–")
-			i += 7
-		default:
+		// Common entities, table-driven (ordered by frequency). Each entry
+		// checks bounds before slicing to prevent panic.
+		matched := false
+		for _, e := range commonHTMLEntities {
+			if remainingLen >= len(e.token) && text[i:i+len(e.token)] == e.token {
+				sb.WriteString(e.repl)
+				i += len(e.token)
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			// Not a common entity, copy as-is
 			sb.WriteByte(text[i])
 			i++
@@ -897,8 +855,14 @@ func replaceHTMLEntitiesFull(text string) string {
 			continue
 		}
 
-		// For non-numeric entities, find the semicolon
-		semi := strings.IndexByte(text[i:], ';')
+		// For non-numeric entities, find the semicolon. Bound the scan to
+		// maxEntityScanLen so ampersand-heavy input without a terminator is O(n)
+		// rather than O(n²) (see replaceEntityAt).
+		scanEnd := i + maxEntityScanLen
+		if scanEnd > len(text) {
+			scanEnd = len(text)
+		}
+		semi := strings.IndexByte(text[i:scanEnd], ';')
 		if semi == -1 {
 			// No semicolon found, write the '&' and continue
 			sb.WriteByte(text[i])
@@ -931,12 +895,26 @@ func replaceHTMLEntitiesFull(text string) string {
 // SECURITY: Includes validation to prevent DoS and injection attacks through
 // malformed or malicious numeric entities.
 func replaceNumericEntity(text string, start int) (string, int) {
+	// Maximum valid Unicode code point is 0x10FFFF: at most 8 decimal digits or
+	// 6 hex digits. maxEntityLength covers the hex prefix + digits and also
+	// bounds the ';' search below so '&#' runs without a terminator are O(n),
+	// not O(n²).
+	const maxEntityLength = 10
+
 	if start+2 >= len(text) || text[start+1] != '#' {
 		return string(text[start]), 1
 	}
 
-	// Find the semicolon
-	semi := strings.IndexByte(text[start:], ';')
+	// Find the semicolon, bounded to maxEntityScanLen so '&#' runs without a
+	// terminator are O(n), not O(n²) (each scans at most maxEntityScanLen bytes
+	// instead of the whole tail). A ';' beyond the window cannot belong to a
+	// valid numeric reference (at most maxEntityLength digits); treating the '&'
+	// as literal and resuming reproduces the previous verbatim output.
+	scanEnd := start + maxEntityScanLen
+	if scanEnd > len(text) {
+		scanEnd = len(text)
+	}
+	semi := strings.IndexByte(text[start:scanEnd], ';')
 	if semi == -1 {
 		return string(text[start]), 1
 	}
@@ -948,9 +926,6 @@ func replaceNumericEntity(text string, start int) (string, int) {
 	}
 
 	// Security: limit entity length to prevent DoS through extremely long numeric strings.
-	// Maximum valid Unicode code point is 0x10FFFF which requires at most 8 decimal digits
-	// or 6 hexadecimal digits. We allow up to 10 characters to handle hex prefix + digits.
-	const maxEntityLength = 10
 	if len(entity) > maxEntityLength {
 		return text[start : semi+1], semi - start + 1
 	}
@@ -1040,6 +1015,20 @@ func IsValidURL(url string) bool {
 		return false
 	}
 
+	// SECURITY: Reject dangerous schemes (javascript:, vbscript:, file:) and
+	// their protocol-relative forms before the format checks below. IsValidURL
+	// is a format validator reached by paths that deliberately bypass the DOM
+	// sanitizer: ExtractAllLinks skips sanitization, and the raw-HTML
+	// video/audio scan reads pre-sanitization HTML. Without this gate a URL
+	// such as "javascript:alert(1).mp4" passed because its first byte 'j' is
+	// alphanumeric and the char scan below only blocks control bytes and
+	// <>"'. containsDangerousScheme applies the same Unicode/C0/whitespace
+	// normalization as the DOM sanitizer, so disguised schemes (leading C0
+	// controls, embedded tab/LF/CR, fullwidth) are blocked identically here.
+	if containsDangerousScheme(url) {
+		return false
+	}
+
 	// Special handling for data URLs - stricter validation with size limit
 	if strings.HasPrefix(url, "data:") {
 		if urlLen > MaxDataURILength {
@@ -1077,8 +1066,8 @@ func IsValidURL(url string) bool {
 		return true
 	}
 
-	// Accept absolute URLs
-	if strings.HasPrefix(url, "https://") || strings.HasPrefix(url, "http://") {
+	// Accept absolute URLs (scheme is case-insensitive per RFC 3986 §3.1).
+	if hasHTTPScheme(url) {
 		return true
 	}
 
@@ -1135,6 +1124,8 @@ func imgHasValidSrc(n *html.Node) bool {
 	return hasSrc
 }
 
+// SelectBestCandidate returns the candidate node with the highest score, or nil
+// if candidates is empty. Ties are resolved by map iteration order.
 func SelectBestCandidate(candidates map[*html.Node]int) *html.Node {
 	var bestNode *html.Node
 	bestScore := -1

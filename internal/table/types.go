@@ -1,10 +1,6 @@
 // Package table provides HTML table extraction and rendering functionality.
 package table
 
-import (
-	"strings"
-)
-
 // CellAlignment represents the text alignment of a table cell.
 type CellAlignment int
 
@@ -46,42 +42,104 @@ type AlignCount struct {
 	Left, Center, Right, Justify int
 }
 
-// TrackedBuilder is a strings.Builder that remembers the last byte written, so
-// callers can inspect the trailing byte without re-reading the buffer.
+// TrackedBuilder is a capacity-retaining byte buffer that remembers the last
+// byte written, so callers can inspect the trailing byte without re-reading the
+// buffer.
 //
-// LastChar holds that trailing byte. It is a byte, not a rune: for multi-byte
-// UTF-8 input it is the final byte of the encoding (a leading or continuation
-// byte), which is meaningful only for the ASCII single-byte comparisons the
+// It is backed by a []byte rather than a *strings.Builder so that Reset
+// (buf[:0]) RETAINS the backing capacity across uses. A pooled TrackedBuilder
+// therefore does not re-grow from zero on every call — unlike *strings.Builder,
+// whose Reset() nils its buffer (see internal/pool.go's BuilderPool notes). The
+// text-extraction hot path builds a document-length string per Extract() call, so
+// retaining the buffer removes the per-call growth allocations and the GC churn
+// they cause. Callers that want a retained instance should obtain one via
+// internal.GetTrackedBuilder/PutTrackedBuilder rather than constructing directly.
+//
+// LastChar holds the trailing byte written. It is a byte, not a rune: for
+// multi-byte UTF-8 input it is the final byte of the encoding (a leading or
+// continuation byte), meaningful only for the ASCII single-byte comparisons the
 // callers rely on — newline/space detection in EnsureNewline/EnsureSpacing and
 // tests asserting the last byte of ASCII output. Code that writes non-ASCII
 // content should not interpret LastChar as a character.
 type TrackedBuilder struct {
-	*strings.Builder
+	buf      []byte
 	LastChar byte
 }
 
-// NewTrackedBuilder creates a new TrackedBuilder wrapping the provided strings.Builder.
-func NewTrackedBuilder(sb *strings.Builder) *TrackedBuilder {
-	return &TrackedBuilder{
-		Builder:  sb,
-		LastChar: 0,
+// NewTrackedBuilder returns a ready-to-use TrackedBuilder. Callers that want a
+// pooled, capacity-retaining instance should use internal.GetTrackedBuilder /
+// PutTrackedBuilder instead of constructing directly.
+func NewTrackedBuilder() *TrackedBuilder {
+	return &TrackedBuilder{}
+}
+
+// Reset clears the written bytes while retaining the backing capacity for reuse.
+func (tb *TrackedBuilder) Reset() {
+	tb.buf = tb.buf[:0]
+	tb.LastChar = 0
+}
+
+// Len returns the number of bytes written so far.
+func (tb *TrackedBuilder) Len() int { return len(tb.buf) }
+
+// Cap returns the capacity of the backing buffer.
+func (tb *TrackedBuilder) Cap() int { return cap(tb.buf) }
+
+// Bytes returns the bytes written so far. The returned slice aliases the buffer's
+// backing array and is invalidated by subsequent writes or a Reset.
+func (tb *TrackedBuilder) Bytes() []byte { return tb.buf }
+
+// String returns the bytes written so far as a string. This copies the buffer
+// (the single unavoidable allocation on a retaining buffer); the buffer itself is
+// retained for reuse.
+func (tb *TrackedBuilder) String() string { return string(tb.buf) }
+
+// Grow reserves at least n more bytes of capacity. Mirrors strings.Builder.Grow
+// so callers can pre-size when the eventual length is known, though a pooled
+// instance typically already retains sufficient capacity.
+func (tb *TrackedBuilder) Grow(n int) {
+	if n < 0 {
+		panic("table.TrackedBuilder.Grow: negative count")
 	}
+	if cap(tb.buf)-len(tb.buf) >= n {
+		return
+	}
+	// Double until enough, like strings.Builder, but honor n as a floor.
+	newCap := cap(tb.buf)
+	if newCap < 64 {
+		newCap = 64
+	}
+	for newCap < len(tb.buf)+n {
+		newCap *= 2
+	}
+	buf := make([]byte, len(tb.buf), newCap)
+	copy(buf, tb.buf)
+	tb.buf = buf
 }
 
-// WriteByte writes a single byte and records it in LastChar.
+// WriteByte appends a single byte and records it in LastChar.
 func (tb *TrackedBuilder) WriteByte(c byte) error {
+	tb.buf = append(tb.buf, c)
 	tb.LastChar = c
-	return tb.Builder.WriteByte(c)
+	return nil
 }
 
-// WriteString writes a string and, when at least one byte was written, records
-// the final byte of s in LastChar.
+// Write appends p and, when non-empty, records its final byte in LastChar.
+func (tb *TrackedBuilder) Write(p []byte) (int, error) {
+	tb.buf = append(tb.buf, p...)
+	if len(p) > 0 {
+		tb.LastChar = p[len(p)-1]
+	}
+	return len(p), nil
+}
+
+// WriteString appends s and, when non-empty, records its final byte in LastChar.
 func (tb *TrackedBuilder) WriteString(s string) (int, error) {
-	n, err := tb.Builder.WriteString(s)
-	if n > 0 && err == nil {
+	tb.buf = append(tb.buf, s...)
+	if len(s) > 0 {
 		tb.LastChar = s[len(s)-1]
 	}
-	return n, err
+	return len(s), nil
 }
 
 // EnsureNewline ensures the builder ends with a newline.

@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/net/html"
+
+	"github.com/cybergodev/html/internal/table"
 )
 
 // Pool configuration constants
@@ -295,6 +297,38 @@ func PutByteBuf(bp *[]byte) {
 	}
 	*bp = (*bp)[:0]
 	byteBufPool.Put(bp)
+}
+
+// trackedBuilderPool pools *table.TrackedBuilder instances for the text-extraction
+// hot path. A TrackedBuilder is []byte-backed, so its Reset (buf[:0]) retains the
+// backing capacity across uses — unlike BuilderPool's *strings.Builder, whose
+// Reset nils the buffer. extractTextContent builds a document-length string per
+// Extract() call, so reusing a buffer that is already large enough after warmup
+// removes the per-call growth allocations and the GC churn they cause.
+var trackedBuilderPool = sync.Pool{
+	New: func() any { return table.NewTrackedBuilder() },
+}
+
+// GetTrackedBuilder returns a reset TrackedBuilder from the pool. Return it with
+// PutTrackedBuilder. The returned buffer retains capacity across uses.
+func GetTrackedBuilder() *table.TrackedBuilder {
+	tb := trackedBuilderPool.Get().(*table.TrackedBuilder)
+	tb.Reset()
+	return tb
+}
+
+// PutTrackedBuilder returns a TrackedBuilder to the pool. Oversized buffers are
+// dropped (see maxPooledByteCap) so a single huge document cannot make the pool
+// retain a multi-MB backing array indefinitely.
+func PutTrackedBuilder(tb *table.TrackedBuilder) {
+	if tb == nil {
+		return
+	}
+	if tb.Cap() > maxPooledByteCap {
+		return
+	}
+	tb.Reset()
+	trackedBuilderPool.Put(tb)
 }
 
 // TransformBufferPool is a sync.Pool for byte slices used in encoding transformation.

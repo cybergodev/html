@@ -357,3 +357,43 @@ func BenchmarkHasMediaReference(b *testing.B) {
 		_ = HasMediaReference(content)
 	}
 }
+
+// TestDetectMediaTypeByExtension covers the query/fragment stripping and the
+// case-sensitive HasSuffix contract of detectMediaTypeByExtension. The existing
+// detectVideoType/detectAudioType tests exercise this only incidentally through
+// the full extractor; these cases pin the boundaries directly.
+func TestDetectMediaTypeByExtension(t *testing.T) {
+	t.Parallel()
+
+	exts := map[string]string{
+		".mp4": "video/mp4",
+		".mp3": "audio/mpeg",
+		".ogg": "audio/ogg",
+	}
+
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{"plain extension", "clip.mp4", "video/mp4"},
+		{"query stripped", "song.mp3?v=2", "audio/mpeg"},
+		{"fragment stripped", "song.mp3#audio", "audio/mpeg"},
+		{"query then fragment", "song.mp3?v=2&t=1#audio", "audio/mpeg"},
+		{"only fragment", "clip.mp4#frag", "video/mp4"},
+		{"uppercase extension no match", "song.MP3", ""}, // HasSuffix is case-sensitive
+		{"unknown extension", "song.xyz", ""},
+		{"no extension", "song", ""},
+		{"empty url", "", ""},
+		{"path segment not extension", "http://host/mp3", ""}, // ends with /mp3, not .mp3
+		{"extension mid-path", "song.mp3.txt", ""},            // ends with .txt, not .mp3
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectMediaTypeByExtension(tt.url, exts); got != tt.want {
+				t.Errorf("detectMediaTypeByExtension(%q) = %q, want %q", tt.url, got, tt.want)
+			}
+		})
+	}
+}

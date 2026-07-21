@@ -24,8 +24,24 @@ func appendUniqueVideoURLs(urls []string, seen map[string]bool, videos []VideoIn
 }
 
 func (p *Processor) extractVideos(node *stdxhtml.Node, htmlContent string, canContainMedia bool) []VideoInfo {
-	videos := make([]VideoInfo, 0, initialSliceCap)
-	seen := make(map[string]bool, initialMapCap)
+	var videos []VideoInfo
+	var seen map[string]bool
+
+	// ensureDedup lazily materializes the result slice and dedup map on the first
+	// match. A nil map read is safe (returns false), so the DOM walk can test
+	// !seen[url] before allocating; only an actual match pays for the slice and
+	// map. On a no-media document — the common case, where canContainMedia is
+	// false and the walk finds no <video>/<iframe>/<embed>/<object> — neither is
+	// ever allocated. The result is normalized to a non-nil empty slice at the
+	// end so callers (incl. JSON marshaling) see [] rather than null.
+	ensureDedup := func() {
+		if seen == nil {
+			seen = make(map[string]bool, initialMapCap)
+		}
+		if videos == nil {
+			videos = make([]VideoInfo, 0, initialSliceCap)
+		}
+	}
 
 	// canContainMedia is computed once by the caller (extractFromDocument) and
 	// shared with extractAudios: HasMediaReference scans the whole document, and
@@ -39,6 +55,8 @@ func (p *Processor) extractVideos(node *stdxhtml.Node, htmlContent string, canCo
 	// These may be removed by sanitization, so we parse them from raw HTML first.
 	// All three share identical validate/dedup logic (appendUniqueVideoURLs).
 	if canContainMedia {
+		// These scans write to seen, so the map (and slice) must exist now.
+		ensureDedup()
 		videos = appendUniqueVideoURLs(
 			p.extractTagAttributes(htmlContent, "iframe", "src"), seen, videos)
 		videos = appendUniqueVideoURLs(
@@ -56,18 +74,21 @@ func (p *Processor) extractVideos(node *stdxhtml.Node, htmlContent string, canCo
 		switch n.Data {
 		case "video":
 			if video := p.parseVideoNode(n); video.URL != "" && !seen[video.URL] {
+				ensureDedup()
 				seen[video.URL] = true
 				videos = append(videos, video)
 			}
 
 		case "iframe":
 			if video := p.parseIframeNode(n); video.URL != "" && !seen[video.URL] {
+				ensureDedup()
 				seen[video.URL] = true
 				videos = append(videos, video)
 			}
 
 		case "embed", "object":
 			if video := p.parseEmbedNode(n); video.URL != "" && !seen[video.URL] {
+				ensureDedup()
 				seen[video.URL] = true
 				videos = append(videos, video)
 			}
@@ -89,6 +110,12 @@ func (p *Processor) extractVideos(node *stdxhtml.Node, htmlContent string, canCo
 		}
 	}
 
+	// Preserve the non-nil-empty contract of the previous eager-make: callers and
+	// JSON marshaling distinguish a nil slice (null) from an empty one ([]).
+	// make([]VideoInfo, 0) is allocation-free (zerobase slice) on this path.
+	if videos == nil {
+		return make([]VideoInfo, 0)
+	}
 	return videos
 }
 
@@ -162,12 +189,25 @@ func (p *Processor) parseEmbedNode(n *stdxhtml.Node) VideoInfo {
 }
 
 func (p *Processor) extractAudios(node *stdxhtml.Node, htmlContent string, canContainMedia bool) []AudioInfo {
-	audios := make([]AudioInfo, 0, initialSliceCap)
-	seen := make(map[string]bool, initialMapCap)
+	var audios []AudioInfo
+	var seen map[string]bool
+
+	// ensureDedup lazily materializes the result slice and dedup map on the first
+	// match (see extractVideos for the full rationale). A no-media document
+	// allocates neither; the result is normalized to a non-nil empty slice below.
+	ensureDedup := func() {
+		if seen == nil {
+			seen = make(map[string]bool, initialMapCap)
+		}
+		if audios == nil {
+			audios = make([]AudioInfo, 0, initialSliceCap)
+		}
+	}
 
 	internal.WalkNodes(node, func(n *stdxhtml.Node) bool {
 		if n.Type == stdxhtml.ElementNode && n.Data == "audio" {
 			if audio := p.parseAudioNode(n); audio.URL != "" && !seen[audio.URL] {
+				ensureDedup()
 				seen[audio.URL] = true
 				audios = append(audios, audio)
 			}
@@ -180,6 +220,9 @@ func (p *Processor) extractAudios(node *stdxhtml.Node, htmlContent string, canCo
 	// <audio>/<source> elements regardless of their URL extension.
 	// canContainMedia is computed once by the caller and shared with extractVideos.
 	if canContainMedia {
+		// The regex writes to seen; ensure it (and audios) exist. If the DOM walk
+		// above already matched, this is a no-op.
+		ensureDedup()
 		matches := audioRegex.FindAllString(htmlContent, maxRegexMatches)
 		for _, url := range matches {
 			if internal.IsValidURL(url) && !seen[url] {
@@ -192,6 +235,9 @@ func (p *Processor) extractAudios(node *stdxhtml.Node, htmlContent string, canCo
 		}
 	}
 
+	if audios == nil {
+		return make([]AudioInfo, 0)
+	}
 	return audios
 }
 
