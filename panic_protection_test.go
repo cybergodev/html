@@ -45,6 +45,19 @@ func (panickingSink) Write(html.AuditEntry) {
 
 func (panickingSink) Close() error { return nil }
 
+// closePanickingSink is an AuditSink whose Close panics. It exercises the
+// sink-close recover path (SEC-003): a misbehaving custom sink's Close must
+// never crash the process via the canonical `defer processor.Close()` pattern.
+// Write is benign so the sink can be installed on an enabled audit config
+// without every Record aborting.
+type closePanickingSink struct{}
+
+func (closePanickingSink) Write(html.AuditEntry) {}
+
+func (closePanickingSink) Close() error {
+	panic("SEC-003 test: intentional audit sink close panic")
+}
+
 const testHTML = `<html><head><title>Test</title></head><body><p>Hello World</p><article><p>Content</p></article></body></html>`
 const testLinkHTML = `<html><body><a href="https://example.com">Link</a></body></html>`
 
@@ -490,4 +503,37 @@ func TestPanicRecovery_PanickingAuditSink(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatalf("close failed: %v", err)
 	}
+}
+
+// TestPanicRecovery_PanickingAuditSinkClose verifies that a custom AuditSink
+// whose Close panics is recovered inside auditCollector.Close (which
+// Processor.Close delegates to) rather than crashing the process. Before the
+// recover was added, this panic propagated through the `defer p.Close()`
+// pattern and aborted the program — defeating SEC-003, which Record already
+// honored for Write.
+func TestPanicRecovery_PanickingAuditSinkClose(t *testing.T) {
+	t.Parallel()
+
+	cfg := html.DefaultConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Sink = closePanickingSink{}
+
+	p, err := html.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// If the sink's Close panic escapes Processor.Close, this recover catches
+	// it and fails the test. With the recover in auditCollector.Close, the
+	// panic is caught there and never reaches this defer.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("audit sink Close panic escaped Processor.Close: %v", r)
+		}
+	}()
+
+	// Processor.Close treats audit cleanup as best-effort and discards the
+	// recovered error; the assertion is simply that Close returns without
+	// aborting the process.
+	_ = p.Close()
 }

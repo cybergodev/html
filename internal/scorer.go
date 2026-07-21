@@ -187,11 +187,22 @@ func (s *DefaultScorer) Score(node *html.Node) int {
 	if node == nil || node.Type != html.ElementNode || IsNonContentElement(node.Data) || node.Data == "p" {
 		return 0
 	}
+	// Collect all metrics in a single traversal
+	return s.scoreWithMetrics(node, collectContentMetrics(node))
+}
+
+// scoreWithMetrics applies the DefaultScorer scoring rules to node using
+// precomputed subtree metrics. It holds the full post-guard body that Score used
+// to inline; the guards are re-checked so it is safe to call directly.
+// ScoreArticleCandidates calls this with metrics folded by a single bottom-up
+// pass (foldAndScore), avoiding the O(N²) per-candidate subtree re-walk that
+// collectContentMetrics would otherwise repeat for every candidate.
+func (s *DefaultScorer) scoreWithMetrics(node *html.Node, metrics contentMetrics) int {
+	if node == nil || node.Type != html.ElementNode || IsNonContentElement(node.Data) || node.Data == "p" {
+		return 0
+	}
 
 	score := s.getTagScore(node.Data) + s.scoreAttributes(node)
-
-	// Collect all metrics in a single traversal
-	metrics := collectContentMetrics(node)
 
 	// Score based on paragraph count
 	if metrics.paragraphCount >= minParagraphsForBonus {
@@ -226,14 +237,22 @@ func (s *DefaultScorer) Score(node *html.Node) int {
 		score = int(float64(score) * lowDensityMultiplier)
 	}
 
-	// Penalize high link density (likely navigation/spam)
+	// Penalize high link density (likely navigation/menu/sitemap). The penalty
+	// is gated on absolute text length: nav bars and tag clouds are link-dense
+	// AND short, whereas main content that legitimately wraps prose or cards
+	// in <a> (landing pages, portfolio grids) is link-dense but substantial.
+	// Without this gate, a card-layout container is crushed by
+	// highLinkDensityPenalty and the article extractor picks a tiny sibling
+	// (e.g. a hero block) instead, discarding most of the page.
 	linkDensity := calculateLinkDensityFromMetrics(metrics)
-	if linkDensity > highLinkDensityThreshold {
-		score = int(float64(score) * highLinkDensityPenalty)
-	} else if linkDensity > mediumLinkDensityThreshold {
-		score = int(float64(score) * mediumLinkDensityPenalty)
-	} else if linkDensity > lowLinkDensityThreshold {
-		score = int(float64(score) * lowLinkDensityPenalty)
+	if metrics.textLength < linkDensityPenaltyTextThreshold {
+		if linkDensity > highLinkDensityThreshold {
+			score = int(float64(score) * highLinkDensityPenalty)
+		} else if linkDensity > mediumLinkDensityThreshold {
+			score = int(float64(score) * mediumLinkDensityPenalty)
+		} else if linkDensity > lowLinkDensityThreshold {
+			score = int(float64(score) * lowLinkDensityPenalty)
+		}
 	}
 
 	// Bonus for comma-rich content (likely prose)
@@ -242,6 +261,108 @@ func (s *DefaultScorer) Score(node *html.Node) int {
 	}
 
 	return score
+}
+
+// ScoreArticleCandidates scores every plausible article-root element under root
+// and returns the candidate→score map (score > 0 only). It is the O(N)
+// replacement for the previous pattern — used by extractArticleNode — of walking
+// the tree and calling Score(n) per non-inline element, where each Score re-walked
+// n's entire subtree via collectContentMetrics.
+//
+// Instead the traversal folds each element's subtree metrics once (post-order) and
+// scores the element immediately from those metrics, so no subtree is walked more
+// than once and no per-node metrics need to be stored — only the returned candidate
+// map is allocated (the same map the previous code built).
+//
+// Selection behavior is identical to scoring each non-inline element with Score:
+// scoreWithMetrics applies the same guards (IsNonContentElement, "p") and rules,
+// and the folded metrics match collectContentMetrics(n). Equivalence is locked by
+// TestScoreArticleCandidatesMatchesNaiveLoop.
+func (s *DefaultScorer) ScoreArticleCandidates(root *html.Node) map[*html.Node]int {
+	candidates := make(map[*html.Node]int, 32)
+	s.foldAndScore(root, false, candidates)
+	return candidates
+}
+
+// foldAndScore computes node's subtree metrics bottom-up and records a score for
+// each non-inline element candidate using its just-folded metrics, then returns
+// node's subtree metrics so the parent can fold them in. insideLink indicates node
+// sits within an <a> ancestor, so its text counts toward linkTextLength.
+//
+// The pass always descends into every subtree so each element is scored against the
+// metrics collectContentMetrics would produce for it (which starts fresh at that
+// node, regardless of whether an ancestor is a skip tag). Contributions are folded
+// into a parent only when the parent is not itself a skip tag, so a skip tag's own
+// metrics are zero — matching collectContentMetrics returning false before
+// incrementing — while its non-skip descendants are still scored correctly.
+func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, candidates map[*html.Node]int) contentMetrics {
+	if node == nil {
+		return contentMetrics{}
+	}
+
+	isSkip := node.Type == html.ElementNode && (IsNonContentElement(node.Data) || metricsSkipTags[node.Data])
+
+	var m contentMetrics
+	if node.Type == html.ElementNode && !isSkip {
+		m.tagCount++
+		switch node.Data {
+		case "p":
+			m.paragraphCount++
+		case "h1", "h2", "h3", "h4", "h5", "h6":
+			m.headingCount++
+		}
+		if node.Data == "a" {
+			insideLink = true
+		}
+	}
+
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		cm := s.foldAndScore(child, insideLink, candidates)
+		if !isSkip {
+			m.tagCount += cm.tagCount
+			m.paragraphCount += cm.paragraphCount
+			m.headingCount += cm.headingCount
+			m.textLength += cm.textLength
+			m.totalTextLength += cm.totalTextLength
+			m.linkTextLength += cm.linkTextLength
+			m.commaCount += cm.commaCount
+		}
+	}
+
+	if node.Type == html.TextNode {
+		// Mirrors collectContentMetrics' text-node handling verbatim so the two
+		// paths cannot diverge (guarded by TestScoreArticleCandidatesMatchesNaiveLoop).
+		data := node.Data
+		dataLen := len(data)
+		hasNBSP := false
+		for i := 0; i+1 < dataLen; i++ {
+			if data[i] == 0xC2 && data[i+1] == 0xA0 {
+				hasNBSP = true
+				break
+			}
+		}
+		if hasNBSP {
+			data = strings.ReplaceAll(data, " ", " ")
+		}
+		if text := strings.TrimSpace(data); text != "" {
+			textLen := len(text)
+			m.textLength += textLen
+			m.totalTextLength += textLen
+			m.commaCount += strings.Count(text, ",") + strings.Count(text, "，")
+			if insideLink {
+				m.linkTextLength += textLen
+			}
+		}
+	}
+
+	// m now holds node's complete subtree metrics; score it if it is a candidate.
+	if node.Type == html.ElementNode && !isSkip && !IsInlineElement(node.Data) {
+		if score := s.scoreWithMetrics(node, m); score > 0 {
+			candidates[node] = score
+		}
+	}
+
+	return m
 }
 
 // ShouldRemove determines if a node should be removed from the content tree.
@@ -285,9 +406,7 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 				}
 			}
 		case "style":
-			compact := compactCSS(attr.Val)
-			if strings.Contains(compact, "display:none") ||
-				strings.Contains(compact, "visibility:hidden") {
+			if isHiddenByStyle(attr.Val) {
 				return true
 			}
 		case "hidden":
@@ -297,25 +416,57 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 	return false
 }
 
-// compactCSS lowercases a CSS declaration and strips ASCII whitespace so that
-// "display:  none", "display:\tnone", "display :none", and "DISPLAY:NONE" all
-// collapse to the single form "display:none". ShouldRemove checks hidden
-// declarations against these compacted forms; without compaction, an element
-// hidden via a style with extra whitespace or a space around the colon bypassed
-// removal and leaked into extracted content.
-func compactCSS(s string) string {
-	lower := strings.ToLower(s)
-	if !strings.ContainsAny(lower, " \t\n\r\f\v") {
-		return lower
+// isHiddenByStyle reports whether a style attribute hides its element
+// (display:none or visibility:hidden). It tokenizes the declaration list and
+// compares complete property names so that:
+//   - CSS custom properties (--my-display:none) are not confused with display.
+//     The previous substring test ("contains display:none") stripped any element
+//     whose custom-property name merely ended in "display".
+//   - CSS escape sequences in the property name (di\splay:none, the valid CSS
+//     spelling of display:none) are decoded before comparison, so a hidden
+//     element can no longer evade removal.
+//
+// Note: hex CSS escapes (\64...) in property names are not decoded; they are
+// vanishingly rare in real style attributes and out of scope for this
+// content-extraction heuristic.
+func isHiddenByStyle(style string) bool {
+	for _, raw := range strings.Split(style, ";") {
+		colon := strings.IndexByte(raw, ':')
+		if colon <= 0 {
+			continue // empty declaration or no property name before the colon
+		}
+		prop := decodeCSSEscape(strings.ToLower(strings.TrimSpace(raw[:colon])))
+		val := strings.ToLower(strings.TrimSpace(raw[colon+1:]))
+		switch {
+		case prop == "display" && val == "none":
+			return true
+		case prop == "visibility" && val == "hidden":
+			return true
+		}
+	}
+	return false
+}
+
+// decodeCSSEscape decodes CSS backslash escapes in a style property name: a
+// backslash followed by a single character yields that character (covering
+// escapes like \s in di\splay → display). This prevents hiding a property name
+// behind escapes. It does not decode hex escapes (see isHiddenByStyle note).
+func decodeCSSEscape(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
 	}
 	var b strings.Builder
-	b.Grow(len(lower))
-	for i := 0; i < len(lower); i++ {
-		c := lower[i]
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v' {
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c != '\\' || i+1 >= len(s) {
+			b.WriteByte(c)
+			i++
 			continue
 		}
-		b.WriteByte(c)
+		// backslash + next literal char
+		b.WriteByte(s[i+1])
+		i += 2
 	}
 	return b.String()
 }

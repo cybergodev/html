@@ -336,13 +336,34 @@ func (p *Processor) validateInput(htmlBytes []byte) error {
 		return ErrProcessorClosed
 	}
 	if len(htmlBytes) > p.config.MaxInputSize {
-		if p.audit != nil {
-			p.audit.RecordInputViolation(len(htmlBytes), p.config.MaxInputSize, "input_too_large")
-		}
-		p.stats.errorCount.Add(1)
-		return newInputError("Extract", len(htmlBytes), p.config.MaxInputSize, nil)
+		return p.inputTooLargeError("Extract", len(htmlBytes))
 	}
 	return nil
+}
+
+// inputTooLargeError builds the canonical *InputError for an oversize input,
+// records the violation to the audit log (when enabled), and bumps the error
+// counter. Centralizing this keeps the byte-input path (validateInput) and the
+// file path (errFileTooLarge) producing the same ErrInputTooLarge error shape.
+func (p *Processor) inputTooLargeError(op string, size int) error {
+	if p.audit != nil {
+		p.audit.RecordInputViolation(size, p.config.MaxInputSize, "input_too_large")
+	}
+	p.stats.errorCount.Add(1)
+	return newInputError(op, size, p.config.MaxInputSize, nil)
+}
+
+// errFileTooLarge returns an *InputError when a regular file's size exceeds
+// MaxInputSize, so the file is rejected before its contents are read into
+// memory. Non-regular files (pipes, devices, sockets) report an implausible
+// Stat size (often 0), so they are never rejected here — they are bounded
+// instead by the byte-level MaxInputSize check that runs after the read in
+// validateInput. Returns nil when the file is within the limit.
+func (p *Processor) errFileTooLarge(regular bool, size int64) error {
+	if !regular || size <= int64(p.config.MaxInputSize) {
+		return nil
+	}
+	return p.inputTooLargeError("ExtractFromFile", int(size))
 }
 
 // detectEncoding detects the character encoding and converts HTML bytes to UTF-8.
@@ -388,6 +409,22 @@ func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
 	// See readContained for details.
 	if p.config.AllowedBaseDir != "" {
 		return p.readContained(cleanPath)
+	}
+
+	// Pre-check the file size against MaxInputSize so an oversized file is
+	// rejected before os.ReadFile materializes it in memory. The byte-level
+	// check in validateInput still guards downstream processing; this guard
+	// closes the read-time memory-exhaustion window for untrusted paths.
+	// AllowedBaseDir confines WHICH file may be read, not how large it is.
+	info, err := os.Stat(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, newFileError("ReadFile", cleanPath, ErrFileNotFound)
+		}
+		return nil, newFileError("ReadFile", cleanPath, err)
+	}
+	if err := p.errFileTooLarge(info.Mode().IsRegular(), info.Size()); err != nil {
+		return nil, err
 	}
 
 	data, err := os.ReadFile(cleanPath)
@@ -448,6 +485,15 @@ func (p *Processor) readContained(cleanPath string) ([]byte, error) {
 			p.audit.RecordPathTraversal(cleanPath)
 		}
 		return nil, newFileError("ReadFile", cleanPath, fmt.Errorf("path outside allowed directory"))
+	}
+
+	// Pre-check size against MaxInputSize on the same verified handle (no
+	// second path resolution, no TOCTOU window) so an oversized file inside
+	// the allowed tree is rejected before io.ReadAll loads it into memory.
+	if info, err := f.Stat(); err == nil {
+		if err := p.errFileTooLarge(info.Mode().IsRegular(), info.Size()); err != nil {
+			return nil, err
+		}
 	}
 
 	return io.ReadAll(f)

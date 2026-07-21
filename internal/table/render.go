@@ -53,6 +53,20 @@ func expandColspanCells(rawCells []CellData) []CellData {
 	return cells
 }
 
+// anyRowspan reports whether any cell in the table declares rowspan > 1.
+// applyRowspanGrid uses it to skip its grid rebuild when the table has no
+// rowspans (the common case), since the rebuild is then an identity transform.
+func anyRowspan(tableData [][]CellData) bool {
+	for _, row := range tableData {
+		for _, c := range row {
+			if c.Rowspan > 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // applyRowspanGrid rebuilds the table so a cell with rowspan > 1 occupies its
 // column in the rows it spans. Markdown tables are strictly rectangular — they
 // cannot express rowspan — so without this grid a spanned cell appears only in
@@ -70,6 +84,21 @@ func expandColspanCells(rawCells []CellData) []CellData {
 // maxCols columns.
 func applyRowspanGrid(tableData [][]CellData, maxCols int) [][]CellData {
 	if len(tableData) == 0 || maxCols <= 0 {
+		return tableData
+	}
+
+	// Fast path: with no rowspan > 1 anywhere, the grid is an identity
+	// transform. Each cell is placed 1:1 (nothing shifts, because the occupied
+	// map never gains an entry), and since calculateMaxColumns returns the raw
+	// max per-row cell count in that case, no row exceeds maxCols and nothing is
+	// truncated. The only effect the full rebuild would have is padding trailing
+	// columns with CellData{Text: " ", Align: AlignDefault} (the pad below at
+	// row[col] = ... AlignDefault) — and padTableColumns, which runs next in
+	// extractTableAsMarkdown, pads with the identical CellData. Skipping the
+	// rebuild therefore yields byte-identical output while avoiding the occupied
+	// and fillText scratch slices, the outer grid slice, and a per-row
+	// make([]CellData, maxCols). The common rowspan-free table hits this path.
+	if !anyRowspan(tableData) {
 		return tableData
 	}
 
@@ -141,12 +170,41 @@ func spannedFill(text string) CellData {
 	}
 }
 
-// calculateMaxColumns finds the maximum number of columns across all rows.
+// calculateMaxColumns computes the grid width needed to place every cell
+// without dropping any, replaying the same rowspan placement applyRowspanGrid
+// performs. A cell with rowspan > 1 reserves its column in the rows it spans,
+// so a later row's cells shift right and can land beyond the raw per-row cell
+// count. Computing maxCols from raw counts (the old behavior) made
+// applyRowspanGrid drop those shifted cells at its "col >= maxCols" guard,
+// silently losing trailing cells. colspan is already expanded into separate
+// one-column entries by expandColspanCells, so each cell occupies exactly one
+// column here.
 func calculateMaxColumns(tableData [][]CellData) int {
 	maxCols := 0
-	for _, row := range tableData {
-		if len(row) > maxCols {
-			maxCols = len(row)
+	numRows := len(tableData)
+	// occupied[r] records columns in row r already taken by a rowspan from an
+	// earlier row. Only rows that receive a span get a non-nil map.
+	occupied := make([]map[int]bool, numRows)
+	for r := 0; r < numRows; r++ {
+		occ := occupied[r]
+		col := 0
+		for _, cell := range tableData[r] {
+			for occ[col] {
+				col++
+			}
+			if col+1 > maxCols {
+				maxCols = col + 1
+			}
+			if rs := cell.Rowspan; rs > 1 {
+				for rr := 1; rr < rs && r+rr < numRows; rr++ {
+					dest := r + rr
+					if occupied[dest] == nil {
+						occupied[dest] = make(map[int]bool)
+					}
+					occupied[dest][col] = true
+				}
+			}
+			col++
 		}
 	}
 	return maxCols

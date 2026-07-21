@@ -9,28 +9,37 @@ import (
 
 // parseIframeNode and parseEmbedNode are only reachable when iframe/embed tags
 // survive sanitization (currently they are in tagsToRemoveMap). These tests verify
-// extraction works through the regex-based fallback path.
+// extraction works through the regex-based fallback path (sanitization on) and the
+// DOM walk path (sanitization off).
+
+// extractMediaVideos builds a processor with the requested sanitization setting,
+// runs Extract on htmlContent, and returns the extracted videos. It centralizes the
+// processor lifecycle and error handling that every case below would otherwise repeat.
+func extractMediaVideos(t *testing.T, htmlContent string, sanitize bool) []html.VideoInfo {
+	t.Helper()
+	cfg := html.DefaultConfig()
+	cfg.EnableSanitization = sanitize
+	p, err := html.New(cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer p.Close()
+	result, err := p.Extract([]byte(htmlContent))
+	if err != nil {
+		t.Fatalf("Extract() failed: %v", err)
+	}
+	return result.Videos
+}
 
 func TestIframeNodeVideoExtraction(t *testing.T) {
 	t.Parallel()
 
 	t.Run("iframe with video URL extracted", func(t *testing.T) {
-		p, err := html.New()
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
-
-		htmlContent := buildPaddedHTML(
-			`<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" width="640" height="480"></iframe>`,
-		)
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
+		videos := extractMediaVideos(t, buildPaddedHTML(
+			`<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" width="640" height="480"></iframe>`), true)
 
 		found := false
-		for _, v := range result.Videos {
+		for _, v := range videos {
 			if v.URL == "https://www.youtube.com/embed/dQw4w9WgXcQ" {
 				found = true
 				if v.Type == "" {
@@ -45,21 +54,10 @@ func TestIframeNodeVideoExtraction(t *testing.T) {
 	})
 
 	t.Run("iframe with non-video URL not extracted as video", func(t *testing.T) {
-		p, err := html.New()
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
+		videos := extractMediaVideos(t, buildPaddedHTML(
+			`<iframe src="https://example.com/page" width="800" height="600"></iframe>`), true)
 
-		htmlContent := buildPaddedHTML(
-			`<iframe src="https://example.com/page" width="800" height="600"></iframe>`,
-		)
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		for _, v := range result.Videos {
+		for _, v := range videos {
 			if v.URL == "https://example.com/page" {
 				t.Error("non-video iframe URL should not appear in videos")
 			}
@@ -67,23 +65,11 @@ func TestIframeNodeVideoExtraction(t *testing.T) {
 	})
 
 	t.Run("iframe without src produces no video", func(t *testing.T) {
-		p, err := html.New()
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
+		videos := extractMediaVideos(t, `<html><body><iframe width="640" height="480"></iframe></body></html>`, true)
 
-		htmlContent := `<html><body><iframe width="640" height="480"></iframe></body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		if len(result.Videos) > 0 {
-			for _, v := range result.Videos {
-				if v.URL == "" {
-					t.Error("iframe without src should not produce a video entry")
-				}
+		for _, v := range videos {
+			if v.URL == "" {
+				t.Error("iframe without src should not produce a video entry")
 			}
 		}
 	})
@@ -93,61 +79,28 @@ func TestEmbedNodeVideoExtraction(t *testing.T) {
 	t.Parallel()
 
 	t.Run("embed with video src URL extracted", func(t *testing.T) {
-		p, err := html.New()
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
+		videos := extractMediaVideos(t, buildPaddedHTML(
+			`<embed src="https://www.youtube.com/embed/test123" type="video/mp4" width="800" height="600">`), true)
 
-		htmlContent := buildPaddedHTML(
-			`<embed src="https://www.youtube.com/embed/test123" type="video/mp4" width="800" height="600">`,
-		)
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		if len(result.Videos) == 0 {
+		if len(videos) == 0 {
 			t.Fatal("expected at least one video from embed tag")
 		}
 	})
 
 	t.Run("embed with data attribute extracted", func(t *testing.T) {
-		p, err := html.New()
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
+		videos := extractMediaVideos(t, buildPaddedHTML(
+			`<embed data="https://player.vimeo.com/video/12345" type="application/x-shockwave-flash" width="400" height="300">`), true)
 
-		htmlContent := buildPaddedHTML(
-			`<embed data="https://player.vimeo.com/video/12345" type="application/x-shockwave-flash" width="400" height="300">`,
-		)
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		if len(result.Videos) == 0 {
+		if len(videos) == 0 {
 			t.Fatal("expected at least one video from embed data attribute")
 		}
 	})
 
 	t.Run("embed with non-video URL ignored", func(t *testing.T) {
-		p, err := html.New()
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
+		videos := extractMediaVideos(t, buildPaddedHTML(
+			`<embed src="https://example.com/file.swf" type="application/octet-stream" width="100" height="100">`), true)
 
-		htmlContent := buildPaddedHTML(
-			`<embed src="https://example.com/file.swf" type="application/octet-stream" width="100" height="100">`,
-		)
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
-
-		for _, v := range result.Videos {
+		for _, v := range videos {
 			if v.URL == "https://example.com/file.swf" {
 				t.Error("non-video embed URL should not appear in videos")
 			}
@@ -177,27 +130,15 @@ func TestParseIframeNodeDOMPath(t *testing.T) {
 	t.Parallel()
 
 	t.Run("iframe with video src via DOM", func(t *testing.T) {
-		cfg := html.DefaultConfig()
-		cfg.EnableSanitization = false
-		p, err := html.New(cfg)
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
-
-		htmlContent := `<html><head><title>Iframe DOM Test</title></head><body>
+		videos := extractMediaVideos(t, `<html><head><title>Iframe DOM Test</title></head><body>
 			<article>
 				<p>Main article content for extraction.</p>
 				<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" width="640" height="480"></iframe>
 			</article>
-		</body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
+		</body></html>`, false)
 
 		found := false
-		for _, v := range result.Videos {
+		for _, v := range videos {
 			if v.URL == "https://www.youtube.com/embed/dQw4w9WgXcQ" {
 				found = true
 				if v.Type != "embed" {
@@ -212,26 +153,14 @@ func TestParseIframeNodeDOMPath(t *testing.T) {
 	})
 
 	t.Run("iframe with non-video src ignored via DOM", func(t *testing.T) {
-		cfg := html.DefaultConfig()
-		cfg.EnableSanitization = false
-		p, err := html.New(cfg)
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
-
-		htmlContent := `<html><head><title>Non-video Iframe</title></head><body>
+		videos := extractMediaVideos(t, `<html><head><title>Non-video Iframe</title></head><body>
 			<article>
 				<p>Article content.</p>
 				<iframe src="https://example.com/page" width="800" height="600"></iframe>
 			</article>
-		</body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
+		</body></html>`, false)
 
-		for _, v := range result.Videos {
+		for _, v := range videos {
 			if v.URL == "https://example.com/page" {
 				t.Error("non-video iframe should not appear in videos via DOM path")
 			}
@@ -239,24 +168,12 @@ func TestParseIframeNodeDOMPath(t *testing.T) {
 	})
 
 	t.Run("iframe without src produces empty video via DOM", func(t *testing.T) {
-		cfg := html.DefaultConfig()
-		cfg.EnableSanitization = false
-		p, err := html.New(cfg)
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
-
-		htmlContent := `<html><body><article>
+		videos := extractMediaVideos(t, `<html><body><article>
 			<p>Content.</p>
 			<iframe width="640" height="480"></iframe>
-		</article></body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
+		</article></body></html>`, false)
 
-		for _, v := range result.Videos {
+		for _, v := range videos {
 			if v.URL == "" {
 				t.Error("iframe without src should not produce a video entry")
 			}
@@ -270,27 +187,15 @@ func TestParseEmbedNodeDOMPath(t *testing.T) {
 	t.Parallel()
 
 	t.Run("embed with video src via DOM", func(t *testing.T) {
-		cfg := html.DefaultConfig()
-		cfg.EnableSanitization = false
-		p, err := html.New(cfg)
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
-
-		htmlContent := `<html><head><title>Embed DOM Test</title></head><body>
+		videos := extractMediaVideos(t, `<html><head><title>Embed DOM Test</title></head><body>
 			<article>
 				<p>Article content.</p>
 				<embed src="https://www.youtube.com/embed/test123" type="video/mp4" width="800" height="600">
 			</article>
-		</body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
+		</body></html>`, false)
 
 		found := false
-		for _, v := range result.Videos {
+		for _, v := range videos {
 			if v.URL == "https://www.youtube.com/embed/test123" {
 				found = true
 				break
@@ -302,25 +207,13 @@ func TestParseEmbedNodeDOMPath(t *testing.T) {
 	})
 
 	t.Run("embed with data attribute via DOM", func(t *testing.T) {
-		cfg := html.DefaultConfig()
-		cfg.EnableSanitization = false
-		p, err := html.New(cfg)
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
-
-		htmlContent := `<html><body><article>
+		videos := extractMediaVideos(t, `<html><body><article>
 			<p>Content.</p>
 			<embed data="https://player.vimeo.com/video/12345" type="application/x-shockwave-flash" width="400" height="300">
-		</article></body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
+		</article></body></html>`, false)
 
 		found := false
-		for _, v := range result.Videos {
+		for _, v := range videos {
 			if v.URL == "https://player.vimeo.com/video/12345" {
 				found = true
 				break
@@ -332,24 +225,12 @@ func TestParseEmbedNodeDOMPath(t *testing.T) {
 	})
 
 	t.Run("embed with non-video URL ignored via DOM", func(t *testing.T) {
-		cfg := html.DefaultConfig()
-		cfg.EnableSanitization = false
-		p, err := html.New(cfg)
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
-
-		htmlContent := `<html><body><article>
+		videos := extractMediaVideos(t, `<html><body><article>
 			<p>Content.</p>
 			<embed src="https://example.com/file.swf" type="application/octet-stream">
-		</article></body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
+		</article></body></html>`, false)
 
-		for _, v := range result.Videos {
+		for _, v := range videos {
 			if v.URL == "https://example.com/file.swf" {
 				t.Error("non-video embed should not appear in videos via DOM path")
 			}
@@ -357,25 +238,13 @@ func TestParseEmbedNodeDOMPath(t *testing.T) {
 	})
 
 	t.Run("object tag with video data via DOM", func(t *testing.T) {
-		cfg := html.DefaultConfig()
-		cfg.EnableSanitization = false
-		p, err := html.New(cfg)
-		if err != nil {
-			t.Fatalf("New() failed: %v", err)
-		}
-		defer p.Close()
-
-		htmlContent := `<html><body><article>
+		videos := extractMediaVideos(t, `<html><body><article>
 			<p>Content.</p>
 			<object data="https://www.youtube.com/embed/obj123" type="video/mp4" width="320" height="240"></object>
-		</article></body></html>`
-		result, err := p.Extract([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("Extract() failed: %v", err)
-		}
+		</article></body></html>`, false)
 
 		found := false
-		for _, v := range result.Videos {
+		for _, v := range videos {
 			if v.URL == "https://www.youtube.com/embed/obj123" {
 				found = true
 				break

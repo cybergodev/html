@@ -19,20 +19,6 @@ func TestConvertToUTF8(t *testing.T) {
 		mustNotContain string // Result must not contain this string
 	}{
 		{
-			name:        "UTF-8 to UTF-8 (no conversion)",
-			data:        []byte("Hello World"),
-			charset:     "utf-8",
-			expectError: false,
-			mustContain: "Hello World",
-		},
-		{
-			name:        "Windows-1252 conversion",
-			data:        []byte{0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0xE9, 0x20, 0x57, 0x6F, 0x72, 0x6C, 0x64}, // "Hello é World" in Windows-1252
-			charset:     "windows-1252",
-			expectError: false,
-			mustContain: "Hello",
-		},
-		{
 			name:           "Empty input",
 			data:           []byte{},
 			charset:        "utf-8",

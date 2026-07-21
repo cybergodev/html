@@ -161,30 +161,14 @@ func withProcessorBatch(pooled bool, cfg Config, itemCount int, fn func(*Process
 		if err != nil {
 			// Propagate the invariant failure to every item, mirroring the
 			// New-failure path in the else branch below.
-			errs := make([]error, itemCount)
-			for i := range errs {
-				errs[i] = err
-			}
-			return &BatchResult{
-				Results: make([]*Result, itemCount),
-				Errors:  errs,
-				Failed:  itemCount,
-			}
+			return uniformErrorBatch(itemCount, err)
 		}
 		defer putPooledProcessor(p)
 	} else {
 		var err error
 		p, err = New(cfg)
 		if err != nil {
-			errs := make([]error, itemCount)
-			for i := range errs {
-				errs[i] = err
-			}
-			return &BatchResult{
-				Results: make([]*Result, itemCount),
-				Errors:  errs,
-				Failed:  itemCount,
-			}
+			return uniformErrorBatch(itemCount, err)
 		}
 		defer func() { _ = p.Close() }()
 	}

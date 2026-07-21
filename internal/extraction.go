@@ -21,8 +21,11 @@ func writeInt(tb *table.TrackedBuilder, n int) {
 }
 
 // ExtractTextWithStructureAndImages extracts text content from an HTML node tree
-// while preserving document structure (headings, paragraphs, lists, tables).
-func ExtractTextWithStructureAndImages(node *html.Node, sb *strings.Builder, imageCounter *int, linkCounter *int, tableFormat string) {
+// while preserving document structure (headings, paragraphs, lists, tables). It
+// writes into tb, a capacity-retaining TrackedBuilder the caller obtains from
+// GetTrackedBuilder (and returns with PutTrackedBuilder) so the per-Extract
+// document buffer is reused across calls instead of re-grown from zero each time.
+func ExtractTextWithStructureAndImages(node *html.Node, tb *table.TrackedBuilder, imageCounter *int, linkCounter *int, tableFormat string) {
 	if node == nil {
 		return
 	}
@@ -30,7 +33,6 @@ func ExtractTextWithStructureAndImages(node *html.Node, sb *strings.Builder, ima
 		return
 	}
 
-	tb := table.NewTrackedBuilder(sb)
 	extractTextWithStructure(node, tb, imageCounter, linkCounter, tableFormat, nil, 0)
 }
 

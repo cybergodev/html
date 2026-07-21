@@ -691,7 +691,7 @@ processor, _ := html.New(config)
 
 ## 📁 Example Code
 
-For complete runnable examples, see the [examples/](examples) directory:
+For complete runnable examples, see the [examples/](examples):
 
 | Example | Description |
 |---------|-------------|
@@ -703,12 +703,9 @@ For complete runnable examples, see the [examples/](examples) directory:
 | [06_advanced_usage.go](examples/06_advanced_usage.go) | Custom scorers, audit logging, security |
 | [07_error_handling.go](examples/07_error_handling.go) | Error handling patterns |
 | [08_real_world.go](examples/08_real_world.go) | Real-world use cases |
-
-Each example is a self-contained `main` program guarded by the `examples` build tag, so it is excluded from `go build ./...` and never interferes with the library build. Run any one by naming its file:
-
-```bash
-go run examples/01_quick_start.go
-```
+| [09_context_cancellation.go](examples/09_context_cancellation.go) | Context cancellation and timeouts |
+| [10_secure_file_processing.go](examples/10_secure_file_processing.go) | AllowedBaseDir sandbox and secure file reads |
+| [11_encoding.go](examples/11_encoding.go) | Character encoding detection and override |
 
 ---
 

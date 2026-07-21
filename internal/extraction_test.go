@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cybergodev/html/internal/table"
 	"golang.org/x/net/html"
 )
 
@@ -65,9 +66,9 @@ func TestExtractTextWithStructure(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc, _ := html.Parse(strings.NewReader(tt.html))
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-			result := strings.TrimSpace(sb.String())
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			result := strings.TrimSpace(tb.String())
 
 			if result != tt.want {
 				t.Errorf("ExtractTextWithStructureAndImages() = %q, want %q", result, tt.want)
@@ -109,9 +110,9 @@ func TestExtractListMarkers(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc, _ := html.Parse(strings.NewReader(tt.html))
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-			result := strings.TrimSpace(sb.String())
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			result := strings.TrimSpace(tb.String())
 
 			if result != tt.want {
 				t.Errorf("got %q, want %q", result, tt.want)
@@ -138,12 +139,12 @@ func TestNestedTablesNotFlattened(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	var sb strings.Builder
-	ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
 
 	// ExtractTextWithStructureAndImages does not run CleanText, so column
 	// padding introduces runs of spaces. Collapse them for stable assertions.
-	out := collapseSpaces(sb.String())
+	out := collapseSpaces(tb.String())
 
 	// Inner data table must render as Markdown rows, not flattened text.
 	if !strings.Contains(out, "| A | B |") {
@@ -219,10 +220,10 @@ func TestExtractTextWithStructureAndImages(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc, _ := html.Parse(strings.NewReader(tt.html))
-			var sb strings.Builder
+			tb := table.NewTrackedBuilder()
 			imageCounter := 0
-			ExtractTextWithStructureAndImages(doc, &sb, &imageCounter, nil, "markdown")
-			result := strings.TrimSpace(sb.String())
+			ExtractTextWithStructureAndImages(doc, tb, &imageCounter, nil, "markdown")
+			result := strings.TrimSpace(tb.String())
 
 			if result != tt.wantText {
 				t.Errorf("ExtractTextWithStructureAndImages() text = %q, want %q", result, tt.wantText)
@@ -237,10 +238,10 @@ func TestExtractTextWithStructureAndImages(t *testing.T) {
 func TestExtractTextWithStructureAndImagesNil(t *testing.T) {
 	t.Parallel()
 
-	var sb strings.Builder
-	ExtractTextWithStructureAndImages(nil, &sb, nil, nil, "markdown")
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(nil, tb, nil, nil, "markdown")
 
-	if sb.Len() != 0 {
+	if tb.Len() != 0 {
 		t.Error("ExtractTextWithStructureAndImages(nil) should not write anything")
 	}
 }
@@ -286,9 +287,9 @@ func TestExtractTable(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc, _ := html.Parse(strings.NewReader(tt.html))
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-			result := sb.String()
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			result := tb.String()
 
 			if tt.wantRows > 0 {
 				// Should have separator line
@@ -309,10 +310,10 @@ func TestExtractTableNil(t *testing.T) {
 
 	doc, _ := html.Parse(strings.NewReader("<table></table>"))
 	tableNode := FindElementByTag(doc, "table")
-	var sb strings.Builder
-	ExtractTextWithStructureAndImages(tableNode, &sb, nil, nil, "markdown")
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(tableNode, tb, nil, nil, "markdown")
 
-	result := strings.TrimSpace(sb.String())
+	result := strings.TrimSpace(tb.String())
 	if result != "" {
 		t.Errorf("ExtractTextWithStructureAndImages(empty table) should not write anything, got %q", result)
 	}
@@ -341,9 +342,9 @@ func TestExtractTextWithStructureDepth(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc, _ := html.Parse(strings.NewReader(tt.html))
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-			result := sb.String()
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			result := tb.String()
 
 			if !tt.check(result) {
 				t.Errorf("ExtractTextWithStructure() = %q, failed check", result)
@@ -429,8 +430,8 @@ func BenchmarkExtractTextWithStructure(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		var sb strings.Builder
-		ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
+		tb := table.NewTrackedBuilder()
+		ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
 	}
 }
 
@@ -473,14 +474,44 @@ func TestExtractTableAsHTML(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc, _ := html.Parse(strings.NewReader(tt.html))
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "html")
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "html")
 
-			result := sb.String()
+			result := tb.String()
 			for _, want := range tt.want {
 				if !strings.Contains(result, want) {
 					t.Errorf("Output should contain %q, got:\n%s", want, result)
 				}
+			}
+		})
+	}
+}
+
+// TestWriteInt covers both branches of writeInt: the single-digit fast path
+// (WriteByte of '0'+n) and the multi-digit AppendInt path, including a value wide
+// enough to exercise the full decimal buffer.
+func TestWriteInt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		n    int
+		want string
+	}{
+		{"zero", 0, "0"},
+		{"single digit", 9, "9"},
+		{"first multi-digit", 10, "10"},
+		{"two digits", 99, "99"},
+		{"five digits", 12345, "12345"},
+		{"ten digits", 1234567890, "1234567890"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tb := table.NewTrackedBuilder()
+			writeInt(tb, tt.n)
+			if got := tb.String(); got != tt.want {
+				t.Errorf("writeInt(%d) = %q, want %q", tt.n, got, tt.want)
 			}
 		})
 	}

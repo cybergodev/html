@@ -523,3 +523,48 @@ func TestIsDifferentDomain(t *testing.T) {
 		})
 	}
 }
+
+// TestIsExternalURL_CaseInsensitiveScheme verifies scheme matching is
+// case-insensitive per RFC 3986 §3.1, matching browser behavior. A
+// case-sensitive test misclassifies uppercase-scheme URLs as relative/internal.
+func TestIsExternalURL_CaseInsensitiveScheme(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{"lowercase http", "http://example.com", true},
+		{"uppercase http", "HTTP://example.com", true},
+		{"mixedcase http", "Http://example.com", true},
+		{"uppercase https", "HTTPS://example.com", true},
+		{"mixedcase https", "hTtPs://example.com", true},
+		{"protocol-relative", "//example.com", true},
+		{"relative path", "/path/page", false},
+		{"schemeless", "example.com", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsExternalURL(tt.url); got != tt.want {
+				t.Errorf("IsExternalURL(%q) = %v, want %v", tt.url, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNormalizeBaseURL_CaseInsensitiveScheme verifies an uppercase scheme is
+// still recognized as HTTP and normalized rather than dropped as a non-HTTP URL.
+func TestNormalizeBaseURL_CaseInsensitiveScheme(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"HTTP://example.com":       "HTTP://example.com/",
+		"HTTPS://example.com/path": "HTTPS://example.com/",
+		"HtTp://example.com":       "HtTp://example.com/",
+	}
+	for in, want := range cases {
+		if got := NormalizeBaseURL(in); got != want {
+			t.Errorf("NormalizeBaseURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

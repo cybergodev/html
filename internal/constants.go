@@ -35,6 +35,14 @@ const (
 	highLinkDensityPenalty      = 0.2
 	mediumLinkDensityPenalty    = 0.5
 	lowLinkDensityPenalty       = 0.75
-	commaBonusThreshold         = 5
-	commaBonusMultiplier        = 10
+	// linkDensityPenaltyTextThreshold is the minimum content-text length below
+	// which the link-density penalty applies. Navigation bars, tag clouds, and
+	// sitemaps are link-dense AND short; main content that legitimately wraps
+	// prose or cards in <a> (landing pages, portfolio grids) is link-dense but
+	// substantial. Gating the penalty on text length prevents the article
+	// extractor from crushing a real content container and falling back to a
+	// tiny sibling (e.g. a hero block).
+	linkDensityPenaltyTextThreshold = 500
+	commaBonusThreshold             = 5
+	commaBonusMultiplier            = 10
 )

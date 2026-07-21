@@ -459,17 +459,17 @@ func TestCollectColumnWidths(t *testing.T) {
 			}
 
 			// Find table
-			table := FindElementByTag(doc, "table")
-			if table == nil {
+			tableNode := FindElementByTag(doc, "table")
+			if tableNode == nil {
 				t.Fatal("Table not found")
 			}
 
 			// Use the public API to extract table content
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(table, &sb, nil, nil, "markdown")
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(tableNode, tb, nil, nil, "markdown")
 
 			// Verify content was extracted
-			result := sb.String()
+			result := tb.String()
 			if result == "" {
 				t.Error("No table content extracted")
 			}
@@ -523,17 +523,17 @@ func TestTableStructureRowDetection(t *testing.T) {
 				t.Fatalf("Failed to parse HTML: %v", err)
 			}
 
-			table := FindElementByTag(doc, "table")
-			if table == nil {
+			tableNode := FindElementByTag(doc, "table")
+			if tableNode == nil {
 				t.Fatal("Table not found")
 			}
 
 			// Use the public API to extract table content
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(table, &sb, nil, nil, "markdown")
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(tableNode, tb, nil, nil, "markdown")
 
 			// Count rows by counting lines with | characters
-			result := sb.String()
+			result := tb.String()
 			lines := strings.Split(strings.TrimSpace(result), "\n")
 			// isBlankPipeRow detects a row whose cells are all empty (only pipes
 			// and whitespace), e.g. the synthesized header row emitted for
@@ -669,17 +669,17 @@ func TestTableColspanExpansion(t *testing.T) {
 				t.Fatalf("Failed to parse HTML: %v", err)
 			}
 
-			table := FindElementByTag(doc, "table")
-			if table == nil {
+			tableNode := FindElementByTag(doc, "table")
+			if tableNode == nil {
 				t.Fatal("Table not found")
 			}
 
 			// Use the public API to extract table content
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(table, &sb, nil, nil, "markdown")
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(tableNode, tb, nil, nil, "markdown")
 
 			// Verify the expected content is in the output
-			result := sb.String()
+			result := tb.String()
 			if !strings.Contains(result, tc.expectedContent) {
 				t.Errorf("%s: expected content %q not found in output %q", tc.description, tc.expectedContent, result)
 			}

@@ -61,12 +61,19 @@ const (
 	cacheKeySample = 4096
 
 	// Buffer size estimates for pre-allocation
-	initialTextSize   = 4096 // Initial capacity for text builder
-	initialSliceCap   = 16   // Initial capacity for result slices
-	initialMapCap     = 8    // Initial capacity for result maps
-	imageHTMLBufExtra = 64   // Extra buffer for HTML image tag generation
-	extractTagCap     = 16   // Initial capacity for tag attribute extraction
-	linkMapCap        = 64   // Initial capacity for link deduplication map
+	initialTextSize = 4096 // Initial capacity for text builder
+	initialSliceCap = 16   // Initial capacity for result slices
+	// linksInitialCap is the initial capacity for the links result slice. Links are
+	// the most numerous per-element extraction target on typical pages (nav bars,
+	// in-content links, footers), and a link-dense page exceeds initialSliceCap
+	// (16) many times over — each overflow reallocates and copies the whole slice.
+	// 128 covers realistic pages in a single backing array with no growth while
+	// staying a modest, strictly-bounded over-allocation for small pages.
+	linksInitialCap   = 128
+	initialMapCap     = 8  // Initial capacity for result maps
+	imageHTMLBufExtra = 64 // Extra buffer for HTML image tag generation
+	extractTagCap     = 16 // Initial capacity for tag attribute extraction
+	linkMapCap        = 64 // Initial capacity for link deduplication map
 
 	// Processing thresholds
 	wordsPerMinute = 200 // Average reading speed for reading time estimation

@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"golang.org/x/net/html"
+
+	"github.com/cybergodev/html/internal/table"
 )
 
 // TestSECDocumentStructure tests that SEC documents with custom tags
@@ -43,9 +45,9 @@ PUBLIC DOCUMENT COUNT:		1
 		t.Fatalf("Failed to parse HTML: %v", err)
 	}
 
-	var sb strings.Builder
-	ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-	result := sb.String()
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	result := tb.String()
 
 	// Verify that custom SEC tags result in proper spacing
 	lines := strings.Split(result, "\n")
@@ -135,9 +137,9 @@ func TestCustomTagFormatting(t *testing.T) {
 				t.Fatalf("Failed to parse HTML: %v", err)
 			}
 
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-			result := sb.String()
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			result := tb.String()
 
 			// Count paragraph separations (double newlines)
 			lines := strings.Split(result, "\n")
@@ -200,7 +202,7 @@ PUBLIC DOCUMENT COUNT:		1
 			b.Fatalf("Failed to parse HTML: %v", err)
 		}
 
-		var sb strings.Builder
-		ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
+		tb := table.NewTrackedBuilder()
+		ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
 	}
 }

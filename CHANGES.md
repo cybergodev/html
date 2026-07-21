@@ -4,6 +4,46 @@ All notable changes to the cybergodev/html library will be documented in this fi
 
 ---
 
+## v1.4.6 - Security Hardening, Extraction & Table Fixes, Performance (2026-07-22)
+
+### Security
+- `IsValidURL` now blocks `javascript:`/`vbscript:`/`file:` schemes (incl. disguised forms: leading control/space, embedded tab, uppercase, `.mp4`-suffix) on sanitizer-bypass paths (`ExtractAllLinks`, raw-HTML media scan), closing a script-URL injection vector
+- `ExtractFromFile` now rejects oversized files via a pre-read `Stat`, preventing memory exhaustion when callers pass untrusted file paths
+- `isSafeURIWithAudit` strips leading/trailing C0 controls and internal tab/LF/CR before scheme detection, closing an XSS-class bypass (`\x01javascript:`, `java&#9;script:`)
+- `AuditSink.Close` panics are now recovered (matching the `Record`/`Write` protection), so a user sink can no longer crash the process via the canonical `defer processor.Close()`
+- HTML entity decoding is bounded to `maxEntityScanLen`, closing an O(N²) CPU-exhaustion DoS reachable from any text node via runs of bare `&`
+- `DetectCharsetSmart` now honors `ForcedEncoding`/`Config.Encoding` even with smart detection enabled — an explicit override was previously silently ignored
+
+### Fixed
+- Article extraction on link-wrapped card/landing pages no longer collapses to a tiny hero block: non-content subtrees (script/nav/footer/svg) are excluded from scoring and the link-density penalty is gated on absolute text length
+- `findBodyElement` descends the subtree, so `SanitizeHTMLWithAudit` no longer falls back to fragment mode and leak `<html><head>` when head carries surviving content
+- Table rendering: `rowspan` placement now derives the true grid width (dropped trailing Markdown cells fixed); `tableFormat` is lowercased once so `HTML` no longer takes the Markdown data path
+- `<canvas>` removed from inline elements (it was classified as both inline and block); `getCellWidth` requires `width:` at a CSS boundary (`border-width:`/`max-width:`/`min-width:` no longer misclassified)
+- Hidden-style detection is tokenized per-declaration, fixing the `--my-display:none` custom-property false positive and the `di\splay:none` CSS-escape false negative
+- `IsExternalURL`/`NormalizeBaseURL`/`IsValidURL` compare the http/https scheme case-insensitively (`HTTP://` no longer seen as relative/internal)
+- `CleanText` normalizes NBSP (U+00A0) to a space, now consistent with `normalizeText`/`GetTextContent`
+- `DetectCharsetSmart` bounds its scoring pass to `MaxSampleSize` and clamps the confidence boost to 0–100 (a 100-match previously surfaced as 105)
+
+### Changed
+- HTML entity decoding is table-driven (ten common entities in one package-level table, replacing three hand-copied switches)
+- `tryAllEncodings` subsamples input to `MaxSampleSize` (the field was set but never read, so each of ~13 candidates full-scored the whole document)
+- `TrackedBuilder` is now a capacity-retaining `[]byte` buffer (was a `*strings.Builder` whose `Reset` nilled its backing array)
+- Examples use unique per-file `exampleNN` build tags so each builds and runs independently; new inline-link, table-format, and internal-links-only demos wired up
+- `withProcessorBatch` routes both processor-creation failure paths through `uniformErrorBatch`, removing ~20 lines of duplication
+
+### Performance
+- Article scoring cut from O(N²) to O(N) via a single bottom-up tree fold — ~10% faster extraction, alloc-neutral (external custom scorers unaffected via fallback)
+- Extraction bytes/op cut ~13% via slice/table/text-buffer pooling (links initial cap 128, per-row table scratch reuse, pooled `TrackedBuilder`, lazy media allocation)
+
+### Added
+- Examples `09_context_cancellation.go`, `10_secure_file_processing.go`, `11_encoding.go`
+- Regression/coverage tests: dangerous-scheme bypass, oversize-before-read, table multi-row aliasing, scoring equivalence, and `escapeMarkdownText`/`writeInt`/`detectMediaTypeByExtension` coverage
+
+### Removed
+- Dead code: `RemoveTagContent` and its helpers (~140 LOC), `GetTextLength`/`GetLinkDensity`, `compactCSS`, `asciiFoldIndex`, plus struct-zero-value tests that asserted nothing
+
+---
+
 ## v1.4.5 - Security Hardening, Table & URL Fixes, Allocation Cuts (2026-07-08)
 
 ### Security

@@ -5,13 +5,24 @@ import "strings"
 
 // IsExternalURL checks if a URL is an external HTTP(S) URL or protocol-relative URL.
 func IsExternalURL(url string) bool {
-	return strings.HasPrefix(url, "http://") ||
-		strings.HasPrefix(url, "https://") ||
-		strings.HasPrefix(url, "//")
+	return hasHTTPScheme(url) || strings.HasPrefix(url, "//")
 }
 
-// ExtractDomain extracts the domain from a URL.
-// Returns the domain portion (scheme://domain) or empty string for invalid URLs.
+// hasHTTPScheme reports whether url begins with an http:// or https:// scheme,
+// compared case-insensitively per RFC 3986 §3.1 (schemes are ASCII
+// case-insensitive). Browsers normalize HTTP:///HTTPS:// before any network
+// activity, so a case-sensitive prefix test misclassifies such URLs as
+// relative/internal. Shared by IsExternalURL, NormalizeBaseURL, and IsValidURL
+// so the three stay consistent.
+func hasHTTPScheme(url string) bool {
+	return (len(url) >= 7 && strings.EqualFold(url[:7], "http://")) ||
+		(len(url) >= 8 && strings.EqualFold(url[:8], "https://"))
+}
+
+// ExtractDomain extracts the host portion of a URL (e.g. "example.com" for
+// "https://example.com/path"), stripping the scheme and path. When the input
+// has no "://" or leading "//", the scheme is treated as absent and the input
+// is returned unchanged (the whole string is the "host").
 func ExtractDomain(url string) string {
 	// Find the start of the domain (after scheme)
 	start := 0
@@ -62,7 +73,8 @@ func NormalizeBaseURL(baseURL string) string {
 	}
 
 	// Skip non-HTTP URLs like data:, javascript:, mailto:, etc.
-	if strings.Contains(baseURL, ":") && !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+	// Scheme comparison is case-insensitive (RFC 3986 §3.1).
+	if strings.Contains(baseURL, ":") && !hasHTTPScheme(baseURL) {
 		return ""
 	}
 

@@ -106,6 +106,45 @@ func main() {
 	sinkProcessor.Close() // flush pending audit writes to sink
 	fmt.Printf("WriterAuditSink captured %d bytes of JSON audit logs\n", auditBuf.Len())
 
+	// ChannelAuditSink routes entries to a Go channel for async consumption
+	// (e.g. forwarding to an external logging service). Audit writes are
+	// synchronous, so once Extract returns the entries are already queued —
+	// drain the channel to inspect them, then close the sink.
+	channelSink := html.NewChannelAuditSink(64)
+	chCfg := html.DefaultConfig()
+	chCfg.Audit = html.DefaultAuditConfig()
+	chCfg.Audit.Enabled = true
+	chCfg.Audit.Sink = channelSink
+	chProcessor, err := html.New(chCfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	chProcessor.Extract([]byte(dangerousHTML))
+	chProcessor.Close()
+
+	var critical, warning, info int
+drain:
+	for {
+		select {
+		case e, ok := <-channelSink.Channel():
+			if !ok {
+				break drain
+			}
+			switch e.Level {
+			case html.AuditLevelCritical:
+				critical++
+			case html.AuditLevelWarning:
+				warning++
+			case html.AuditLevelInfo:
+				info++
+			}
+		default:
+			break drain
+		}
+	}
+	channelSink.Close()
+	fmt.Printf("ChannelAuditSink drained: %d critical, %d warning, %d info\n", critical, warning, info)
+
 	fmt.Println("\nOther built-in sinks (set via AuditConfig.Sink):")
 	fmt.Println("  - LoggerAuditSink   - Writes to standard logger")
 	fmt.Println("  - ChannelAuditSink  - Sends to Go channel (for async processing)")

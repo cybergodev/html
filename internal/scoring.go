@@ -36,6 +36,18 @@ type contentMetrics struct {
 	commaCount      int
 }
 
+// metricsSkipTags lists tags whose subtrees contain no extractable main-content
+// text and must be excluded from content scoring, in addition to
+// IsNonContentElement (script/style/noscript/nav/aside/footer/header). These
+// are raw-text or embedded-content elements (svg, math, template) and document
+// metadata (head, title) whose internal text never appears in extracted output.
+// Skipping them keeps scoring consistent with extraction and decouples the
+// score from whether SanitizeDOM has already removed them.
+var metricsSkipTags = map[string]bool{
+	"svg": true, "math": true, "template": true,
+	"head": true, "title": true,
+}
+
 // collectContentMetrics collects all scoring metrics in a single DOM traversal.
 // This is more efficient than calling separate functions for each metric.
 // Optimized with inline NBSP handling to avoid function call overhead.
@@ -44,6 +56,17 @@ func collectContentMetrics(node *html.Node) contentMetrics {
 
 	WalkNodes(node, func(n *html.Node) bool {
 		if n.Type == html.ElementNode {
+			// Skip subtrees that carry no extractable main-content text. This
+			// mirrors ExtractTextWithStructureAndImages (which skips
+			// IsNonContentElement) and prevents script/style/svg/nav/header
+			// text from inflating a candidate's content metrics. Without it,
+			// pages that inline large script payloads (e.g. VitePress SSR
+			// data) score wildly differently depending on whether SanitizeDOM
+			// has removed those tags, and the article extractor can pick the
+			// wrong node. Returning false stops traversal of this subtree.
+			if IsNonContentElement(n.Data) || metricsSkipTags[n.Data] {
+				return false
+			}
 			metrics.tagCount++
 			switch n.Data {
 			case "p":

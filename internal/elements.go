@@ -21,9 +21,14 @@ var inlineElements = map[string]bool{
 	"time": true, "data": true, "ruby": true, "rt": true, "rp": true,
 	"bdi": true, "wbr": true,
 
-	// Media and embedded
+	// Media and embedded. canvas is intentionally NOT here: it is a block-level
+	// element (see blockElements / IsParagraphLevelBlockElement) and surviving
+	// sanitization, so classifying it inline too made IsInlineElement and
+	// IsBlockElement both return true and caused the article scorer to skip
+	// <canvas> subtrees (extract.go extractArticleNode) while extraction treated
+	// them as blocks.
 	"img": true, "svg": true, "picture": true,
-	"video": true, "audio": true, "canvas": true,
+	"video": true, "audio": true,
 	"object": true, "embed": true, "iframe": true,
 	"map": true,
 

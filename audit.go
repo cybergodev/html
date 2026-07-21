@@ -373,11 +373,22 @@ func (c *auditCollector) Clear() {
 
 // Close closes the audit collector and its sink.
 // Sink writes are synchronous, so no draining is needed before closing.
-func (c *auditCollector) Close() error {
+//
+// Like Record, this recovers a panic from a user-supplied AuditSink.Close so a
+// misbehaving sink cannot crash the process via the canonical
+// `defer processor.Close()` pattern (SEC-003: the audit subsystem is best-effort
+// and must never propagate a panic to the public-API caller). Close has an error
+// return, so the recovered value is surfaced there rather than discarded.
+func (c *auditCollector) Close() (err error) {
 	if c == nil {
 		return nil
 	}
 	if c.sink != nil {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("%w: audit sink close panic: %v", ErrInternalPanic, r)
+			}
+		}()
 		return c.sink.Close()
 	}
 	return nil

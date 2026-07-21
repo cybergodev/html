@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"golang.org/x/net/html"
+
+	"github.com/cybergodev/html/internal/table"
 )
 
 // TestNamespaceTagInlineHandling tests that namespaced tags (e.g., ix:nonnumeric)
@@ -66,9 +68,9 @@ func TestNamespaceTagInlineHandling(t *testing.T) {
 				t.Fatalf("Failed to parse HTML: %v", err)
 			}
 
-			var sb strings.Builder
-			ExtractTextWithStructureAndImages(doc, &sb, nil, nil, "markdown")
-			result := sb.String()
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			result := tb.String()
 
 			// Remove extra whitespace for comparison
 			result = strings.Join(strings.Fields(result), " ")

@@ -1,7 +1,9 @@
 package html_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +18,74 @@ import (
 // ============================================================================
 // ExtractFromFile Tests
 // ============================================================================
+
+// TestExtractFromFileRejectsOversizeBeforeRead guards the F-1 fix: a file
+// larger than MaxInputSize is rejected by a pre-read Stat check rather than
+// being fully materialized in memory. Both the plain path and the
+// AllowedBaseDir (contained) path have the guard.
+func TestExtractFromFileRejectsOversizeBeforeRead(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.html")
+	// 512 * 6 = 3072 bytes, comfortably above the 1024 limit set below.
+	if err := os.WriteFile(path, bytes.Repeat([]byte("<p>x</p>"), 512), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("plain path", func(t *testing.T) {
+		t.Parallel()
+		cfg := html.DefaultConfig()
+		cfg.MaxInputSize = 1024
+		p, err := html.New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.Close()
+
+		_, err = p.ExtractFromFile(path)
+		if !errors.Is(err, html.ErrInputTooLarge) {
+			t.Fatalf("expected ErrInputTooLarge, got %v", err)
+		}
+	})
+
+	t.Run("contained path", func(t *testing.T) {
+		t.Parallel()
+		cfg := html.DefaultConfig()
+		cfg.MaxInputSize = 1024
+		cfg.AllowedBaseDir = dir
+		p, err := html.New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.Close()
+
+		_, err = p.ExtractFromFile(path)
+		if !errors.Is(err, html.ErrInputTooLarge) {
+			t.Fatalf("expected ErrInputTooLarge (contained), got %v", err)
+		}
+	})
+
+	t.Run("within limit still reads", func(t *testing.T) {
+		t.Parallel()
+		smallPath := filepath.Join(dir, "small.html")
+		if err := os.WriteFile(smallPath, []byte(`<html><body><p>ok</p></body></html>`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg := html.DefaultConfig()
+		cfg.MaxInputSize = 1024
+		p, err := html.New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.Close()
+
+		_, err = p.ExtractFromFile(smallPath)
+		if err != nil {
+			t.Fatalf("small file should read fine, got %v", err)
+		}
+	})
+}
 
 func TestExtractFromFile(t *testing.T) {
 	t.Parallel()

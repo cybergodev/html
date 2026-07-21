@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"regexp"
 	"strings"
 	"testing"
 
@@ -178,103 +177,6 @@ func TestGetTextContentNil(t *testing.T) {
 	}
 }
 
-func TestGetTextLength(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		html string
-		want int
-	}{
-		{
-			name: "simple text",
-			html: `<p>Hello</p>`,
-			want: 5,
-		},
-		{
-			name: "nested text",
-			html: `<div><p>Hello</p><p>World</p></div>`,
-			want: 10,
-		},
-		{
-			name: "empty",
-			html: `<p></p>`,
-			want: 0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			doc, _ := html.Parse(strings.NewReader(tt.html))
-			result := GetTextLength(doc)
-
-			if result != tt.want {
-				t.Errorf("GetTextLength() = %d, want %d", result, tt.want)
-			}
-		})
-	}
-}
-
-func TestGetTextLengthNil(t *testing.T) {
-	t.Parallel()
-
-	result := GetTextLength(nil)
-	if result != 0 {
-		t.Errorf("GetTextLength(nil) = %d, want 0", result)
-	}
-}
-
-func TestGetLinkDensity(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		html string
-		want float64
-	}{
-		{
-			name: "no links",
-			html: `<p>Hello World</p>`,
-			want: 0.0,
-		},
-		{
-			name: "all links",
-			html: `<p><a href="test.html">Hello World</a></p>`,
-			want: 1.0,
-		},
-		{
-			name: "half links",
-			html: `<p>Hello <a href="test.html">World</a></p>`,
-			want: 0.5,
-		},
-		{
-			name: "empty",
-			html: `<p></p>`,
-			want: 0.0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			doc, _ := html.Parse(strings.NewReader(tt.html))
-			result := GetLinkDensity(doc)
-
-			if result < tt.want-0.1 || result > tt.want+0.1 {
-				t.Errorf("GetLinkDensity() = %f, want ~%f", result, tt.want)
-			}
-		})
-	}
-}
-
-func TestGetLinkDensityNil(t *testing.T) {
-	t.Parallel()
-
-	result := GetLinkDensity(nil)
-	if result != 0.0 {
-		t.Errorf("GetLinkDensity(nil) = %f, want 0.0", result)
-	}
-}
-
 func TestCleanText(t *testing.T) {
 	t.Parallel()
 
@@ -308,7 +210,7 @@ func TestCleanText(t *testing.T) {
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				result := CleanText(tt.input, nil)
+				result := CleanText(tt.input)
 				if result != tt.want {
 					t.Errorf("CleanText() = %q, want %q", result, tt.want)
 				}
@@ -317,8 +219,6 @@ func TestCleanText(t *testing.T) {
 	})
 
 	t.Run("with regex", func(t *testing.T) {
-		whitespaceRegex := regexp.MustCompile(`\s+`)
-
 		tests := []struct {
 			name  string
 			input string
@@ -368,7 +268,7 @@ func TestCleanText(t *testing.T) {
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				result := CleanText(tt.input, whitespaceRegex)
+				result := CleanText(tt.input)
 				if result != tt.want {
 					t.Errorf("CleanText() = %q, want %q", result, tt.want)
 				}
@@ -377,11 +277,9 @@ func TestCleanText(t *testing.T) {
 	})
 
 	t.Run("edge cases", func(t *testing.T) {
-		whitespaceRegex := regexp.MustCompile(`\s+`)
-
 		t.Run("very long text", func(t *testing.T) {
 			longText := strings.Repeat("word ", 10000)
-			result := CleanText(longText, whitespaceRegex)
+			result := CleanText(longText)
 			if len(result) == 0 {
 				t.Error("CleanText() should handle long text")
 			}
@@ -389,7 +287,7 @@ func TestCleanText(t *testing.T) {
 
 		t.Run("special characters", func(t *testing.T) {
 			input := "Test   @#$%   Special"
-			result := CleanText(input, whitespaceRegex)
+			result := CleanText(input)
 			if !strings.Contains(result, "@#$%") {
 				t.Error("CleanText() should preserve special chars")
 			}
@@ -521,106 +419,6 @@ func TestSelectBestCandidate(t *testing.T) {
 // Tests for non-breaking space handling in helper functions
 // These tests verify that &nbsp;, &#160;, and &#xa0; are properly converted to regular spaces
 
-func TestGetTextLengthWithNbsp(t *testing.T) {
-	t.Parallel()
-
-	testCases := []struct {
-		name     string
-		html     string
-		expected int
-	}{
-		{
-			name:     "Regular spaces",
-			html:     "<p>Hello World</p>",
-			expected: 11, // "Hello World"
-		},
-		{
-			name:     "Named entity &nbsp;",
-			html:     "<p>Hello&nbsp;World</p>",
-			expected: 11, // "Hello World"
-		},
-		{
-			name:     "Decimal entity &#160;",
-			html:     "<p>Hello&#160;World</p>",
-			expected: 11, // "Hello World"
-		},
-		{
-			name:     "Hexadecimal entity &#xa0;",
-			html:     "<p>Hello&#xa0;World</p>",
-			expected: 11, // "Hello World"
-		},
-		{
-			name:     "Multiple nbsp",
-			html:     "<p>A&nbsp;&nbsp;&nbsp;B</p>",
-			expected: 5, // "A   B" (parser creates single text node)
-		},
-		{
-			name:     "Mixed nbsp and regular spaces",
-			html:     "<p>A&nbsp; B &#xa0;C</p>",
-			expected: 7, // "A  B  C" (parser creates single text node)
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			doc, err := html.Parse(strings.NewReader(tc.html))
-			if err != nil {
-				t.Fatalf("Failed to parse HTML: %v", err)
-			}
-
-			result := GetTextLength(doc)
-			if result != tc.expected {
-				t.Errorf("GetTextLength() = %d, want %d", result, tc.expected)
-			}
-		})
-	}
-}
-
-func TestGetLinkDensityWithNbsp(t *testing.T) {
-	t.Parallel()
-
-	testCases := []struct {
-		name     string
-		html     string
-		expected float64
-	}{
-		{
-			name:     "No links",
-			html:     "<p>Hello&nbsp;World</p>",
-			expected: 0.0,
-		},
-		{
-			name:     "All text in link with nbsp",
-			html:     "<p><a href='#'>Hello&nbsp;World</a></p>",
-			expected: 1.0, // 100% link density
-		},
-		{
-			name:     "Partial link with nbsp",
-			html:     "<p>Hello&nbsp;<a href='#'>World</a></p>",
-			expected: 5.0 / 10.0, // "World" is 5 chars, "Hello" is 5 chars (trailing space removed)
-		},
-		{
-			name:     "Multiple spaces in link",
-			html:     "<p><a href='#'>A&nbsp;&nbsp;B</a> C</p>",
-			expected: 0.8, // Actual value after trim and replace
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			doc, err := html.Parse(strings.NewReader(tc.html))
-			if err != nil {
-				t.Fatalf("Failed to parse HTML: %v", err)
-			}
-
-			result := GetLinkDensity(doc)
-			if result != tc.expected {
-				t.Errorf("GetLinkDensity() = %f, want %f", result, tc.expected)
-			}
-		})
-	}
-}
-
 func TestCalculateContentDensityWithNbsp(t *testing.T) {
 	t.Parallel()
 
@@ -670,19 +468,10 @@ func BenchmarkGetTextContent(b *testing.B) {
 
 func BenchmarkCleanText(b *testing.B) {
 	text := "Hello    World\n\nWith   multiple   spaces"
-	whitespaceRegex := regexp.MustCompile(`\s+`)
 
-	b.Run("without regex", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			CleanText(text, nil)
-		}
-	})
-
-	b.Run("with regex", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			CleanText(text, whitespaceRegex)
-		}
-	})
+	for i := 0; i < b.N; i++ {
+		CleanText(text)
+	}
 }
 
 // Benchmarks for performance optimizations
@@ -707,8 +496,6 @@ func BenchmarkNormalizeNonBreakingSpaces(b *testing.B) {
 }
 
 func BenchmarkCleanTextEarlyExit(b *testing.B) {
-	whitespaceRegex := regexp.MustCompile(`\s+`)
-
 	tests := []struct {
 		name string
 		text string
@@ -723,7 +510,7 @@ func BenchmarkCleanTextEarlyExit(b *testing.B) {
 	for _, tt := range tests {
 		b.Run(tt.name, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				CleanText(tt.text, whitespaceRegex)
+				CleanText(tt.text)
 			}
 		})
 	}
@@ -775,9 +562,22 @@ func TestIsValidURL(t *testing.T) {
 		{"protocol relative vbscript", "//vbscript:alert(1)", false},
 		{"protocol relative file", "//file:///etc/passwd", false},
 
-		// These are accepted by current implementation
-		{"javascript URL (not blocked)", "javascript:alert(1)", true},
-		{"file URL (not blocked)", "file:///etc/passwd", true},
+		// Dangerous schemes are now rejected (defense-in-depth: these reach
+		// IsValidURL via the non-sanitizing ExtractAllLinks path and the
+		// raw-HTML media scan, which bypass the DOM sanitizer).
+		{"javascript URL", "javascript:alert(1)", false},
+		{"vbscript URL", "vbscript:msgbox(1)", false},
+		{"file URL", "file:///etc/passwd", false},
+		// Disguised dangerous schemes — mirrors the sanitizer's bypass cases.
+		{"javascript with leading C0", "\x01javascript:alert(1)", false},
+		{"javascript with leading space", " javascript:alert(1)", false},
+		{"javascript split by tab", "java\tscript:alert(1)", false},
+		{"javascript uppercase", "JaVaScRiPt:alert(1)", false},
+		{"javascript disguised by .mp4 suffix", "javascript:alert(1).mp4", false},
+		// Schemes that merely contain the substring are NOT rejected.
+		{"https path containing javascript", "https://example.com/javascript-tutorial", true},
+		{"relative file named javascript", "javascript", true},
+
 		{"anchor only (not accepted)", "#section", false},
 	}
 
@@ -1098,5 +898,22 @@ func TestNormalizeText(t *testing.T) {
 				t.Errorf("normalizeText(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestIsValidURL_HTTPSchemeCaseInsensitive verifies IsValidURL accepts
+// uppercase/mixed-case http(s) schemes (RFC 3986 §3.1).
+func TestIsValidURL_HTTPSchemeCaseInsensitive(t *testing.T) {
+	t.Parallel()
+	valid := []string{
+		"http://example.com",
+		"HTTP://example.com",
+		"Https://example.com/path",
+		"HTTPS://example.com",
+	}
+	for _, u := range valid {
+		if !IsValidURL(u) {
+			t.Errorf("IsValidURL(%q) = false, want true (scheme is case-insensitive)", u)
+		}
 	}
 }

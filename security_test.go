@@ -82,6 +82,82 @@ func TestXSSPrevention(t *testing.T) {
 	}
 }
 
+// hasDangerousSchemePrefix is a test-only check that a URL begins with a
+// browser-executable or filesystem-reaching scheme. It mirrors the contract
+// IsValidURL now enforces; the test asserts these never reach structured output.
+func hasDangerousSchemePrefix(url string) bool {
+	return strings.HasPrefix(url, "javascript:") ||
+		strings.HasPrefix(url, "vbscript:") ||
+		strings.HasPrefix(url, "file:")
+}
+
+// TestDangerousSchemeNotInStructuredOutput guards the MEDIUM-1/MEDIUM-2 fix.
+// ExtractAllLinks skips sanitization by design, and the raw-HTML video/audio
+// scan reads pre-sanitization HTML; both reach IsValidURL, which must reject
+// dangerous schemes so a consumer iterating Links/Videos never receives a
+// javascript:/vbscript:/file: URL it might render unsafely. The ".mp4" suffix
+// is the bypass case: IsValidURL accepted it (first byte 'j' is alphanumeric)
+// and IsVideoURL matched on the extension.
+func TestDangerousSchemeNotInStructuredOutput(t *testing.T) {
+	t.Parallel()
+
+	p, err := html.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// Default config (sanitization ON). The raw-HTML media scan still reads the
+	// pre-sanitization string, so these must be filtered by IsValidURL.
+	mediaPayloads := []string{
+		`<html><body><iframe src="javascript:alert(1).mp4"></iframe><p>ok</p></body></html>`,
+		`<html><body><embed src="javascript:alert(1).mp4"><p>ok</p></body></html>`,
+		`<html><body><object data="javascript:alert(1).mp4"></object><p>ok</p></body></html>`,
+		`<html><body><iframe src="vbscript:msgbox(1).mp4"></iframe><p>ok</p></body></html>`,
+	}
+	for _, in := range mediaPayloads {
+		result, err := p.Extract([]byte(in))
+		if err != nil {
+			t.Fatalf("Extract failed: %v", err)
+		}
+		for _, v := range result.Videos {
+			if hasDangerousSchemePrefix(strings.ToLower(v.URL)) {
+				t.Errorf("dangerous scheme reached Videos: %q (input %q)", v.URL, in)
+			}
+		}
+		for _, a := range result.Audios {
+			if hasDangerousSchemePrefix(strings.ToLower(a.URL)) {
+				t.Errorf("dangerous scheme reached Audios: %q (input %q)", a.URL, in)
+			}
+		}
+	}
+
+	// ExtractAllLinks deliberately skips sanitization; dangerous schemes must
+	// still be filtered by IsValidURL.
+	linksHTML := `<html><body>
+		<a href="javascript:alert(1)">x</a>
+		<a href="vbscript:msgbox(1)">y</a>
+		<a href="file:///etc/passwd">z</a>
+		<a href="https://example.com/ok">keep</a>
+	</body></html>`
+	links, err := p.ExtractAllLinks([]byte(linksHTML))
+	if err != nil {
+		t.Fatalf("ExtractAllLinks failed: %v", err)
+	}
+	var kept int
+	for _, l := range links {
+		if hasDangerousSchemePrefix(strings.ToLower(l.URL)) {
+			t.Errorf("dangerous scheme reached Links: %q", l.URL)
+		}
+		if l.URL == "https://example.com/ok" {
+			kept++
+		}
+	}
+	if kept == 0 {
+		t.Errorf("safe link was filtered out; IsValidURL is too strict")
+	}
+}
+
 // TestPathTraversalPrevention tests file path validation
 func TestPathTraversalPrevention(t *testing.T) {
 	t.Parallel()

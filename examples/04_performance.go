@@ -135,6 +135,12 @@ func main() {
 
 	fmt.Printf("  Success: %d/%d\n\n", batchResult.Success, len(batchResult.Results))
 
+	// Package-level convenience: html.ExtractBatch needs no explicit Processor
+	// (it borrows one from an internal pool), handy for one-off batch jobs.
+	pkgBatch := html.ExtractBatch(docs)
+	fmt.Printf("html.ExtractBatch (package-level): %d/%d success\n\n",
+		pkgBatch.Success, len(pkgBatch.Results))
+
 	// ============================================================
 	// 4. Batch with Context (Cancellation)
 	// ============================================================
@@ -236,6 +242,7 @@ func main() {
 	fmt.Printf("Total Processed: %d\n", stats.TotalProcessed)
 	fmt.Printf("Cache Hits: %d\n", stats.CacheHits)
 	fmt.Printf("Cache Misses: %d\n", stats.CacheMisses)
+	fmt.Printf("Errors: %d\n", stats.ErrorCount)
 	fmt.Printf("Avg Process Time: %v\n", stats.AverageProcessTime)
 
 	if stats.TotalProcessed > 0 {
