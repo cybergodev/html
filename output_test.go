@@ -440,3 +440,65 @@ func TestProcessorOutputMethod_ContextError(t *testing.T) {
 		t.Errorf("ExtractToJSONWithContext: expected nil JSON on error, got %d bytes", len(jsonData))
 	}
 }
+
+// TestProcessorOutputWithContext_HappyPath covers the non-error branches of
+// extractWithFormatsWithContext and extractFromFileWithFormatsWithContext
+// (both at 66.7%) by calling the context-aware output methods on a valid
+// processor with an active context.
+func TestProcessorOutputWithContext_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	p := testutil.NewTestProcessor(t)
+	ctx := context.Background()
+	htmlBytes := []byte("<html><body><h1>Title</h1><p>Content</p></body></html>")
+
+	t.Run("ExtractToMarkdownWithContext happy path", func(t *testing.T) {
+		t.Parallel()
+
+		md, err := p.ExtractToMarkdownWithContext(ctx, htmlBytes)
+		if err != nil {
+			t.Fatalf("ExtractToMarkdownWithContext() failed: %v", err)
+		}
+		if md == "" {
+			t.Error("expected non-empty markdown")
+		}
+	})
+
+	t.Run("ExtractToJSONWithContext happy path", func(t *testing.T) {
+		t.Parallel()
+
+		data, err := p.ExtractToJSONWithContext(ctx, htmlBytes)
+		if err != nil {
+			t.Fatalf("ExtractToJSONWithContext() failed: %v", err)
+		}
+		if len(data) == 0 {
+			t.Error("expected non-empty JSON")
+		}
+	})
+
+	t.Run("ExtractToMarkdownFromFileWithContext happy path", func(t *testing.T) {
+		t.Parallel()
+
+		tmpFile := testutil.CreateTempHTML(t, "<html><body><h1>File</h1><p>Content</p></body></html>")
+		md, err := p.ExtractToMarkdownFromFileWithContext(ctx, tmpFile)
+		if err != nil {
+			t.Fatalf("ExtractToMarkdownFromFileWithContext() failed: %v", err)
+		}
+		if md == "" {
+			t.Error("expected non-empty markdown")
+		}
+	})
+
+	t.Run("ExtractToJSONFromFileWithContext happy path", func(t *testing.T) {
+		t.Parallel()
+
+		tmpFile := testutil.CreateTempHTML(t, "<html><body><h1>File</h1><p>Content</p></body></html>")
+		data, err := p.ExtractToJSONFromFileWithContext(ctx, tmpFile)
+		if err != nil {
+			t.Fatalf("ExtractToJSONFromFileWithContext() failed: %v", err)
+		}
+		if len(data) == 0 {
+			t.Error("expected non-empty JSON")
+		}
+	})
+}

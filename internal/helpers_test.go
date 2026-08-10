@@ -476,25 +476,6 @@ func BenchmarkCleanText(b *testing.B) {
 
 // Benchmarks for performance optimizations
 
-func BenchmarkNormalizeNonBreakingSpaces(b *testing.B) {
-	tests := []struct {
-		name string
-		text string
-	}{
-		{"NoNBSP", "This is regular text without non-breaking spaces"},
-		{"WithNBSP", "This\u00a0is\u00a0text\u00a0with\u00a0NBSP"},
-		{"LargeNoNBSP", strings.Repeat("Regular text ", 100)},
-		{"LargeWithNBSP", strings.Repeat("Text\u00a0", 100)},
-	}
-	for _, tt := range tests {
-		b.Run(tt.name, func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				normalizeNonBreakingSpaces(tt.text)
-			}
-		})
-	}
-}
-
 func BenchmarkCleanTextEarlyExit(b *testing.B) {
 	tests := []struct {
 		name string
@@ -638,31 +619,6 @@ func BenchmarkIsValidURL(b *testing.B) {
 		b.Run(tt.name, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				IsValidURL(tt.url)
-			}
-		})
-	}
-}
-
-func TestNormalizeNonBreakingSpaces(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"empty", "", ""},
-		{"no nbsp passthrough", "hello world", "hello world"},
-		{"single nbsp", "a b", "a b"},
-		{"multiple nbsp", "a  b", "a  b"},
-		{"leading and trailing nbsp", " hi ", " hi "},
-		{"only nbsp", " ", " "},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := normalizeNonBreakingSpaces(tt.in); got != tt.want {
-				t.Errorf("normalizeNonBreakingSpaces(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
 	}

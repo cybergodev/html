@@ -1,5 +1,3 @@
-//go:build examples
-
 package main
 
 import (
@@ -68,6 +66,37 @@ func main() {
 		}
 		fmt.Printf("   Doc %d: %s (%d words)\n", i+1, result.Title, result.WordCount)
 	}
+
+	// ============================================================
+	// 4. ExtractArticle mode (default: true)
+	// ============================================================
+	// When ExtractArticle is true (the default), the library identifies the
+	// primary content node (e.g. <article>) and extracts only that subtree.
+	// Setting it to false extracts the entire <body>, which is useful when
+	// you need surrounding context (related sections, comments, etc.).
+	// Note: nav, aside, footer, and script are always removed regardless
+	// of this setting.
+	fmt.Println("\n4. ExtractArticle mode:")
+	pageWithExtra := `<html><body>
+		<div>
+			<h2>Related Articles</h2>
+			<p>See also: Understanding Go Channels.</p>
+		</div>
+		<article>
+			<h1>Main Article</h1>
+			<p>This is the primary content.</p>
+		</article>
+	</body></html>`
+
+	articleResult, _ := processor.Extract([]byte(pageWithExtra))
+	fmt.Printf("   ExtractArticle=true (default):\n     %s\n", articleResult.Text)
+
+	fullBodyCfg := html.DefaultConfig()
+	fullBodyCfg.ExtractArticle = false
+	fullBodyProc, _ := html.New(fullBodyCfg)
+	defer fullBodyProc.Close()
+	fullResult, _ := fullBodyProc.Extract([]byte(pageWithExtra))
+	fmt.Printf("   ExtractArticle=false:\n     %s\n", fullResult.Text)
 
 	// ============================================================
 	// Summary

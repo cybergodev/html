@@ -644,3 +644,85 @@ func TestPutByteBufSecureClear(t *testing.T) {
 	// Return to pool - the secure-clear path zeroes then resets (no panic).
 	PutByteBuf(bp)
 }
+
+// --- TrackedBuilder pool tests (GetTrackedBuilder / PutTrackedBuilder) ---
+// These were at 0% coverage because the table rendering code path goes through
+// NewTrackedBuilder (direct construction), not the pooled variant.
+
+// TestGetTrackedBuilder tests getting a TrackedBuilder from the pool.
+func TestGetTrackedBuilder(t *testing.T) {
+	t.Parallel()
+
+	tb := GetTrackedBuilder()
+	if tb == nil {
+		t.Fatal("GetTrackedBuilder() returned nil")
+	}
+
+	// Must be reset (empty) on acquisition.
+	if tb.Len() != 0 {
+		t.Errorf("pooled TrackedBuilder should be reset, got Len()=%d", tb.Len())
+	}
+	if tb.LastChar != 0 {
+		t.Errorf("LastChar = %d, want 0 after reset", tb.LastChar)
+	}
+
+	// Verify it is usable.
+	tb.WriteString("hello")
+	if tb.String() != "hello" {
+		t.Errorf("String() = %q, want 'hello'", tb.String())
+	}
+
+	PutTrackedBuilder(tb)
+}
+
+// TestPutTrackedBuilder tests returning a TrackedBuilder to the pool and verifies
+// that the next Get returns a reset instance.
+func TestPutTrackedBuilder(t *testing.T) {
+	t.Parallel()
+
+	tb := GetTrackedBuilder()
+	tb.WriteString("content to be cleared")
+	tb.WriteByte('!')
+
+	PutTrackedBuilder(tb)
+
+	// Next acquisition should be reset.
+	tb2 := GetTrackedBuilder()
+	if tb2.Len() != 0 {
+		t.Errorf("pooled TrackedBuilder should be reset after Put, got Len()=%d", tb2.Len())
+	}
+
+	PutTrackedBuilder(tb2)
+}
+
+// TestPutTrackedBuilderNil tests that PutTrackedBuilder handles nil safely.
+func TestPutTrackedBuilderNil(t *testing.T) {
+	t.Parallel()
+
+	PutTrackedBuilder(nil) // must not panic
+}
+
+// TestTrackedBuilderPoolConcurrent tests concurrent access to the TrackedBuilder pool.
+func TestTrackedBuilderPoolConcurrent(t *testing.T) {
+	t.Parallel()
+
+	const numGoroutines = 100
+	const numOperations = 50
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				tb := GetTrackedBuilder()
+				tb.WriteString("test string")
+				_ = tb.String()
+				PutTrackedBuilder(tb)
+			}
+		}()
+	}
+
+	wg.Wait()
+}

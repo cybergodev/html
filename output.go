@@ -12,6 +12,7 @@ import (
 // from the HTML bytes and converts it to UTF-8 before processing.
 // This method configures the extractor to use markdown format for inline images and links.
 // Thread-safe: creates a config copy to avoid modifying shared state.
+// Returns the same errors as [Processor.Extract].
 func (p *Processor) ExtractToMarkdown(htmlBytes []byte) (string, error) {
 	return recoverPanic(func() (string, error) {
 		result, err := p.extractWithFormats(htmlBytes, "markdown", "markdown")
@@ -27,6 +28,7 @@ func (p *Processor) ExtractToMarkdown(htmlBytes []byte) (string, error) {
 // from the HTML file and converts it to UTF-8 before processing.
 // This method configures the extractor to use markdown format for inline images and links.
 // Thread-safe: creates a config copy to avoid modifying shared state.
+// Returns the same errors as [Processor.ExtractFromFile].
 func (p *Processor) ExtractToMarkdownFromFile(filePath string) (string, error) {
 	return recoverPanic(func() (string, error) {
 		result, err := p.extractFromFileWithFormats(filePath, "markdown", "markdown")
@@ -41,6 +43,7 @@ func (p *Processor) ExtractToMarkdownFromFile(filePath string) (string, error) {
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML bytes and converts it to UTF-8 before processing.
 // This method uses the processor's configuration (cache, timeout, etc.) for extraction.
+// Returns the same errors as [Processor.Extract].
 func (p *Processor) ExtractToJSON(htmlBytes []byte) ([]byte, error) {
 	return recoverPanic(func() ([]byte, error) {
 		result, err := p.Extract(htmlBytes)
@@ -55,6 +58,7 @@ func (p *Processor) ExtractToJSON(htmlBytes []byte) ([]byte, error) {
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML file and converts it to UTF-8 before processing.
 // This method uses the processor's configuration (cache, timeout, etc.) for extraction.
+// Returns the same errors as [Processor.ExtractFromFile].
 func (p *Processor) ExtractToJSONFromFile(filePath string) ([]byte, error) {
 	return recoverPanic(func() ([]byte, error) {
 		result, err := p.ExtractFromFile(filePath)
@@ -69,6 +73,7 @@ func (p *Processor) ExtractToJSONFromFile(filePath string) ([]byte, error) {
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML bytes and converts it to UTF-8 before processing.
 // Thread-safe: creates a config copy to avoid modifying shared state.
+// Returns the same errors as [Processor.ExtractWithContext].
 func (p *Processor) ExtractToMarkdownWithContext(ctx context.Context, htmlBytes []byte) (string, error) {
 	return recoverPanic(func() (string, error) {
 		result, err := p.extractWithFormatsWithContext(ctx, htmlBytes, "markdown", "markdown")
@@ -83,6 +88,7 @@ func (p *Processor) ExtractToMarkdownWithContext(ctx context.Context, htmlBytes 
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML file and converts it to UTF-8 before processing.
 // Thread-safe: creates a config copy to avoid modifying shared state.
+// Returns the same errors as [Processor.ExtractFromFileWithContext].
 func (p *Processor) ExtractToMarkdownFromFileWithContext(ctx context.Context, filePath string) (string, error) {
 	return recoverPanic(func() (string, error) {
 		result, err := p.extractFromFileWithFormatsWithContext(ctx, filePath, "markdown", "markdown")
@@ -96,6 +102,7 @@ func (p *Processor) ExtractToMarkdownFromFileWithContext(ctx context.Context, fi
 // ExtractToJSONWithContext extracts content from HTML and returns it as JSON with context support.
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML bytes and converts it to UTF-8 before processing.
+// Returns the same errors as [Processor.ExtractWithContext].
 func (p *Processor) ExtractToJSONWithContext(ctx context.Context, htmlBytes []byte) ([]byte, error) {
 	return recoverPanic(func() ([]byte, error) {
 		result, err := p.ExtractWithContext(ctx, htmlBytes)
@@ -109,6 +116,7 @@ func (p *Processor) ExtractToJSONWithContext(ctx context.Context, htmlBytes []by
 // ExtractToJSONFromFileWithContext extracts content from an HTML file and returns it as JSON with context support.
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML file and converts it to UTF-8 before processing.
+// Returns the same errors as [Processor.ExtractFromFileWithContext].
 func (p *Processor) ExtractToJSONFromFileWithContext(ctx context.Context, filePath string) ([]byte, error) {
 	return recoverPanic(func() ([]byte, error) {
 		result, err := p.ExtractFromFileWithContext(ctx, filePath)
@@ -131,6 +139,8 @@ func (p *Processor) ExtractToJSONFromFileWithContext(ctx context.Context, filePa
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [Extract].
 func ExtractToMarkdown(htmlBytes []byte, cfg ...Config) (string, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -149,6 +159,8 @@ func ExtractToMarkdown(htmlBytes []byte, cfg ...Config) (string, error) {
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractFromFile].
 func ExtractToMarkdownFromFile(filePath string, cfg ...Config) (string, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -167,6 +179,8 @@ func ExtractToMarkdownFromFile(filePath string, cfg ...Config) (string, error) {
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [Extract].
 func ExtractToJSON(htmlBytes []byte, cfg ...Config) ([]byte, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -185,6 +199,8 @@ func ExtractToJSON(htmlBytes []byte, cfg ...Config) ([]byte, error) {
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractFromFile].
 func ExtractToJSONFromFile(filePath string, cfg ...Config) ([]byte, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -203,6 +219,8 @@ func ExtractToJSONFromFile(filePath string, cfg ...Config) ([]byte, error) {
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractWithContext].
 func ExtractToMarkdownWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -221,6 +239,8 @@ func ExtractToMarkdownWithContext(ctx context.Context, htmlBytes []byte, cfg ...
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractFromFileWithContext].
 func ExtractToMarkdownFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -239,6 +259,8 @@ func ExtractToMarkdownFromFileWithContext(ctx context.Context, filePath string, 
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractWithContext].
 func ExtractToJSONWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) ([]byte, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -257,6 +279,8 @@ func ExtractToJSONWithContext(ctx context.Context, htmlBytes []byte, cfg ...Conf
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractFromFileWithContext].
 func ExtractToJSONFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) ([]byte, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -302,15 +326,14 @@ func (r *Result) MarshalJSON() ([]byte, error) {
 }
 
 // buildFormatProcessor returns a transient processor that reuses p's scorer but
-// applies the given inline image/link formats. It snapshots p's config under the
-// config lock so the format overrides never mutate the shared config, uses a
-// disabled cache to avoid polluting p's cache with format-specific results, and
-// an independent disabled audit collector so a parent Close() cannot race with
-// an in-flight extraction on the temporary processor.
+// applies the given inline image/link formats. It copies p's immutable config
+// (never mutated after New, so no lock is needed) and overrides only the format
+// fields, uses a disabled cache to avoid polluting p's cache with format-specific
+// results, and an independent disabled audit collector so a parent Close() cannot
+// race with an in-flight extraction on the temporary processor.
 func (p *Processor) buildFormatProcessor(imageFormat, linkFormat string) *Processor {
-	p.configMu.Lock()
-	cfg := *p.config // Value copy to avoid race conditions
-	p.configMu.Unlock()
+	// p.config is immutable after New(), so a plain value copy is safe without a lock.
+	cfg := *p.config
 
 	cfg.InlineImageFormat = imageFormat
 	cfg.InlineLinkFormat = linkFormat

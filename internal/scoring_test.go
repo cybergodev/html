@@ -54,7 +54,7 @@ func TestScoreContentNode(t *testing.T) {
 		{
 			name:      "negative class names",
 			html:      `<div class="sidebar"><p>Content</p></div>`,
-			checkFunc: func(score int) bool { return score < 0 },
+			checkFunc: func(score int) bool { return score == 0 }, // ShouldRemove guard: removable nodes score 0
 		},
 		{
 			name:      "with headings",
@@ -490,9 +490,51 @@ func TestShouldRemoveElement(t *testing.T) {
 		},
 		{
 			// A plain div matching a removal pattern is still removed — only
-			// semantic primary-content containers are protected.
+			// semantic primary-content containers (<article>, <main>) and
+			// class/id values carrying a content-area signal ("content",
+			// "article") alongside the removal pattern are protected.
 			name: "div with sidebar class still removed",
 			html: `<div class="post-with-sidebar">content</div>`,
+			want: true,
+		},
+		{
+			// Compound layout class names like "content-sidebar" describe a
+			// CSS grid/flex layout that wraps BOTH the main content area and
+			// a sidebar column, not the sidebar itself. The "content" signal
+			// overrides the "sidebar" removal so the article body nested
+			// inside survives.
+			name: "div content-sidebar layout wrapper",
+			html: `<div class="content-sidebar grid-layout">article body</div>`,
+			want: false,
+		},
+		{
+			// Real-world regression: The Motley Fool uses
+			// "foolcom-grid-content-sidebar mt-9" on the div that wraps
+			// #article-body and the sidebar. Without the content-area-signal
+			// override, CleanContentNode removed this div and discarded the
+			// entire article, yielding empty extraction output.
+			name: "foolcom-grid-content-sidebar (real-world regression)",
+			html: `<div class="foolcom-grid-content-sidebar mt-9">article body</div>`,
+			want: false,
+		},
+		{
+			// "article" is also a valid content-area signal in class names.
+			name: "div article-sidebar layout wrapper",
+			html: `<div class="article-sidebar">article body</div>`,
+			want: false,
+		},
+		{
+			// The override applies to the id attribute as well.
+			name: "id content-sidebar layout wrapper",
+			html: `<div id="content-sidebar">article body</div>`,
+			want: false,
+		},
+		{
+			// A genuinely non-content element inside the layout wrapper is
+			// still removed — the override only protects the wrapper itself,
+			// not its children.
+			name: "sidebar child still removed inside content wrapper",
+			html: `<div class="sidebar">nav links</div>`,
 			want: true,
 		},
 		{
@@ -655,7 +697,7 @@ func TestPatternMatchesEdgeCases(t *testing.T) {
 			name:    "both empty",
 			value:   "",
 			pattern: "",
-			want:    true, // MatchesPattern returns true for empty pattern (iteration doesn't execute)
+			want:    false, // Empty pattern never matches
 		},
 		{
 			name:    "pattern longer than value",
@@ -682,10 +724,10 @@ func TestPatternMatchesEdgeCases(t *testing.T) {
 			want:    true, // Underscore is not treated as a word boundary by patternMatches
 		},
 		{
-			name:    "partial match should fail",
+			name:    "digit suffix matches (digits are boundary chars)",
 			value:   "article123",
 			pattern: "article",
-			want:    false,
+			want:    true, // Digits are boundary chars: menu3 matches menu, article1 matches article
 		},
 		{
 			name:    "match at start",

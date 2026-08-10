@@ -132,6 +132,11 @@ func DetectAudioType(url string) string {
 // URLs like "song.mp3?v=2#audio" still match. The two callers pass distinct,
 // non-overlapping maps (videoExtensions / audioExtensions), so iteration order
 // does not affect the result.
+//
+// Instead of iterating every extension with strings.HasSuffix (O(n) map
+// iteration), it extracts the suffix after the last '.' and does a single O(1)
+// map lookup. This is both faster (one hash lookup vs n suffix comparisons) and
+// more correct: the longest trailing extension wins deterministically.
 func detectMediaTypeByExtension(url string, exts map[string]string) string {
 	// Remove query parameters and fragments
 	if idx := strings.IndexByte(url, '?'); idx >= 0 {
@@ -141,12 +146,13 @@ func detectMediaTypeByExtension(url string, exts map[string]string) string {
 		url = url[:idx]
 	}
 
-	for ext, mimeType := range exts {
-		if strings.HasSuffix(url, ext) {
-			return mimeType
-		}
+	// Extract the file extension: everything from the last '.' onward.
+	// A direct map lookup replaces the O(n) iteration of HasSuffix checks.
+	dotIdx := strings.LastIndexByte(url, '.')
+	if dotIdx < 0 {
+		return ""
 	}
-	return ""
+	return exts[url[dotIdx:]]
 }
 
 // detectVideoType performs lookup for video extensions.

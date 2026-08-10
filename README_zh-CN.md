@@ -106,19 +106,21 @@ func main() {
 
     // 仅提取文本
     text, _ := html.ExtractText(htmlBytes)
+    fmt.Println(text)
 
     // 提取所有内容（含元数据）
     result, _ := html.Extract(htmlBytes)
     fmt.Println(result.Title)     // "标题"
-    fmt.Println(result.Text)      // "标题\n\n内容在这里..."
     fmt.Println(result.WordCount) // 2
 
-    // 提取所有资源链接
+    // 提取所有资源链接（包括 <script>、<iframe>、<link> 标签）
     links, _ := html.ExtractAllLinks(htmlBytes)
+    fmt.Printf("找到 %d 个链接\n", len(links))
 
     // 格式转换
     markdown, _ := html.ExtractToMarkdown(htmlBytes)
     jsonData, _ := html.ExtractToJSON(htmlBytes)
+    fmt.Printf("Markdown: %d 字符, JSON: %d 字节\n", len(markdown), len(jsonData))
 }
 ```
 
@@ -223,16 +225,15 @@ import (
 )
 
 func main() {
-    config := html.Config{
-        MaxInputSize:       10 * 1024 * 1024, // 10MB 限制
-        ProcessingTimeout:  30 * time.Second,
-        MaxCacheEntries:    500,
-        CacheTTL:           30 * time.Minute,
-        CacheCleanup:       5 * time.Minute,  // 后台清理间隔
-        WorkerPoolSize:     8,
-        EnableSanitization: true,  // 移除 <script>, <style> 标签
-        MaxDepth:           50,    // 防止深度嵌套攻击
-    }
+    config := html.DefaultConfig()
+    config.MaxInputSize = 10 * 1024 * 1024 // 10MB 限制
+    config.ProcessingTimeout = 30 * time.Second
+    config.MaxCacheEntries = 500
+    config.CacheTTL = 30 * time.Minute
+    config.CacheCleanup = 5 * time.Minute // 后台清理间隔
+    config.WorkerPoolSize = 8
+    config.EnableSanitization = true // 移除 <script>, <style> 标签
+    config.MaxDepth = 50             // 防止深度嵌套攻击
     processor, _ := html.New(config)
     defer processor.Close()
 }
@@ -287,9 +288,8 @@ for _, link := range links {
 
 // 按类型分组
 byType := html.GroupLinksByType(links)
-cssLinks := byType["css"]
-jsLinks := byType["js"]
-images := byType["image"]
+fmt.Printf("CSS: %d, JS: %d, 图片: %d\n",
+    len(byType["css"]), len(byType["js"]), len(byType["image"]))
 ```
 
 ### 获取阅读时间
@@ -374,6 +374,12 @@ html.ExtractToJSON(htmlBytes []byte, cfg ...Config) ([]byte, error)
 // 格式转换（从文件）
 html.ExtractToMarkdownFromFile(filePath string, cfg ...Config) (string, error)
 html.ExtractToJSONFromFile(filePath string, cfg ...Config) ([]byte, error)
+
+// Context 感知格式转换
+html.ExtractToMarkdownWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error)
+html.ExtractToMarkdownFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error)
+html.ExtractToJSONWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) ([]byte, error)
+html.ExtractToJSONFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) ([]byte, error)
 
 // 链接
 html.ExtractAllLinks(htmlBytes []byte, cfg ...Config) ([]LinkResource, error)
@@ -621,7 +627,7 @@ type Config struct {
 - **基目录锁定**：`AllowedBaseDir` 将文件读取限制在受信任的目录内
 
 ### Data URL 安全
-- **允许**：`data:image/*`、`data:font/*`、`data:application/pdf`
+- **允许**：`data:image/{gif,jpeg,jpg,png,webp,bmp,x-icon,vnd.microsoft.icon,avif,apng}`、`data:font/{woff,woff2,ttf,otf}`、`data:application/pdf`（及 `application/font-woff`、`application/font-woff2` 别名）
 - **阻止**：`data:text/html`、`data:text/javascript`、`data:text/plain`
 
 ---
@@ -691,21 +697,26 @@ processor, _ := html.New(config)
 
 ## 📁 示例代码
 
-完整的可运行示例请参见 [examples/](examples)：
+完整的可运行示例请参见 [examples/](examples) 目录。
+每个示例都是独立的 `main` 包，可直接运行：
+
+```bash
+go run ./examples/01_quick_start/
+```
 
 | 示例 | 描述 |
 |------|------|
-| [01_quick_start.go](examples/01_quick_start.go) | 快速入门指南 |
-| [02_content_extraction.go](examples/02_content_extraction.go) | 内容提取选项与输出格式 |
-| [03_links_media.go](examples/03_links_media.go) | 链接与媒体提取 |
-| [04_performance.go](examples/04_performance.go) | 性能优化与批处理 |
-| [05_http_integration.go](examples/05_http_integration.go) | HTTP 集成模式 |
-| [06_advanced_usage.go](examples/06_advanced_usage.go) | 自定义评分器、审计日志、安全配置 |
-| [07_error_handling.go](examples/07_error_handling.go) | 错误处理模式 |
-| [08_real_world.go](examples/08_real_world.go) | 实际应用案例 |
-| [09_context_cancellation.go](examples/09_context_cancellation.go) | 上下文取消与超时 |
-| [10_secure_file_processing.go](examples/10_secure_file_processing.go) | AllowedBaseDir 沙箱与安全文件读取 |
-| [11_encoding.go](examples/11_encoding.go) | 字符编码检测与覆盖 |
+| [01_quick_start](examples/01_quick_start) | 快速入门指南 |
+| [02_content_extraction](examples/02_content_extraction) | 内容提取选项与输出格式 |
+| [03_links_media](examples/03_links_media) | 链接与媒体提取 |
+| [04_performance](examples/04_performance) | 性能优化与批处理 |
+| [05_http_integration](examples/05_http_integration) | HTTP 集成模式 |
+| [06_advanced_usage](examples/06_advanced_usage) | 自定义评分器、审计日志、安全配置 |
+| [07_error_handling](examples/07_error_handling) | 错误处理模式 |
+| [08_real_world](examples/08_real_world) | 实际应用案例 |
+| [09_context_cancellation](examples/09_context_cancellation) | 上下文取消与超时 |
+| [10_secure_file_processing](examples/10_secure_file_processing) | AllowedBaseDir 沙箱与安全文件读取 |
+| [11_encoding](examples/11_encoding) | 字符编码检测与覆盖 |
 
 ---
 

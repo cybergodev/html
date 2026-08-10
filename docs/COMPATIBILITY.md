@@ -556,21 +556,21 @@ fmt.Printf("Cache hit rate: %.1f%%\n",
 
 ## Examples
 
-See the `examples/` directory for complete examples (each is a self-contained `main` program guarded by a per-file `exampleNN` build tag):
+See the `examples/` directory for complete examples (each is a self-contained `main` package in its own subdirectory):
 
-- `01_quick_start.go` - Basic usage
-- `02_content_extraction.go` - Content extraction features
-- `03_links_media.go` - Link and media extraction
-- `04_performance.go` - Performance optimization
-- `05_http_integration.go` - HTTP server integration
-- `06_advanced_usage.go` - Advanced features
-- `07_error_handling.go` - Error handling patterns
-- `08_real_world.go` - Real-world scenarios
-- `09_context_cancellation.go` - Context cancellation and timeouts
-- `10_secure_file_processing.go` - AllowedBaseDir sandbox and secure file reads
-- `11_encoding.go` - Character encoding detection and override
+- `01_quick_start/` - Basic usage
+- `02_content_extraction/` - Content extraction features
+- `03_links_media/` - Link and media extraction
+- `04_performance/` - Performance optimization
+- `05_http_integration/` - HTTP server integration
+- `06_advanced_usage/` - Advanced features
+- `07_error_handling/` - Error handling patterns
+- `08_real_world/` - Real-world scenarios
+- `09_context_cancellation/` - Context cancellation and timeouts
+- `10_secure_file_processing/` - AllowedBaseDir sandbox and secure file reads
+- `11_encoding/` - Character encoding detection and override
 
-Run any one with its build tag, e.g. `go run -tags example01 ./examples/`.
+Run any one directly, e.g. `go run ./examples/01_quick_start/`, or build all at once with `go build ./examples/...`.
 
 ## FAQ
 

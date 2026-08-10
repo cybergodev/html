@@ -202,6 +202,20 @@ func (s *DefaultScorer) scoreWithMetrics(node *html.Node, metrics contentMetrics
 		return 0
 	}
 
+	// Nodes that CleanContentNode would remove (class/id matching nav, menu,
+	// sidebar, ad, etc., or hidden via style/attribute) must never be selected
+	// as the article root. Without this guard, a text-rich mega-menu navigation
+	// container can outscore the real article body — but when CleanContentNode
+	// then strips the nav children (which also carry nav/menu classes), the
+	// extraction yields empty output. Returning 0 here excludes such nodes
+	// from the candidate set so a non-removable ancestor or sibling is chosen
+	// instead. ShouldRemove also honors the contentAreaSignal and
+	// isPrimaryContentContainer overrides, so layout wrappers like
+	// content-sidebar and semantic <article>/<main> are still eligible.
+	if s.ShouldRemove(node) {
+		return 0
+	}
+
 	score := s.getTagScore(node.Data) + s.scoreAttributes(node)
 
 	// Score based on paragraph count
@@ -263,6 +277,32 @@ func (s *DefaultScorer) scoreWithMetrics(node *html.Node, metrics contentMetrics
 	return score
 }
 
+// candidateCollector receives scored candidates from foldAndScore. When the map
+// field is non-nil, every scored node is recorded into it (the ScoreArticleCandidates
+// path). When it is nil, only the single highest-scoring node is tracked (the
+// FindBestArticleNode path), eliminating the map allocation entirely — a
+// make(map[*html.Node]int, 32) was the sole allocation on the scoring hot path,
+// attributed ~2.2% of total bytes by the profiler.
+type candidateCollector struct {
+	candidates map[*html.Node]int
+	bestNode   *html.Node
+	bestScore  int
+}
+
+// record stores (or tracks) a scored candidate. Ties in the best-node path
+// prefer the existing node (first-wins), matching SelectBestCandidate's behavior
+// when the map iteration encounters the equal-scoring node first.
+func (c *candidateCollector) record(node *html.Node, score int) {
+	if c.candidates != nil {
+		c.candidates[node] = score
+		return
+	}
+	if score > c.bestScore {
+		c.bestNode = node
+		c.bestScore = score
+	}
+}
+
 // ScoreArticleCandidates scores every plausible article-root element under root
 // and returns the candidate→score map (score > 0 only). It is the O(N)
 // replacement for the previous pattern — used by extractArticleNode — of walking
@@ -280,8 +320,19 @@ func (s *DefaultScorer) scoreWithMetrics(node *html.Node, metrics contentMetrics
 // TestScoreArticleCandidatesMatchesNaiveLoop.
 func (s *DefaultScorer) ScoreArticleCandidates(root *html.Node) map[*html.Node]int {
 	candidates := make(map[*html.Node]int, 32)
-	s.foldAndScore(root, false, candidates)
+	s.foldAndScore(root, false, &candidateCollector{candidates: candidates})
 	return candidates
+}
+
+// FindBestArticleNode scores every plausible article-root element under root and
+// returns the one with the highest score (or nil if none scores above 0). It
+// folds best-candidate tracking directly into the bottom-up scoring pass, so the
+// map allocation that ScoreArticleCandidates requires is never made — the caller
+// (extractArticleNode) only needs the winning node, never the full candidate set.
+func (s *DefaultScorer) FindBestArticleNode(root *html.Node) *html.Node {
+	cc := &candidateCollector{bestScore: -1}
+	s.foldAndScore(root, false, cc)
+	return cc.bestNode
 }
 
 // foldAndScore computes node's subtree metrics bottom-up and records a score for
@@ -295,12 +346,12 @@ func (s *DefaultScorer) ScoreArticleCandidates(root *html.Node) map[*html.Node]i
 // into a parent only when the parent is not itself a skip tag, so a skip tag's own
 // metrics are zero — matching collectContentMetrics returning false before
 // incrementing — while its non-skip descendants are still scored correctly.
-func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, candidates map[*html.Node]int) contentMetrics {
+func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, cc *candidateCollector) contentMetrics {
 	if node == nil {
 		return contentMetrics{}
 	}
 
-	isSkip := node.Type == html.ElementNode && (IsNonContentElement(node.Data) || metricsSkipTags[node.Data])
+	isSkip := node.Type == html.ElementNode && (IsNonContentElement(node.Data) || metricsSkipTags[node.Data] || s.ShouldRemove(node))
 
 	var m contentMetrics
 	if node.Type == html.ElementNode && !isSkip {
@@ -317,7 +368,7 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, candidate
 	}
 
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
-		cm := s.foldAndScore(child, insideLink, candidates)
+		cm := s.foldAndScore(child, insideLink, cc)
 		if !isSkip {
 			m.tagCount += cm.tagCount
 			m.paragraphCount += cm.paragraphCount
@@ -358,11 +409,36 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, candidate
 	// m now holds node's complete subtree metrics; score it if it is a candidate.
 	if node.Type == html.ElementNode && !isSkip && !IsInlineElement(node.Data) {
 		if score := s.scoreWithMetrics(node, m); score > 0 {
-			candidates[node] = score
+			cc.record(node, score)
 		}
 	}
 
 	return m
+}
+
+// contentAreaSignals lists class/id tokens that, when present alongside a
+// removal pattern in the same attribute value, indicate a CSS layout wrapper
+// (e.g. foolcom-grid-content-sidebar, article-with-sidebar) rather than the
+// non-content region itself. Only patterns that unambiguously denote a
+// primary-content area are included; patterns such as "main", "post", and
+// "text" are excluded because they also appear in non-content class names
+// (main-nav, post-nav, nav-text) where an override would be harmful.
+var contentAreaSignals = map[string]bool{
+	"content": true,
+	"article": true,
+}
+
+// hasContentAreaSignal reports whether value (a lowercased class or id
+// attribute) contains any contentAreaSignals pattern as a word-bounded match.
+// ShouldRemove uses this to exempt layout wrappers from the class/id-based
+// removal heuristic so the main content nested inside them is not discarded.
+func hasContentAreaSignal(value string) bool {
+	for pattern := range contentAreaSignals {
+		if hasWordBoundary(value, pattern, boundaryStandard) {
+			return true
+		}
+	}
+	return false
 }
 
 // ShouldRemove determines if a node should be removed from the content tree.
@@ -395,6 +471,20 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 				continue
 			}
 			lowerVal := strings.ToLower(attr.Val)
+			// A non-semantic element (div, section, ...) whose class/id
+			// contains both a content-area signal ("content", "article")
+			// and a removal pattern ("sidebar", "nav", ...) describes a CSS
+			// layout wrapper that encloses the main content AND a non-content
+			// region — e.g. foolcom-grid-content-sidebar on The Motley Fool
+			// wraps #article-body and a sidebar column. Removing it would
+			// discard the article body along with the sidebar, yielding empty
+			// output. Skip removal-pattern matching for this attribute so the
+			// content subtree survives. The heuristic for truly non-content
+			// elements still applies via their own class/id (e.g. a child
+			// <div class="sidebar"> is still stripped).
+			if hasContentAreaSignal(lowerVal) {
+				continue
+			}
 			for pattern := range s.config.RemovePatterns {
 				if hasWordBoundary(lowerVal, pattern, boundaryStandard) {
 					return true
@@ -417,8 +507,9 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 }
 
 // isHiddenByStyle reports whether a style attribute hides its element
-// (display:none or visibility:hidden). It tokenizes the declaration list and
-// compares complete property names so that:
+// (display:none or visibility:hidden). It scans the declaration list inline
+// (without allocating a []string from strings.Split) and compares complete
+// property names so that:
 //   - CSS custom properties (--my-display:none) are not confused with display.
 //     The previous substring test ("contains display:none") stripped any element
 //     whose custom-property name merely ended in "display".
@@ -430,13 +521,23 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 // vanishingly rare in real style attributes and out of scope for this
 // content-extraction heuristic.
 func isHiddenByStyle(style string) bool {
-	for _, raw := range strings.Split(style, ";") {
+	pos := 0
+	n := len(style)
+	for pos < n {
+		// Find the next ';' or end of string to delimit a declaration.
+		declStart := pos
+		for pos < n && style[pos] != ';' {
+			pos++
+		}
+		raw := style[declStart:pos]
+		pos++ // skip ';'
+
 		colon := strings.IndexByte(raw, ':')
 		if colon <= 0 {
 			continue // empty declaration or no property name before the colon
 		}
-		prop := decodeCSSEscape(strings.ToLower(strings.TrimSpace(raw[:colon])))
-		val := strings.ToLower(strings.TrimSpace(raw[colon+1:]))
+		prop := decodeCSSEcapeInline(raw[:colon])
+		val := asciiTrimSpaceLower(raw[colon+1:])
 		switch {
 		case prop == "display" && val == "none":
 			return true
@@ -445,6 +546,67 @@ func isHiddenByStyle(style string) bool {
 		}
 	}
 	return false
+}
+
+// asciiTrimSpaceLower trims leading/trailing ASCII whitespace and lowercases
+// ASCII letters in a single pass, returning a substring of s (no allocation)
+// when possible. For values containing non-ASCII bytes it falls back to
+// strings.ToLower + strings.TrimSpace.
+func asciiTrimSpaceLower(s string) string {
+	// Trim leading whitespace
+	start := 0
+	for start < len(s) && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
+		start++
+	}
+	// Trim trailing whitespace
+	end := len(s)
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
+		end--
+	}
+	if start >= end {
+		return ""
+	}
+	// Check if already lowercase ASCII (common case — no allocation)
+	for i := start; i < end; i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return strings.ToLower(s[start:end])
+		}
+	}
+	return s[start:end]
+}
+
+// decodeCSSEcapeInline decodes CSS backslash escapes and lowercases ASCII in a
+// single pass. For property names without backslashes or uppercase (the common
+// case), it returns a substring of the input with no allocation.
+func decodeCSSEcapeInline(s string) string {
+	// Trim leading/trailing whitespace first
+	start := 0
+	for start < len(s) && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	end := len(s)
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
+		end--
+	}
+	if start >= end {
+		return ""
+	}
+	s = s[start:end]
+
+	hasBackslash := false
+	hasUpper := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			hasBackslash = true
+		}
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			hasUpper = true
+		}
+	}
+	if !hasBackslash && !hasUpper {
+		return s
+	}
+	return decodeCSSEscape(strings.ToLower(s))
 }
 
 // decodeCSSEscape decodes CSS backslash escapes in a style property name: a
@@ -550,10 +712,11 @@ func (s *DefaultScorer) calculatePatternScore(value string, patterns map[string]
 
 	score := 0
 
-	// Use fixed-size arrays on stack to avoid heap allocation
-	// Most values have fewer than 32 unique alphanumeric characters
+	// Use fixed-size arrays on stack to avoid heap allocation.
+	// presentChars covers all possible first characters of scoring patterns:
+	// 26 lowercase letters + 10 digits = 36 possible values.
 	var valueChars [128]bool
-	var presentChars [32]byte
+	var presentChars [36]byte
 	charCount := 0
 
 	for i := 0; i < len(value); i++ {
@@ -566,7 +729,7 @@ func (s *DefaultScorer) calculatePatternScore(value string, patterns map[string]
 		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
 			if !valueChars[c] {
 				valueChars[c] = true
-				if charCount < 32 {
+				if charCount < 36 {
 					presentChars[charCount] = c
 					charCount++
 				}
@@ -593,18 +756,10 @@ func (s *DefaultScorer) calculatePatternScore(value string, patterns map[string]
 	return score
 }
 
-// defaultScorer variables for lazy initialization.
-var (
-	defaultScorerOnce sync.Once
-	defaultScorer     *DefaultScorer
-)
-
-// getDefaultScorer returns a shared DefaultScorer instance.
-// This is an optimization for cases where multiple processors use the default
-// scorer, reducing memory allocation by sharing a single instance.
-func getDefaultScorer() *DefaultScorer {
-	defaultScorerOnce.Do(func() {
-		defaultScorer = NewDefaultScorer()
-	})
-	return defaultScorer
-}
+// getDefaultScorer returns a shared DefaultScorer instance, lazily initialized
+// on first call via sync.OnceValue. This is an optimization for cases where
+// multiple processors use the default scorer, reducing memory allocation by
+// sharing a single read-only instance.
+var getDefaultScorer = sync.OnceValue(func() *DefaultScorer {
+	return NewDefaultScorer()
+})

@@ -51,20 +51,35 @@ const (
 
 // AuditEntry represents a single audit log entry.
 type AuditEntry struct {
-	Timestamp time.Time      `json:"timestamp"`
+	// Timestamp is when the event was recorded (UTC).
+	Timestamp time.Time `json:"timestamp"`
+	// EventType categorizes the audit event (e.g., blocked_tag, timeout).
 	EventType AuditEventType `json:"event_type"`
-	Level     AuditLevel     `json:"level"`
-	Message   string         `json:"message"`
-	Tag       string         `json:"tag,omitempty"`
-	Attribute string         `json:"attribute,omitempty"`
-	URL       string         `json:"url,omitempty"`
-	InputSize int            `json:"input_size,omitempty"`
-	MaxSize   int            `json:"max_size,omitempty"`
-	Depth     int            `json:"depth,omitempty"`
-	MaxDepth  int            `json:"max_depth,omitempty"`
-	Path      string         `json:"path,omitempty"`
-	RawValue  string         `json:"raw_value,omitempty"`
-	Metadata  map[string]any `json:"metadata,omitempty"`
+	// Level is the severity of the event (info, warning, or critical).
+	Level AuditLevel `json:"level"`
+	// Message is a human-readable description of the event.
+	Message string `json:"message"`
+	// Tag is the HTML tag name that triggered the event, when applicable.
+	Tag string `json:"tag,omitempty"`
+	// Attribute is the HTML attribute name that triggered the event, when applicable.
+	Attribute string `json:"attribute,omitempty"`
+	// URL is the resource URL that triggered the event, when applicable.
+	URL string `json:"url,omitempty"`
+	// InputSize is the actual input size for input-violation events.
+	InputSize int `json:"input_size,omitempty"`
+	// MaxSize is the configured maximum input size for input-violation events.
+	MaxSize int `json:"max_size,omitempty"`
+	// Depth is the actual nesting depth for depth-violation events.
+	Depth int `json:"depth,omitempty"`
+	// MaxDepth is the configured maximum depth for depth-violation events.
+	MaxDepth int `json:"max_depth,omitempty"`
+	// Path is the file path for path-traversal events (sanitized to base filename).
+	Path string `json:"path,omitempty"`
+	// RawValue is the raw attribute or URL value that triggered the event.
+	// Only populated when AuditConfig.IncludeRawValues is true.
+	RawValue string `json:"raw_value,omitempty"`
+	// Metadata holds additional event-specific key-value pairs.
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // AuditSink defines the interface for audit log destinations.
@@ -511,12 +526,15 @@ func NewWriterAuditSink(w io.Writer) *WriterAuditSink {
 }
 
 // Write writes an audit entry to the writer.
+// Marshal errors are logged to the standard logger for diagnosability,
+// consistent with LoggerAuditSink.Write.
 func (s *WriterAuditSink) Write(entry AuditEntry) {
 	if s == nil || s.writer == nil {
 		return
 	}
 	data, err := json.Marshal(entry)
 	if err != nil {
+		log.Printf("Failed to marshal audit entry: %v", err)
 		return
 	}
 	s.mu.Lock()

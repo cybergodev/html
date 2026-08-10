@@ -1,5 +1,3 @@
-//go:build examples
-
 package main
 
 import (
@@ -14,7 +12,7 @@ import (
 // Learn how to extract links, images, videos, and audio from HTML content.
 //
 // NOTE: For brevity, extraction errors are elided in this example;
-// see 07_error_handling.go for proper error-handling patterns.
+// see 07_error_handling for proper error-handling patterns.
 func main() {
 	fmt.Println("=== Links & Media Extraction ===")
 	fmt.Println()
@@ -71,7 +69,7 @@ func main() {
 			icon = "🎨"
 		case "link":
 			// Distinguish external links (https and not our base host)
-			// from internal ones; otherwise the 🔗 case below never fires.
+			// from internal ones; otherwise the external case below never fires.
 			if strings.HasPrefix(link.URL, "https://") && !strings.Contains(link.URL, "example.com") {
 				icon = "🔗"
 			} else {

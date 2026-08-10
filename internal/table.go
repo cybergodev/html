@@ -65,9 +65,17 @@ var defaultTableAccessor = &htmlCellAccessor{}
 // defaultTableWalker is the default walker instance for table extraction.
 var defaultTableWalker = &htmlNodeWalker{}
 
+// defaultTableProcessor is the singleton table processor with default accessor
+// and walker. Processor holds only immutable references (the accessor and walker
+// are stateless singletons), so a single shared instance is safe for concurrent
+// use. Extracting a table previously allocated a new *table.Processor on every
+// <table> element encountered; on table-heavy documents (financial reports,
+// data pages) this is hundreds of tiny allocations per document.
+var defaultTableProcessor = table.NewProcessor(defaultTableAccessor, defaultTableWalker)
+
 // TableProcessor returns the table processor with default accessor and walker.
 func TableProcessor() *table.Processor {
-	return table.NewProcessor(defaultTableAccessor, defaultTableWalker)
+	return defaultTableProcessor
 }
 
 // containsWord checks if text contains word with proper boundary detection.
@@ -141,15 +149,15 @@ func getCellAlign(n *html.Node) table.CellAlignment {
 // <td colspan="N"> exhaust memory.
 const maxCellSpan = 1000
 
-// getColSpan extracts the colspan attribute value from a table cell.
-// Returns 1 if no colspan attribute is present or if the value is invalid.
-// Values above maxCellSpan are clamped to maxCellSpan.
-func getColSpan(n *html.Node) int {
+// getCellSpan extracts an integer span attribute (colspan or rowspan) from a
+// table cell. Returns 1 when the attribute is absent or invalid. Values above
+// maxCellSpan are clamped, matching the HTML spec's behavior.
+func getCellSpan(n *html.Node, attrKey string) int {
 	if n == nil {
 		return 1
 	}
 	for _, attr := range n.Attr {
-		if strings.ToLower(attr.Key) == "colspan" {
+		if strings.ToLower(attr.Key) == attrKey {
 			if val, err := strconv.Atoi(strings.TrimSpace(attr.Val)); err == nil && val > 0 {
 				if val > maxCellSpan {
 					return maxCellSpan
@@ -161,24 +169,14 @@ func getColSpan(n *html.Node) int {
 	return 1
 }
 
+// getColSpan extracts the colspan attribute value from a table cell.
+func getColSpan(n *html.Node) int {
+	return getCellSpan(n, "colspan")
+}
+
 // getRowSpan extracts the rowspan attribute value from a table cell.
-// Returns 1 if no rowspan attribute is present or if the value is invalid.
-// Values above maxCellSpan are clamped to maxCellSpan.
 func getRowSpan(n *html.Node) int {
-	if n == nil {
-		return 1
-	}
-	for _, attr := range n.Attr {
-		if strings.ToLower(attr.Key) == "rowspan" {
-			if val, err := strconv.Atoi(strings.TrimSpace(attr.Val)); err == nil && val > 0 {
-				if val > maxCellSpan {
-					return maxCellSpan
-				}
-				return val
-			}
-		}
-	}
-	return 1
+	return getCellSpan(n, "rowspan")
 }
 
 // isZeroWidthValue reports whether a width value represents zero width ("",
@@ -195,47 +193,56 @@ func isZeroWidthValue(s string) bool {
 }
 
 // getCellWidth extracts the width from a table cell node.
-// It checks both the width attribute and the style attribute.
+// It checks both the width attribute and the style attribute in a single pass.
+// The width attribute takes precedence over the style attribute's width property.
 func getCellWidth(n *html.Node) string {
 	if n == nil {
 		return ""
 	}
-	// First check width attribute
+	// Scan attributes once: collect the first non-zero width attribute value
+	// (preferred) and remember the style attribute for fallback. The width
+	// attribute takes precedence over style per the HTML/CSS cascade for
+	// presentational hints.
+	var styleAttr string
+	widthFound := false
 	for _, attr := range n.Attr {
-		if strings.ToLower(attr.Key) == "width" {
+		switch strings.ToLower(attr.Key) {
+		case "width":
+			if widthFound {
+				continue
+			}
 			widthVal := strings.TrimSpace(attr.Val)
 			if !isZeroWidthValue(widthVal) {
 				return widthVal
 			}
+		case "style":
+			styleAttr = attr.Val
 		}
 	}
-	// Then check style attribute
-	for _, attr := range n.Attr {
-		if strings.ToLower(attr.Key) == "style" {
-			style := attr.Val
-			// Find "width:" case-insensitively, requiring it to start at a CSS
-			// boundary so it is not matched inside "border-width:", "max-width:",
-			// or "min-width:". Searching the original rather than a strings.ToLower
-			// copy keeps the index correct even when lowercasing would change byte
-			// length (some non-ASCII runes fold to a different number of bytes),
-			// and preserves the value's original case.
-			if idx := asciiFoldIndexWord(style, "width:"); idx >= 0 {
-				start := idx + len("width:")
-				for start < len(style) && (style[start] == ' ' || style[start] == '\t') {
-					start++
+	// Check style attribute for width property
+	if styleAttr != "" {
+		// Find "width:" case-insensitively, requiring it to start at a CSS
+		// boundary so it is not matched inside "border-width:", "max-width:",
+		// or "min-width:". Searching the original rather than a strings.ToLower
+		// copy keeps the index correct even when lowercasing would change byte
+		// length (some non-ASCII runes fold to a different number of bytes),
+		// and preserves the value's original case.
+		if idx := asciiFoldIndexWord(styleAttr, "width:"); idx >= 0 {
+			start := idx + len("width:")
+			for start < len(styleAttr) && (styleAttr[start] == ' ' || styleAttr[start] == '\t') {
+				start++
+			}
+			end := start
+			for end < len(styleAttr) {
+				c := styleAttr[end]
+				if c == ';' || c == '"' || c == '\'' || c == '}' {
+					break
 				}
-				end := start
-				for end < len(style) {
-					c := style[end]
-					if c == ';' || c == '"' || c == '\'' || c == '}' {
-						break
-					}
-					end++
-				}
-				widthVal := strings.TrimSpace(style[start:end])
-				if !isZeroWidthValue(widthVal) {
-					return widthVal
-				}
+				end++
+			}
+			widthVal := strings.TrimSpace(styleAttr[start:end])
+			if !isZeroWidthValue(widthVal) {
+				return widthVal
 			}
 		}
 	}

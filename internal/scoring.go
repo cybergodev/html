@@ -64,7 +64,14 @@ func collectContentMetrics(node *html.Node) contentMetrics {
 			// data) score wildly differently depending on whether SanitizeDOM
 			// has removed those tags, and the article extractor can pick the
 			// wrong node. Returning false stops traversal of this subtree.
-			if IsNonContentElement(n.Data) || metricsSkipTags[n.Data] {
+			//
+			// ShouldRemoveElement is also checked so that class/id-based
+			// removal targets (nav containers, ad slots, widgets, etc.) do
+			// not inflate ancestor scores. Without this, an anonymous wrapper
+			// div around a mega-menu can outscore the real article body; when
+			// CleanContentNode then strips the wrapper's children, the
+			// extraction yields empty output.
+			if IsNonContentElement(n.Data) || metricsSkipTags[n.Data] || ShouldRemoveElement(n) {
 				return false
 			}
 			metrics.tagCount++

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -147,8 +146,7 @@ func (n contentNodeAdapter) Parent() ContentNode {
 // It provides methods for extracting content, links, and media from HTML documents
 // with automatic encoding detection and caching support.
 type Processor struct {
-	config   *Config
-	configMu sync.Mutex // Protects config snapshot copy during extractWithFormats
+	config   *Config // Immutable after New(); never mutated, so no lock needed
 	cache    *internal.Cache[[16]byte]
 	scorer   internal.Scorer
 	audit    *auditCollector

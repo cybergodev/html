@@ -17,4 +17,7 @@
 //	processor, _ := html.New(cfg)
 //	defer processor.Close()
 //	result, _ := processor.Extract(htmlBytes)
+//
+// See the examples/ directory for complete runnable programs covering HTTP
+// integration, encoding detection, context cancellation, and secure file processing.
 package html

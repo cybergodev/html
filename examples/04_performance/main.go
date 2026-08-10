@@ -1,5 +1,3 @@
-//go:build examples
-
 package main
 
 import (
@@ -16,7 +14,7 @@ import (
 // Learn how to tune the library for batch processing and high-throughput scenarios.
 //
 // NOTE: For clarity, extraction errors are elided in the benchmark loops below;
-// see 07_error_handling.go for proper error-handling patterns.
+// see 07_error_handling for proper error-handling patterns.
 func main() {
 	fmt.Println("=== Performance Optimization ===")
 	fmt.Println()

@@ -1,4 +1,4 @@
-# HTML Extracted Library
+# HTML Extraction Library
 
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://golang.org)
 [![GoDoc](https://pkg.go.dev/badge/github.com/cybergodev/html.svg)](https://pkg.go.dev/github.com/cybergodev/html)
@@ -106,19 +106,21 @@ func main() {
 
     // Extract text only
     text, _ := html.ExtractText(htmlBytes)
+    fmt.Println(text)
 
     // Extract all content with metadata
     result, _ := html.Extract(htmlBytes)
     fmt.Println(result.Title)     // "Title"
-    fmt.Println(result.Text)      // "Title\n\nContent here..."
     fmt.Println(result.WordCount) // 3
 
-    // Extract all resource links
+    // Extract all resource links (includes <script>, <iframe>, <link> tags)
     links, _ := html.ExtractAllLinks(htmlBytes)
+    fmt.Printf("Found %d links\n", len(links))
 
     // Format conversion
     markdown, _ := html.ExtractToMarkdown(htmlBytes)
     jsonData, _ := html.ExtractToJSON(htmlBytes)
+    fmt.Printf("Markdown: %d chars, JSON: %d bytes\n", len(markdown), len(jsonData))
 }
 ```
 
@@ -223,16 +225,15 @@ import (
 )
 
 func main() {
-    config := html.Config{
-        MaxInputSize:       10 * 1024 * 1024, // 10MB limit
-        ProcessingTimeout:  30 * time.Second,
-        MaxCacheEntries:    500,
-        CacheTTL:           30 * time.Minute,
-        CacheCleanup:       5 * time.Minute,  // Background cleanup interval
-        WorkerPoolSize:     8,
-        EnableSanitization: true,  // Remove <script>, <style> tags
-        MaxDepth:           50,    // Prevent deeply nested attacks
-    }
+    config := html.DefaultConfig()
+    config.MaxInputSize = 10 * 1024 * 1024 // 10MB limit
+    config.ProcessingTimeout = 30 * time.Second
+    config.MaxCacheEntries = 500
+    config.CacheTTL = 30 * time.Minute
+    config.CacheCleanup = 5 * time.Minute // Background cleanup interval
+    config.WorkerPoolSize = 8
+    config.EnableSanitization = true // Remove <script>, <style> tags
+    config.MaxDepth = 50             // Prevent deeply nested attacks
     processor, _ := html.New(config)
     defer processor.Close()
 }
@@ -287,9 +288,8 @@ for _, link := range links {
 
 // Group by type
 byType := html.GroupLinksByType(links)
-cssLinks := byType["css"]
-jsLinks := byType["js"]
-images := byType["image"]
+fmt.Printf("CSS: %d, JS: %d, Images: %d\n",
+    len(byType["css"]), len(byType["js"]), len(byType["image"]))
 ```
 
 ### Get Reading Time
@@ -374,6 +374,12 @@ html.ExtractToJSON(htmlBytes []byte, cfg ...Config) ([]byte, error)
 // Format conversion (from file)
 html.ExtractToMarkdownFromFile(filePath string, cfg ...Config) (string, error)
 html.ExtractToJSONFromFile(filePath string, cfg ...Config) ([]byte, error)
+
+// Context-aware format conversion
+html.ExtractToMarkdownWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error)
+html.ExtractToMarkdownFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error)
+html.ExtractToJSONWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) ([]byte, error)
+html.ExtractToJSONFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) ([]byte, error)
 
 // Links
 html.ExtractAllLinks(htmlBytes []byte, cfg ...Config) ([]LinkResource, error)
@@ -621,7 +627,7 @@ type Config struct {
 - **Base Directory Lock**: `AllowedBaseDir` confines file reads to a trusted directory
 
 ### Data URL Security
-- **Allowed**: `data:image/*`, `data:font/*`, `data:application/pdf`
+- **Allowed**: `data:image/{gif,jpeg,jpg,png,webp,bmp,x-icon,vnd.microsoft.icon,avif,apng}`, `data:font/{woff,woff2,ttf,otf}`, `data:application/pdf` (and `application/font-woff`, `application/font-woff2` aliases)
 - **Blocked**: `data:text/html`, `data:text/javascript`, `data:text/plain`
 
 ---
@@ -691,21 +697,26 @@ processor, _ := html.New(config)
 
 ## 📁 Example Code
 
-For complete runnable examples, see the [examples/](examples):
+For complete runnable examples, see the [examples/](examples) directory.
+Each example is a standalone `main` package you can run directly:
+
+```bash
+go run ./examples/01_quick_start/
+```
 
 | Example | Description |
 |---------|-------------|
-| [01_quick_start.go](examples/01_quick_start.go) | Quick start guide |
-| [02_content_extraction.go](examples/02_content_extraction.go) | Content extraction options and output formats |
-| [03_links_media.go](examples/03_links_media.go) | Link and media extraction |
-| [04_performance.go](examples/04_performance.go) | Performance optimization and batch processing |
-| [05_http_integration.go](examples/05_http_integration.go) | HTTP integration patterns |
-| [06_advanced_usage.go](examples/06_advanced_usage.go) | Custom scorers, audit logging, security |
-| [07_error_handling.go](examples/07_error_handling.go) | Error handling patterns |
-| [08_real_world.go](examples/08_real_world.go) | Real-world use cases |
-| [09_context_cancellation.go](examples/09_context_cancellation.go) | Context cancellation and timeouts |
-| [10_secure_file_processing.go](examples/10_secure_file_processing.go) | AllowedBaseDir sandbox and secure file reads |
-| [11_encoding.go](examples/11_encoding.go) | Character encoding detection and override |
+| [01_quick_start](examples/01_quick_start) | Quick start guide |
+| [02_content_extraction](examples/02_content_extraction) | Content extraction options and output formats |
+| [03_links_media](examples/03_links_media) | Link and media extraction |
+| [04_performance](examples/04_performance) | Performance optimization and batch processing |
+| [05_http_integration](examples/05_http_integration) | HTTP integration patterns |
+| [06_advanced_usage](examples/06_advanced_usage) | Custom scorers, audit logging, security |
+| [07_error_handling](examples/07_error_handling) | Error handling patterns |
+| [08_real_world](examples/08_real_world) | Real-world use cases |
+| [09_context_cancellation](examples/09_context_cancellation) | Context cancellation and timeouts |
+| [10_secure_file_processing](examples/10_secure_file_processing) | AllowedBaseDir sandbox and secure file reads |
+| [11_encoding](examples/11_encoding) | Character encoding detection and override |
 
 ---
 
