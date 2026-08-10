@@ -6,6 +6,7 @@ package html_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -459,6 +460,110 @@ func TestBatchInvalidConfig(t *testing.T) {
 		br := html.ExtractBatchFilesWithContext(context.Background(), []string{"test.html"}, cfg)
 		if br.Failed != 1 {
 			t.Fatalf("expected 1 failure, got %d", br.Failed)
+		}
+	})
+}
+
+// TestPackageLevelBatchFiles_HappyPath covers the package-level
+// ExtractBatchFiles happy path (60% → higher). The processor-method variant
+// is tested in batch_test.go but the convenience wrapper was only tested on
+// its error branch.
+func TestPackageLevelBatchFiles_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	paths := make([]string, 3)
+	for i := range paths {
+		paths[i] = filepath.Join(tmpDir, fmt.Sprintf("file%d.html", i))
+		content := fmt.Sprintf(`<html><body><h1>File %d</h1></body></html>`, i)
+		os.WriteFile(paths[i], []byte(content), 0644)
+	}
+
+	br := html.ExtractBatchFiles(paths)
+	if br.Failed > 0 {
+		t.Fatalf("unexpected failures: %v", br.Errors)
+	}
+	if len(br.Results) != 3 {
+		t.Errorf("got %d results, want 3", len(br.Results))
+	}
+}
+
+// TestPackageLevelLinksWithContext_ErrorPaths covers error branches of the
+// package-level ExtractAllLinksWithContext and ExtractAllLinksFromFileWithContext
+// (63–70% coverage) by testing file-not-found and cancelled-context scenarios.
+func TestPackageLevelLinksWithContext_ErrorPaths(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ExtractAllLinksFromFileWithContext non-existent file", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := html.ExtractAllLinksFromFileWithContext(context.Background(), "nonexistent.html")
+		if err == nil {
+			t.Error("expected error for non-existent file")
+		}
+	})
+
+	t.Run("ExtractAllLinksWithContext cancelled context", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := html.ExtractAllLinksWithContext(ctx, []byte(`<html><body><a href="x">x</a></body></html>`))
+		if err == nil {
+			t.Error("expected error for cancelled context")
+		}
+	})
+
+	t.Run("ExtractAllLinksFromFileWithContext valid file", func(t *testing.T) {
+		t.Parallel()
+
+		tmpFile := writeTempHTML(t, `<html><body><a href="https://example.com">Link</a></body></html>`)
+		links, err := html.ExtractAllLinksFromFileWithContext(context.Background(), tmpFile)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(links) == 0 {
+			t.Error("expected at least one link")
+		}
+	})
+}
+
+// TestExtractTextFromFileWithContext_Coverage covers the ExtractTextFromFileWithContext
+// method on Processor (75% → higher). The happy path was tested via the package-level
+// function in boundary_test.go but not the processor method.
+func TestExtractTextFromFileWithContext_Coverage(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid file", func(t *testing.T) {
+		t.Parallel()
+		p, err := html.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.Close()
+
+		tmpFile := writeTempHTML(t, boundaryTestHTML)
+		text, err := p.ExtractTextFromFileWithContext(context.Background(), tmpFile)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if text == "" {
+			t.Error("expected non-empty text")
+		}
+	})
+
+	t.Run("non-existent file", func(t *testing.T) {
+		t.Parallel()
+		p, err := html.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.Close()
+
+		_, err = p.ExtractTextFromFileWithContext(context.Background(), "nonexistent.html")
+		if err == nil {
+			t.Error("expected error for non-existent file")
 		}
 	})
 }

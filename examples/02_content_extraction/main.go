@@ -1,5 +1,3 @@
-//go:build examples
-
 package main
 
 import (
@@ -15,7 +13,7 @@ import (
 // Learn how to customize extraction and produce different output formats.
 //
 // NOTE: For brevity, extraction errors are elided in this example;
-// see 07_error_handling.go for proper error-handling patterns.
+// see 07_error_handling for proper error-handling patterns.
 func main() {
 	fmt.Println("=== Content Extraction & Output Formats ===")
 	fmt.Println()

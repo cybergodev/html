@@ -103,6 +103,105 @@ func TestTrackedBuilder(t *testing.T) {
 			t.Errorf("Len() = %d, want 0", tb.Len())
 		}
 	})
+
+	// --- TrackedBuilder methods that were at 0% coverage ---
+
+	t.Run("Reset clears content and retains capacity", func(t *testing.T) {
+		tb := table.NewTrackedBuilder()
+		tb.WriteString("hello world")
+
+		oldCap := tb.Cap()
+		tb.Reset()
+
+		if tb.Len() != 0 {
+			t.Errorf("Len() after Reset = %d, want 0", tb.Len())
+		}
+		if tb.LastChar != 0 {
+			t.Errorf("LastChar after Reset = %d, want 0", tb.LastChar)
+		}
+		// Capacity must survive Reset so the buffer is reusable without reallocation.
+		if tb.Cap() < oldCap {
+			t.Errorf("Cap() after Reset = %d, was %d before (capacity must be retained)", tb.Cap(), oldCap)
+		}
+		if tb.String() != "" {
+			t.Errorf("String() after Reset = %q, want empty", tb.String())
+		}
+	})
+
+	t.Run("Cap reports backing capacity", func(t *testing.T) {
+		tb := table.NewTrackedBuilder()
+		if tb.Cap() != 0 {
+			t.Errorf("Cap() on fresh builder = %d, want 0", tb.Cap())
+		}
+
+		tb.WriteString("ab")
+		if tb.Cap() < 2 {
+			t.Errorf("Cap() = %d, must be >= Len()=2", tb.Cap())
+		}
+	})
+
+	t.Run("Bytes returns raw buffer", func(t *testing.T) {
+		tb := table.NewTrackedBuilder()
+		tb.WriteString("payload")
+
+		got := tb.Bytes()
+		if string(got) != "payload" {
+			t.Errorf("Bytes() = %q, want 'payload'", string(got))
+		}
+		// Aliases the backing array, so subsequent writes change the returned slice.
+		tb.WriteByte('!')
+		// The slice returned *before* the WriteByte may or may not have been
+		// resized depending on capacity; the important contract is that the
+		// buffer is accessible. Check via a fresh call.
+		if string(tb.Bytes()) != "payload!" {
+			t.Errorf("Bytes() after WriteByte = %q, want 'payload!'", string(tb.Bytes()))
+		}
+	})
+
+	t.Run("Grow pre-sizes capacity", func(t *testing.T) {
+		tb := table.NewTrackedBuilder()
+
+		// Grow by 100: remaining capacity must be >= 100 after the call.
+		tb.Grow(100)
+		if tb.Cap()-tb.Len() < 100 {
+			t.Errorf("after Grow(100): available = %d, want >= 100", tb.Cap()-tb.Len())
+		}
+
+		// Grow(0) is a no-op (must not shrink or panic).
+		before := tb.Cap()
+		tb.Grow(0)
+		if tb.Cap() != before {
+			t.Errorf("Grow(0) changed Cap from %d to %d", before, tb.Cap())
+		}
+
+		// Idempotent when capacity already suffices.
+		tb.Grow(50) // already have >= 100
+	})
+
+	t.Run("Write appends byte slice and tracks LastChar", func(t *testing.T) {
+		tb := table.NewTrackedBuilder()
+
+		n, err := tb.Write([]byte("abc"))
+		if err != nil {
+			t.Fatalf("Write() error: %v", err)
+		}
+		if n != 3 {
+			t.Errorf("Write() n = %d, want 3", n)
+		}
+		if tb.LastChar != 'c' {
+			t.Errorf("LastChar = %c, want 'c'", tb.LastChar)
+		}
+		if tb.String() != "abc" {
+			t.Errorf("String() = %q, want 'abc'", tb.String())
+		}
+
+		// Empty Write must not change LastChar.
+		oldLast := tb.LastChar
+		tb.Write([]byte{})
+		if tb.LastChar != oldLast {
+			t.Errorf("Write([]byte{}) changed LastChar from %c to %c", oldLast, tb.LastChar)
+		}
+	})
 }
 
 // TestMarkdownRenderer tests the MarkdownRenderer.

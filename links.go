@@ -2,7 +2,6 @@ package html
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -21,6 +20,7 @@ import (
 // (EnableSanitization has no effect here) so that resource links living inside
 // tags sanitization would otherwise strip — such as <script src>, <iframe>,
 // <link>, and <embed> — are still enumerated.
+// Returns the same errors as [Processor.Extract].
 func (p *Processor) ExtractAllLinks(htmlBytes []byte) ([]LinkResource, error) {
 	return recoverPanic(func() ([]LinkResource, error) {
 		// Validate input
@@ -64,6 +64,7 @@ func (p *Processor) ExtractAllLinks(htmlBytes []byte) ([]LinkResource, error) {
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML file and converts it to UTF-8 before extracting links.
 // Use this when you have a file path instead of raw bytes.
+// Returns the same errors as [Processor.ExtractFromFile].
 func (p *Processor) ExtractAllLinksFromFile(filePath string) ([]LinkResource, error) {
 	return recoverPanic(func() ([]LinkResource, error) {
 		if p == nil {
@@ -85,6 +86,8 @@ func (p *Processor) ExtractAllLinksFromFile(filePath string) ([]LinkResource, er
 // ExtractAllLinksWithContext extracts all links from HTML bytes with context support for cancellation.
 // This method provides cooperative cancellation, allowing long-running extractions to be
 // interrupted when the context is cancelled.
+// In addition to the errors returned by [Processor.ExtractAllLinks], this method
+// returns context.Canceled or context.DeadlineExceeded when ctx is cancelled.
 func (p *Processor) ExtractAllLinksWithContext(ctx context.Context, htmlBytes []byte) ([]LinkResource, error) {
 	return recoverPanic(func() ([]LinkResource, error) {
 		// Early cancellation check
@@ -145,6 +148,8 @@ func (p *Processor) ExtractAllLinksWithContext(ctx context.Context, htmlBytes []
 }
 
 // ExtractAllLinksFromFileWithContext extracts all links from an HTML file with context support.
+// Returns the same errors as [Processor.ExtractAllLinksFromFile], plus context.Canceled
+// or context.DeadlineExceeded when ctx is cancelled.
 func (p *Processor) ExtractAllLinksFromFileWithContext(ctx context.Context, filePath string) ([]LinkResource, error) {
 	return recoverPanic(func() ([]LinkResource, error) {
 		// Early cancellation check
@@ -186,6 +191,8 @@ func (p *Processor) ExtractAllLinksFromFileWithContext(ctx context.Context, file
 //
 // Note: HTML sanitization is not applied, so links in tags such as <script>,
 // <iframe>, <link>, and <embed> are included in the result.
+//
+// Returns the same errors as [Extract].
 func ExtractAllLinks(htmlBytes []byte, cfg ...Config) ([]LinkResource, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -204,6 +211,8 @@ func ExtractAllLinks(htmlBytes []byte, cfg ...Config) ([]LinkResource, error) {
 //
 // An optional Config can be provided to customize link extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractFromFile].
 func ExtractAllLinksFromFile(filePath string, cfg ...Config) ([]LinkResource, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -222,6 +231,8 @@ func ExtractAllLinksFromFile(filePath string, cfg ...Config) ([]LinkResource, er
 //
 // An optional Config can be provided to customize link extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractWithContext].
 func ExtractAllLinksWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) ([]LinkResource, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -240,6 +251,8 @@ func ExtractAllLinksWithContext(ctx context.Context, htmlBytes []byte, cfg ...Co
 //
 // An optional Config can be provided to customize link extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractFromFileWithContext].
 func ExtractAllLinksFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) ([]LinkResource, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -251,23 +264,12 @@ func ExtractAllLinksFromFileWithContext(ctx context.Context, filePath string, cf
 }
 
 // extractLinksRespectingDeadline runs link extraction honoring both the caller's
-// context and the configured ProcessingTimeout. When a timeout is configured it
-// derives a deadline from ctx and threads it through extractAllLinksFromContent,
-// so an expired timeout interrupts in-flight work at the next cooperative check
-// rather than racing the return value. It mirrors the Extract path's use of
-// withTimeout; the deadline surfaces as context.DeadlineExceeded and is
-// normalized to the public ErrProcessingTimeout contract.
+// context and the configured ProcessingTimeout via the shared runWithTimeout
+// helper. See runWithTimeout for deadline normalization semantics.
 func (p *Processor) extractLinksRespectingDeadline(ctx context.Context, htmlContent string) ([]LinkResource, error) {
-	if p.config.ProcessingTimeout > 0 {
-		links, err := withTimeout(ctx, p.config.ProcessingTimeout, func(deadlineCtx context.Context) ([]LinkResource, error) {
-			return p.extractAllLinksFromContent(deadlineCtx, htmlContent)
-		})
-		if errors.Is(err, context.DeadlineExceeded) {
-			err = ErrProcessingTimeout
-		}
-		return links, err
-	}
-	return p.extractAllLinksFromContent(ctx, htmlContent)
+	return runWithTimeout(p, ctx, func(deadlineCtx context.Context) ([]LinkResource, error) {
+		return p.extractAllLinksFromContent(deadlineCtx, htmlContent)
+	})
 }
 
 func (p *Processor) extractAllLinksFromContent(ctx context.Context, htmlContent string) ([]LinkResource, error) {
@@ -519,9 +521,8 @@ func (p *Processor) extractImageLinks(n *stdxhtml.Node, baseURL string, linkMap 
 		displayName = alt
 	}
 	if displayName == "" {
-		if strings.Contains(resolvedURL, "/") {
-			displayName = lastPathSegment(resolvedURL)
-		} else {
+		displayName = lastPathSegment(resolvedURL)
+		if displayName == "" {
 			displayName = "Image"
 		}
 	}
@@ -552,9 +553,7 @@ func (p *Processor) extractMediaLink(n *stdxhtml.Node, baseURL string, linkMap m
 
 	displayName := title
 	if displayName == "" {
-		if strings.Contains(resolvedURL, "/") {
-			displayName = lastPathSegment(resolvedURL)
-		}
+		displayName = lastPathSegment(resolvedURL)
 		if displayName == "" {
 			if mediaType != "" {
 				displayName = strings.ToUpper(mediaType[:1]) + mediaType[1:]
@@ -601,9 +600,9 @@ func (p *Processor) extractSourceLinks(n *stdxhtml.Node, baseURL string, linkMap
 		}
 	}
 
-	title := "Media"
-	if strings.Contains(resolvedURL, "/") {
-		title = lastPathSegment(resolvedURL)
+	title := lastPathSegment(resolvedURL)
+	if title == "" {
+		title = "Media"
 	}
 
 	linkMap[resolvedURL] = LinkResource{
@@ -614,7 +613,7 @@ func (p *Processor) extractSourceLinks(n *stdxhtml.Node, baseURL string, linkMap
 }
 
 func (p *Processor) extractLinkTagLinks(n *stdxhtml.Node, baseURL string, linkMap map[string]LinkResource) {
-	var href, rel, linkType, title string
+	var href, rel, linkType, title, asAttr string
 	for _, attr := range n.Attr {
 		switch attr.Key {
 		case "href":
@@ -625,6 +624,8 @@ func (p *Processor) extractLinkTagLinks(n *stdxhtml.Node, baseURL string, linkMa
 			linkType = attr.Val
 		case "title":
 			title = attr.Val
+		case "as":
+			asAttr = attr.Val
 		}
 	}
 
@@ -647,36 +648,31 @@ func (p *Processor) extractLinkTagLinks(n *stdxhtml.Node, baseURL string, linkMa
 			include = true
 		}
 	case "preload", "prefetch", "dns-prefetch", "preconnect":
-		for _, attr := range n.Attr {
-			if attr.Key == "as" {
-				switch attr.Val {
-				case "style":
-					if p.config.IncludeCSS {
-						resourceType = "css"
-						include = true
-					}
-				case "script":
-					if p.config.IncludeJS {
-						resourceType = "js"
-						include = true
-					}
-				case "image":
-					if p.config.IncludeImages {
-						resourceType = "image"
-						include = true
-					}
-				case "video":
-					if p.config.IncludeVideos {
-						resourceType = "video"
-						include = true
-					}
-				case "audio":
-					if p.config.IncludeAudios {
-						resourceType = "audio"
-						include = true
-					}
-				}
-				break
+		switch asAttr {
+		case "style":
+			if p.config.IncludeCSS {
+				resourceType = "css"
+				include = true
+			}
+		case "script":
+			if p.config.IncludeJS {
+				resourceType = "js"
+				include = true
+			}
+		case "image":
+			if p.config.IncludeImages {
+				resourceType = "image"
+				include = true
+			}
+		case "video":
+			if p.config.IncludeVideos {
+				resourceType = "video"
+				include = true
+			}
+		case "audio":
+			if p.config.IncludeAudios {
+				resourceType = "audio"
+				include = true
 			}
 		}
 	default:
@@ -696,9 +692,7 @@ func (p *Processor) extractLinkTagLinks(n *stdxhtml.Node, baseURL string, linkMa
 	resolvedURL := p.resolveURLIfEnabled(baseURL, href)
 
 	if title == "" {
-		if strings.Contains(resolvedURL, "/") {
-			title = lastPathSegment(resolvedURL)
-		}
+		title = lastPathSegment(resolvedURL)
 	}
 	if title == "" {
 		title = resourceType
@@ -726,10 +720,7 @@ func (p *Processor) extractScriptLinks(n *stdxhtml.Node, baseURL string, linkMap
 
 	resolvedURL := p.resolveURLIfEnabled(baseURL, src)
 
-	title := ""
-	if strings.Contains(resolvedURL, "/") {
-		title = lastPathSegment(resolvedURL)
-	}
+	title := lastPathSegment(resolvedURL)
 	if title == "" {
 		title = "Script"
 	}
@@ -783,8 +774,10 @@ func (p *Processor) extractEmbedLinks(n *stdxhtml.Node, baseURL string, linkMap 
 	}
 }
 
-// GroupLinksByType groups links by their type.
-// This is a convenience function for organizing extracted links.
+// GroupLinksByType groups links by their Type field.
+// Links with an empty Type are grouped under "unknown".
+// Keys match the LinkResource.Type values: "link", "image", "video", "audio",
+// "css", "js", "icon", or "media".
 func GroupLinksByType(links []LinkResource) map[string][]LinkResource {
 	if len(links) == 0 {
 		return make(map[string][]LinkResource)

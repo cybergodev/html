@@ -4,6 +4,46 @@ All notable changes to the cybergodev/html library will be documented in this fi
 
 ---
 
+## v1.4.7 - Extraction Fixes, Performance & Code Quality (2026-08-11)
+
+### Fixed
+- Content extraction on compound CSS layout class names (e.g. `grid-content-sidebar`) no longer yields empty output — content-area signal exemption prevents article-body wrappers from being stripped as "sidebar"
+- Mega-menu navigation containers can no longer outscore the real article body and produce empty output — `ShouldRemove` guard in `scoreWithMetrics` rejects removable nodes as candidates
+- Removable subtrees (nav/menu/sidebar) no longer inflate ancestor metrics — `ShouldRemove` added to `isSkip` in `foldAndScore` and `collectContentMetrics`
+- `hasWordBoundary` now scans all occurrences instead of stopping at the first — "menu" in "submenu level-3-menu" is now correctly matched
+- Digit-suffixed CSS class names (`menu3`, `nav2`, `sidebar2`) now match their base removal patterns
+- `containsASCIIFold` now folds both arguments to lowercase — previously an uppercase needle silently failed to match (latent bug)
+
+### Performance
+- Cache-hit path ~33% faster (290→196 ns/op): `hash/maphash` (AES-NI) replaces hand-rolled xxHash; cache key generated before encoding detection, skipping O(n) ASCII scan on cache hits
+- Article scoring map allocation eliminated: `candidateCollector` tracks best node inline during the bottom-up fold (~2.2% of total alloc bytes removed)
+- Text helpers (`CleanText`, `normalizeText`, entity decoders) retain buffer capacity via pooled `[]byte` instead of `*strings.Builder` whose `Reset` nilled the backing array
+- `isHiddenByStyle` rewritten for zero allocation — no `strings.Split` per styled element
+- Single-pass `extractAllMedia` replaces two separate DOM walks when both videos and audio are preserved (default config)
+- `TableProcessor` cached as package-level singleton — was allocated per `<table>` element
+- `detectMediaTypeByExtension`: O(1) `LastIndexByte` + map lookup replaces O(n) suffix iteration
+- Test coverage: root 84.7%→90.1%, internal 91.2%→91.8%, table 87.4%→92.6%
+
+### Changed
+- `generateCacheKey` accepts `[]byte` (raw input) and mixes `Encoding` config into the hash to prevent collisions across forced-encoding settings
+- Removed unused `configMu` mutex from `processor.go` — `p.config` is immutable after `New()`
+- Extracted `runWithTimeout[T]` generic helper from duplicated timeout patterns in `extractCoreWithContext` and `extractLinksRespectingDeadline`
+- `getDefaultScorer` switched to `sync.OnceValue` (Go 1.21+ idiom)
+- Unified `getColSpan`/`getRowSpan` into shared `getCellSpan(n, attrKey)` helper; `getCellWidth` collapsed to single-pass attribute scan
+- Extracted `schemeEnd(url)` helper centralizing scheme-separator logic across four URL functions
+- Removed redundant `strings.Contains(url, "/")` guards before `lastPathSegment` calls
+- GoDoc: error-condition references added to 44 extraction / Markdown / JSON / link methods; `GroupLinksByType` doc describes map keys and "unknown" fallback
+- `presentChars` array widened from [32] to [36] to cover all lowercase letters + digits
+- `WriterAuditSink.Write` now logs `json.Marshal` errors instead of silently dropping them
+
+### Added
+- `example_test.go`: five testable `Example*` functions (`ExampleExtract`, `ExampleNew`, `ExampleExtractText`, `ExampleExtractAllLinks`, `ExampleGroupLinksByType`) visible in godoc / pkg.go.dev
+- Per-field godoc comments on all 14 `AuditEntry` fields
+- New test files: `audit_sink_test.go`, `media_coverage_test.go`; new tests in `output_test.go`, `boundary_test.go`, `internal/pool_test.go`, `internal/table/renderer_test.go`
+- `ExtractArticle` mode demo in `examples/01_quick_start/`
+
+---
+
 ## v1.4.6 - Security Hardening, Extraction & Table Fixes, Performance (2026-07-22)
 
 ### Security
@@ -380,7 +420,8 @@ All notable changes to the cybergodev/html library will be documented in this fi
 - All shared state properly synchronized with appropriate primitives
 
 ### Breaking Changes
-- Destructive update!
+- Internal cache implementation restructured (`Cache.Get` lock semantics changed from RWMutex read-lock to Mutex full-lock for LRU promotion); public API surface unchanged but consumers relying on internal lock behavior (not a supported use case) may observe different contention profiles
+- `CacheCleanup` field and background cleanup goroutine lifecycle are now always managed by the Processor; direct `StartCleanup`/`StopCleanup` calls on a pooled Cache have no effect (pooled processors use `CacheCleanup = 0`)
 
 ---
 
@@ -552,9 +593,14 @@ processor.ExtractBatch(docs, config1)     // single config
   - Multi-line text normalization in table cells
   - Support for all CSS text alignment values (left, center, right, justify)
   - Alignment detection from all rows (not just header)
-- **Stdlib Compatibility**:
-  - 100% API coverage with golang.org/x/net/html
-  - Re-exported all ParseOption types and constants
+- **Stdlib Compatibility** _(see correction note below)_:
+  - Claimed 100% API coverage with golang.org/x/net/html
+  - Claimed re-exported all ParseOption types and constants
+
+  > **Correction (2026-08-11):** The "100% API coverage" and full re-export
+  > claims were inaccurate. The library never achieved full API parity with
+  > `golang.org/x/net/html`; the re-exports that did exist were described as
+  > "unused" and removed in v1.1.1.
 
 ### Changed
 - **Text Extraction**:
@@ -818,9 +864,15 @@ processor.ExtractBatch(docs, config1)     // single config
 
 ## v1.0.0 - Initial Release
 
+> **Correction (2026-08-11):** The original entry claimed "100% compatible as
+> drop-in replacement" and "Re-exported all standard types and functions." This
+> was never accurate — the library has always been an independent content-
+> extraction layer built *on top of* `golang.org/x/net/html`, not a drop-in
+> replacement, and never re-exported its types. The claims were retracted in
+> later releases (see v1.1.1 "Removed unused re-exports" and the README
+> "Not a drop-in replacement" note).
+
 ### Added
-- 100% compatible with golang.org/x/net/html as drop-in replacement
-- Re-exported all standard types and functions
 - `Processor` type with thread-safe concurrent access
 - Scoring-based article detection
 - Smart text extraction with structure preservation

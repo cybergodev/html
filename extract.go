@@ -22,7 +22,8 @@ var markdownEscapeReplacer = strings.NewReplacer(
 	`]`, `\]`,
 )
 
-// containsASCIIFold reports whether substr is contained in s, case-insensitively (ASCII only).
+// containsASCIIFold reports whether substr is contained in s, case-insensitively
+// (ASCII only). Both s and substr are folded to lowercase before comparison.
 func containsASCIIFold(s, substr string) bool {
 	substrLen := len(substr)
 	sLen := len(s)
@@ -36,6 +37,9 @@ func containsASCIIFold(s, substr string) bool {
 			sc := substr[j]
 			if c >= 'A' && c <= 'Z' {
 				c += 32
+			}
+			if sc >= 'A' && sc <= 'Z' {
+				sc += 32
 			}
 			if c != sc {
 				match = false
@@ -87,10 +91,6 @@ func recoverPanic[T any](fn func() (T, error)) (result T, err error) {
 	}()
 	return fn()
 }
-
-// (recoverResult/recoverLinks/recoverString/recoverBytes were one-line wrappers
-// around the generic recoverPanic[T]; removed — Go infers T from the func literal
-// at each call site, so callers now invoke recoverPanic directly.)
 
 // Extract extracts content from HTML bytes with automatic encoding detection.
 // This is a convenience function that uses a pooled Processor for efficiency.
@@ -164,6 +164,8 @@ func ExtractFromFile(filePath string, cfg ...Config) (*Result, error) {
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [Extract].
 func ExtractText(htmlBytes []byte, cfg ...Config) (string, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -182,6 +184,8 @@ func ExtractText(htmlBytes []byte, cfg ...Config) (string, error) {
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractFromFile].
 func ExtractTextFromFile(filePath string, cfg ...Config) (string, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -197,6 +201,8 @@ func ExtractTextFromFile(filePath string, cfg ...Config) (string, error) {
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractWithContext].
 func ExtractTextWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -212,6 +218,8 @@ func ExtractTextWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractFromFileWithContext].
 func ExtractTextFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -227,6 +235,9 @@ func ExtractTextFromFileWithContext(ctx context.Context, filePath string, cfg ..
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [Extract], plus context.Canceled or
+// context.DeadlineExceeded when ctx is cancelled.
 func ExtractWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (*Result, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -242,6 +253,9 @@ func ExtractWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (*
 //
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
+//
+// Returns the same errors as [ExtractFromFile], plus context.Canceled or
+// context.DeadlineExceeded when ctx is cancelled.
 func ExtractFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (*Result, error) {
 	c, pooled, err := resolveConfig(cfg...)
 	if err != nil {
@@ -313,40 +327,24 @@ func (p *Processor) extractCoreWithContext(ctx context.Context, htmlBytes []byte
 
 	startTime := time.Now()
 
-	// Check cancellation before encoding detection
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-
-	// Detect encoding and convert to UTF-8
-	utf8String, err := p.detectEncoding(htmlBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check the cache only when caching is enabled. hasCacheKey records that a
-	// key was generated for this input so the freshly computed result is stored
-	// on the miss path. It is equivalent to (MaxCacheEntries > 0) here, but kept
-	// as an explicit flag so the "was a key produced?" intent reads clearly at
-	// both the lookup below and the store after processing.
+	// Check the cache before encoding detection. The cache key is derived from
+	// the raw input bytes (not the decoded string), so a cache hit skips the
+	// O(n) encoding scan entirely — the single most expensive step on the hot
+	// (repeated-extraction) path. This is safe because the same raw bytes + the
+	// same config (including Encoding setting, which is mixed into the key)
+	// deterministically produce the same extraction result.
 	//
 	// Note: Cache.Get/Set treat the zero key ([16]byte{}) as "no key" and reject
 	// it, so in the astronomically unlikely event (2^-128) that this hash comes
 	// out all zero, that input is simply a permanent cache miss — reprocessed on
-	// every call. This is an accepted tradeoff, not something hasCacheKey can or
-	// needs to remedy.
+	// every call. This is an accepted tradeoff.
 	var cacheKey [16]byte
 	hasCacheKey := false
 	if p.config.MaxCacheEntries > 0 {
-		cacheKey = p.generateCacheKey(utf8String)
+		cacheKey = p.generateCacheKey(htmlBytes)
 		hasCacheKey = true
 		if cached := p.cache.Get(cacheKey); cached != nil {
 			// Count a hit only when the cached value is actually usable.
-			// Incrementing the hit counter before the type assertion previously
-			// double-counted a stray entry as both a hit (here) and a miss
-			// (the fall-through below) when the assertion failed.
 			if cachedResult, ok := cached.(*Result); ok {
 				p.stats.cacheHits.Add(1)
 				p.stats.totalProcessed.Add(1)
@@ -354,6 +352,19 @@ func (p *Processor) extractCoreWithContext(ctx context.Context, htmlBytes []byte
 			}
 		}
 		p.stats.cacheMisses.Add(1)
+	}
+
+	// Check cancellation before encoding detection
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Detect encoding and convert to UTF-8 (skipped entirely on cache hits above)
+	utf8String, err := p.detectEncoding(htmlBytes)
+	if err != nil {
+		return nil, err
 	}
 
 	// Check cancellation before content processing
@@ -370,20 +381,9 @@ func (p *Processor) extractCoreWithContext(ctx context.Context, htmlBytes []byte
 	// work at the next check rather than merely racing the return value while
 	// extraction runs to completion.
 	var result *Result
-	if p.config.ProcessingTimeout > 0 {
-		result, err = withTimeout(ctx, p.config.ProcessingTimeout, func(deadlineCtx context.Context) (*Result, error) {
-			return p.processContentWithContext(deadlineCtx, utf8String)
-		})
-		// A fired deadline surfaces as context.DeadlineExceeded (from either
-		// withTimeout's select or an in-flight cooperative check); normalize it
-		// to the public ErrProcessingTimeout contract. A user-initiated
-		// cancellation surfaces as context.Canceled and is returned unchanged.
-		if errors.Is(err, context.DeadlineExceeded) {
-			err = ErrProcessingTimeout
-		}
-	} else {
-		result, err = p.processContentWithContext(ctx, utf8String)
-	}
+	result, err = runWithTimeout(p, ctx, func(deadlineCtx context.Context) (*Result, error) {
+		return p.processContentWithContext(deadlineCtx, utf8String)
+	})
 
 	if err != nil {
 		p.stats.errorCount.Add(1)
@@ -486,6 +486,10 @@ func (p *Processor) processContentWithContext(ctx context.Context, htmlContent s
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML file and converts it to UTF-8 before processing.
 // Use this when you have a file path instead of raw bytes.
+//
+// Returns the same errors as [Processor.Extract], plus a *FileError wrapping
+// ErrFileNotFound, ErrInvalidFilePath, or a path-traversal rejection for
+// file-access failures.
 func (p *Processor) ExtractFromFile(filePath string) (*Result, error) {
 	return recoverPanic(func() (*Result, error) {
 		// Validate processor state (no input size check for file paths)
@@ -512,6 +516,9 @@ func (p *Processor) ExtractFromFile(filePath string) (*Result, error) {
 //	defer cancel()
 //
 //	result, err := processor.ExtractFromFileWithContext(ctx, "page.html")
+//
+// In addition to the errors returned by [Processor.ExtractFromFile], this method
+// returns context.Canceled or context.DeadlineExceeded when ctx is cancelled.
 func (p *Processor) ExtractFromFileWithContext(ctx context.Context, filePath string) (*Result, error) {
 	return recoverPanic(func() (*Result, error) {
 		// Early cancellation check
@@ -539,6 +546,7 @@ func (p *Processor) ExtractFromFileWithContext(ctx context.Context, filePath str
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML bytes and converts it to UTF-8 before processing.
 // This is a convenience method that returns only the text content without other metadata.
+// Returns the same errors as [Processor.Extract].
 func (p *Processor) ExtractText(htmlBytes []byte) (string, error) {
 	result, err := p.Extract(htmlBytes)
 	if err != nil {
@@ -552,6 +560,7 @@ func (p *Processor) ExtractText(htmlBytes []byte) (string, error) {
 // from the HTML file and converts it to UTF-8 before processing.
 // Use this when you have a file path instead of raw bytes.
 // This is a convenience method that returns only the text content without other metadata.
+// Returns the same errors as [Processor.ExtractFromFile].
 func (p *Processor) ExtractTextFromFile(filePath string) (string, error) {
 	result, err := p.ExtractFromFile(filePath)
 	if err != nil {
@@ -564,6 +573,7 @@ func (p *Processor) ExtractTextFromFile(filePath string) (string, error) {
 // The method automatically detects the character encoding (Windows-1252, UTF-8, GBK, Shift_JIS, etc.)
 // from the HTML bytes and converts it to UTF-8 before processing.
 // This is a convenience method that returns only the text content without other metadata.
+// Returns the same errors as [Processor.ExtractWithContext].
 func (p *Processor) ExtractTextWithContext(ctx context.Context, htmlBytes []byte) (string, error) {
 	result, err := p.ExtractWithContext(ctx, htmlBytes)
 	if err != nil {
@@ -577,6 +587,7 @@ func (p *Processor) ExtractTextWithContext(ctx context.Context, htmlBytes []byte
 // from the HTML file and converts it to UTF-8 before processing.
 // Use this when you have a file path instead of raw bytes.
 // This is a convenience method that returns only the text content without other metadata.
+// Returns the same errors as [Processor.ExtractFromFileWithContext].
 func (p *Processor) ExtractTextFromFileWithContext(ctx context.Context, filePath string) (string, error) {
 	result, err := p.ExtractFromFileWithContext(ctx, filePath)
 	if err != nil {
@@ -665,6 +676,24 @@ func withTimeout[T any](parent context.Context, timeout time.Duration, fn func(c
 		// cooperative check; the buffered resultChan keeps it from blocking.
 		return zero, ctx.Err()
 	}
+}
+
+// runWithTimeout executes fn under the processor's configured ProcessingTimeout
+// (if set), deriving the deadline from ctx so cooperative cancellation checks
+// inside fn honor both the user's context and the timeout. A fired deadline
+// surfaces as context.DeadlineExceeded and is normalized to ErrProcessingTimeout;
+// a user-initiated cancellation surfaces as context.Canceled and is returned
+// unchanged. It is a free function (not a method) because Go does not permit
+// type parameters on methods.
+func runWithTimeout[T any](p *Processor, ctx context.Context, fn func(context.Context) (T, error)) (T, error) {
+	if p.config.ProcessingTimeout > 0 {
+		result, err := withTimeout(ctx, p.config.ProcessingTimeout, fn)
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = ErrProcessingTimeout
+		}
+		return result, err
+	}
+	return fn(ctx)
 }
 
 // isBlankContent checks if content is empty or whitespace-only without allocating.
@@ -791,10 +820,13 @@ func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string) 
 		canContainMedia := len(htmlContent) > 0 &&
 			len(htmlContent) <= maxHTMLForRegex &&
 			internal.HasMediaReference(htmlContent)
-		if p.config.PreserveVideos {
+		// When both media types are preserved (the default), extract them in a
+		// single DOM walk instead of two separate WalkNodes traversals.
+		if p.config.PreserveVideos && p.config.PreserveAudios {
+			result.Videos, result.Audios = p.extractAllMedia(doc, htmlContent, canContainMedia)
+		} else if p.config.PreserveVideos {
 			result.Videos = p.extractVideos(doc, htmlContent, canContainMedia)
-		}
-		if p.config.PreserveAudios {
+		} else {
 			result.Audios = p.extractAudios(doc, htmlContent, canContainMedia)
 		}
 	}
@@ -846,24 +878,19 @@ func (p *Processor) extractArticleNode(doc *stdxhtml.Node) *stdxhtml.Node {
 		return nil
 	}
 
-	// Fast path: the built-in DefaultScorer can score all candidates from a single
-	// bottom-up metrics pass (ScoreArticleCandidates), avoiding the O(N²) per-
-	// candidate subtree re-walk that Score+collectContentMetrics would otherwise
-	// repeat for every non-inline element. Custom scorers lack that method and
+	// Fast path: the built-in DefaultScorer can find the best article node from a
+	// single bottom-up metrics pass (FindBestArticleNode), avoiding both the O(N²)
+	// per-candidate subtree re-walk that Score+collectContentMetrics would repeat
+	// for every non-inline element, and the map allocation that
+	// ScoreArticleCandidates would require. Custom scorers lack that method and
 	// fall back to the per-node Score() loop, whose behavior is unchanged.
-	var candidates map[*stdxhtml.Node]int
 	if ds, ok := p.scorer.(*internal.DefaultScorer); ok {
-		candidates = ds.ScoreArticleCandidates(doc)
+		if bestNode := ds.FindBestArticleNode(doc); bestNode != nil {
+			return bestNode
+		}
 	} else {
-		candidates = make(map[*stdxhtml.Node]int, initialMapCap)
+		candidates := make(map[*stdxhtml.Node]int, initialMapCap)
 		internal.WalkNodes(doc, func(n *stdxhtml.Node) bool {
-			// Only score elements that can plausibly be an article root. Inline/
-			// phrasing/media tags (a, span, em, img, br, …) have tiny subtrees that
-			// never win SelectBestCandidate, and Score() walks the full subtree of
-			// every candidate (collectContentMetrics), so skipping them avoids an
-			// O(N×subtree) traversal surge with no change to the selected node. Score
-			// already short-circuits 'p' and IsNonContentElement tags the same way;
-			// this only broadens that skip. Custom/namespaced/block tags still score.
 			if n.Type == stdxhtml.ElementNode && !internal.IsInlineElement(n.Data) {
 				if score := p.scorer.Score(n); score > 0 {
 					candidates[n] = score
@@ -871,9 +898,9 @@ func (p *Processor) extractArticleNode(doc *stdxhtml.Node) *stdxhtml.Node {
 			}
 			return true
 		})
-	}
-	if bestNode := internal.SelectBestCandidate(candidates); bestNode != nil {
-		return bestNode
+		if bestNode := internal.SelectBestCandidate(candidates); bestNode != nil {
+			return bestNode
+		}
 	}
 	return internal.FindElementByTag(doc, "body")
 }

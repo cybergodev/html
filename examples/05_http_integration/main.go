@@ -1,5 +1,3 @@
-//go:build examples
-
 package main
 
 import (
@@ -200,7 +198,7 @@ func createMockServer() *httptest.Server {
 
 	mux.HandleFunc("/article", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte(`
+		_, _ = w.Write([]byte(`
 			<html>
 				<head><title>Go Article</title></head>
 				<body>
@@ -215,7 +213,7 @@ func createMockServer() *httptest.Server {
 
 	mux.HandleFunc("/blog", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte(`
+		_, _ = w.Write([]byte(`
 			<html>
 				<head><title>Blog Post</title></head>
 				<body>
@@ -230,7 +228,7 @@ func createMockServer() *httptest.Server {
 
 	mux.HandleFunc("/docs", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte(`
+		_, _ = w.Write([]byte(`
 			<html>
 				<head><title>Documentation</title></head>
 				<body>

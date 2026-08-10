@@ -89,27 +89,19 @@ cfg.EnableSanitization = true // Default: true
 - **Threat**: Inline event handlers execute JavaScript in downstream applications
 - **Mitigation**: All event handler attributes removed during sanitization
 
-**Removed Event Handler Attributes** (45+ attributes):
-- **Mouse events**: `onclick`, `ondblclick`, `onmousedown`, `onmouseup`, `onmouseover`, `onmousemove`, `onmouseout`, `onmouseenter`, `onmouseleave`
-- **Keyboard events**: `onkeydown`, `onkeypress`, `onkeyup`
-- **Focus events**: `onfocus`, `onblur`
-- **Form events**: `onsubmit`, `onreset`, `onchange`, `onselect`
-- **UI events**: `onload`, `onunload`, `onabort`, `onerror`, `onresize`, `onscroll`, `oncontextmenu`
-- **Drag and drop events**: `ondrag`, `ondragstart`, `ondragend`, `ondragenter`, `ondragleave`, `ondragover`, `ondrop`
-- **Clipboard events**: `oncopy`, `oncut`, `onpaste`
-- **Media events**: `onplay`, `onpause`, `onended`, `onvolumechange`
-- **Mutation events**: `onDOMAttrModified`, `onDOMCharacterDataModified`, `onDOMNodeInserted`, `onDOMNodeRemoved`
-- **Animation events**: `onanimationstart`, `onanimationend`, `onanimationiteration`
-- **Transition events**: `ontransitionend`
-- **Touch events**: `ontouchstart`, `ontouchend`, `ontouchmove`, `ontouchcancel`
-- **Pointer events**: `onpointerdown`, `onpointerup`, `onpointermove`, `onpointercancel`, `onpointerenter`, `onpointerleave`, `onpointerover`, `onpointerout`
+**Removed Event Handler Attributes** (prefix-based catch-all):
+- All attributes starting with `on` are removed via a prefix check (`strings.HasPrefix("on")`)
+- This covers every current and future event handler, including (non-exhaustive):
+  `onclick`, `onerror`, `onload`, `onmouseover`, `onsubmit`, `onchange`, `oninput`,
+  `onkeydown`, `onkeyup`, `onfocus`, `onblur`, `ondrag`, `ondrop`, `oncopy`, `onpaste`,
+  `ontouchstart`, `onpointerdown`, `onanimationstart`, `ontransitionend`, etc.
 - **Other dangerous attributes**: `formaction` (can override form action), `autofocus` (can be used for phishing)
 
 **Dangerous URI Schemes**
 - **Threat**: `javascript:`, `vbscript:`, `data:` URLs execute code
 - **Mitigation**: URI validation removes dangerous schemes
 - **Blocked Schemes**: `javascript:`, `vbscript:`, `file:`
-- **Validated Schemes**: `data:` URLs validated for size (100KB max), safe content, and media type whitelist
+- **Validated Schemes**: `data:` URLs validated for size (100,000 bytes max), safe content, and media type whitelist
 - **Additional Protection**: NFC Unicode normalization and fullwidth character normalization to prevent bypass attacks
 - **SVG Block**: `image/svg+xml` data URLs explicitly blocked
 
@@ -127,7 +119,7 @@ cfg.EnableSanitization = true // Default: true
 - **Threat**: Malicious input causes catastrophic backtracking in regex
 - **Mitigation**:
   - All regex patterns pre-compiled at initialization
-  - Regex only applied to size-limited content (`maxHTMLForRegex = 1MB`)
+  - Regex only applied to size-limited content (`maxHTMLForRegex = 1,000,000 bytes`)
   - Match limits enforced (`maxRegexMatches = 1000`)
   - Simple, non-backtracking patterns used
 
@@ -149,14 +141,14 @@ if len(htmlContent) <= maxHTMLForRegex {
 - **Threat**: Large data URLs exhaust memory
 - **Mitigation**: Data URL length limited to 100,000 bytes (`MaxDataURILength`)
 - **Validation**: Data URLs exceeding limit are rejected
-- **Media type whitelist**: Only safe types allowed (JPEG, PNG, GIF, WebP, BMP, ICO, AVIF, APNG, WOFF/WOFF2, TTF, OTF, PDF)
+- **Media type whitelist**: Only safe types allowed (GIF, JPEG/JPG, PNG, WebP, BMP, ICO/x-icon/vnd.microsoft.icon, AVIF, APNG, WOFF/WOFF2, TTF, OTF, PDF); `application/font-woff` and `application/font-woff2` aliases also accepted
 - **Base64 validation**: Character set validated for base64-encoded data URLs
 
 #### 4. Cache Poisoning
 
 **Hash Collision Attacks**
 - **Threat**: Crafted inputs produce same cache key, causing incorrect results
-- **Mitigation**: xxHash-style non-cryptographic hash with 128-bit output for cache keys
+- **Mitigation**: xxHash-style non-cryptographic hash with 128-bit (16-byte) output for cache keys (effective collision resistance ~64 bits; the second 8 bytes are deterministically derived from the first 8, providing output-space separation but not doubling collision entropy)
 - **Key generation**: Config flags + format options + content (with 5-point sampling for large documents)
 - **Large document handling**: Multi-point sampling (5 regions) for documents exceeding 64KB ensures modifications anywhere in the document are detected
 
@@ -481,7 +473,7 @@ Security fixes are released as:
 
 ### Automated Testing
 
-The library includes comprehensive security-focused tests with **85%+ code coverage**:
+The library includes comprehensive security-focused tests with **84%+ code coverage** (main package; internal packages exceed 87%):
 
 ```bash
 # Run all tests including security tests

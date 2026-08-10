@@ -23,6 +23,8 @@ type boundaryCharSet int
 
 const (
 	// boundaryStandard uses standard word boundary characters (-, _, space, tab)
+	// and digits (0-9). Digit boundaries let patterns match CSS tokens with
+	// numeric suffixes such as menu3, nav2, content1.
 	boundaryStandard boundaryCharSet = iota
 	// boundaryCSS uses CSS-specific boundary characters (;, :, space, tab, {, }, ")
 	boundaryCSS
@@ -30,55 +32,68 @@ const (
 
 // hasWordBoundary checks if a pattern appears with proper word boundaries.
 // The allowed boundary characters are determined by the boundaryCharSet parameter.
+// It scans ALL occurrences of pattern in text, returning true if any occurrence
+// has valid boundary characters (or string edges) on both sides. The previous
+// implementation checked only the first occurrence, which missed valid matches
+// when an earlier non-bounded occurrence existed — e.g. "submenu level-3-menu"
+// never matched "menu" because strings.Index found "menu" inside "submenu"
+// (no boundary before it) and stopped, ignoring the valid "menu" in "level-3-menu".
 func hasWordBoundary(text, pattern string, charSet boundaryCharSet) bool {
-	idx := strings.Index(text, pattern)
-	if idx == -1 {
+	textLen := len(text)
+	patLen := len(pattern)
+	if patLen == 0 || patLen > textLen {
 		return false
 	}
 
-	// Check character before the match
-	if idx > 0 {
-		before := text[idx-1]
-		if !isBoundaryChar(before, charSet) {
+	searchStart := 0
+	for searchStart <= textLen-patLen {
+		idx := strings.Index(text[searchStart:], pattern)
+		if idx == -1 {
 			return false
 		}
-	}
+		idx += searchStart
 
-	// Check character after the match
-	endIdx := idx + len(pattern)
-	if endIdx < len(text) {
-		after := text[endIdx]
-		if !isBoundaryChar(after, charSet) {
-			return false
+		// Check character before the match
+		beforeOK := idx == 0
+		if !beforeOK {
+			beforeOK = isBoundaryChar(text[idx-1], charSet)
 		}
-	}
 
-	return true
+		// Check character after the match
+		endIdx := idx + patLen
+		afterOK := endIdx >= textLen
+		if !afterOK {
+			afterOK = isBoundaryChar(text[endIdx], charSet)
+		}
+
+		if beforeOK && afterOK {
+			return true
+		}
+
+		// Move past this occurrence to check the next one
+		searchStart = idx + 1
+	}
+	return false
 }
 
-// isBoundaryChar checks if a character is a valid boundary character
+// isBoundaryChar checks if a character is a valid boundary character.
+// For boundaryStandard, digits (0-9) are treated as boundary characters in
+// addition to -, _, space, and tab. CSS class/id naming conventions frequently
+// append numeric suffixes to semantic tokens (menu3, nav2, sidebar2, content1),
+// and these should still match their base patterns. Without digits as boundaries,
+// "nv-menu3-container" escapes the "menu" removal pattern even though it is
+// unmistakably a navigation menu element.
 func isBoundaryChar(c byte, charSet boundaryCharSet) bool {
 	switch charSet {
 	case boundaryCSS:
 		return c == ';' || c == ':' || c == ' ' || c == '\t' ||
 			c == '{' || c == '}' || c == '"'
 	case boundaryStandard:
-		return c == '-' || c == '_' || c == ' ' || c == '\t'
+		return c == '-' || c == '_' || c == ' ' || c == '\t' ||
+			(c >= '0' && c <= '9')
 	default:
 		return false
 	}
-}
-
-// normalizeNonBreakingSpaces replaces all non-breaking spaces (\u00a0) with regular spaces.
-// This ensures consistent text processing across different HTML sources.
-// Optimized with early exit to avoid allocation when no NBSP is present.
-func normalizeNonBreakingSpaces(s string) string {
-	// Fast path: early exit if no non-breaking spaces present
-	// This avoids the allocation overhead of strings.ReplaceAll for common case
-	if !strings.Contains(s, "\u00a0") {
-		return s
-	}
-	return strings.ReplaceAll(s, "\u00a0", " ")
 }
 
 // textNeedsNormalization reports whether s contains any byte sequence that
@@ -147,14 +162,16 @@ func normalizeText(s string) string {
 		return ReplaceHTMLEntities(s)
 	}
 
-	// Single-pass processing for NBSP and newlines
-	sb := GetBuilder()
-	defer PutBuilder(sb)
-	sb.Grow(n)
+	// Single-pass processing for NBSP and newlines.
+	// Use a capacity-retaining pooled []byte instead of BuilderPool: a pooled
+	// []byte keeps its backing array across calls (reset with [:0]), whereas
+	// strings.Builder.Reset() drops the buffer, forcing re-growth on every call.
+	bp := GetByteBuf()
+	defer PutByteBuf(bp)
 
 	// Copy unchanged prefix
 	if firstMod > 0 {
-		sb.WriteString(s[:firstMod])
+		*bp = append(*bp, s[:firstMod]...)
 	}
 
 	// Process from first modification point
@@ -163,27 +180,27 @@ func normalizeText(s string) string {
 		c := s[i]
 		switch {
 		case c == '\n':
-			sb.WriteByte(' ')
+			*bp = append(*bp, ' ')
 			i++
 		case c == '\r':
 			// Skip carriage returns
 			i++
 		case c == 0xC2 && i+1 < n && s[i+1] == 0xA0:
 			// UTF-8 encoding of NBSP (U+00A0) - replace with space
-			sb.WriteByte(' ')
+			*bp = append(*bp, ' ')
 			i += 2
 		case c == '&':
 			// Handle entity at this position
 			replaced, consumed := replaceEntityAt(s, i)
-			sb.WriteString(replaced)
+			*bp = append(*bp, replaced...)
 			i += consumed
 		default:
-			sb.WriteByte(c)
+			*bp = append(*bp, c)
 			i++
 		}
 	}
 
-	return sb.String()
+	return string(*bp)
 }
 
 // commonHTMLEntities lists the ten most frequent HTML entities, ordered roughly
@@ -331,12 +348,12 @@ func CleanText(text string) string {
 		n = len(text)
 	}
 
-	sb := GetBuilder()
-	defer PutBuilder(sb)
+	// Use a capacity-retaining pooled []byte instead of BuilderPool: a pooled
+	// []byte keeps its backing array across calls (reset with [:0]), whereas
+	// strings.Builder.Reset() drops the buffer, forcing re-growth on every call.
+	bp := GetByteBuf()
+	defer PutByteBuf(bp)
 
-	if n > builderPoolInitialCapacity {
-		sb.Grow(n)
-	}
 	start := 0
 	previousWasEmpty := false
 
@@ -385,29 +402,29 @@ func CleanText(text string) string {
 					}
 
 					if contentEnd > 0 {
-						if sb.Len() > 0 {
+						if len(*bp) > 0 {
 							if previousWasEmpty {
-								sb.WriteByte('\n')
+								*bp = append(*bp, '\n')
 							}
-							sb.WriteByte('\n')
+							*bp = append(*bp, '\n')
 						}
-						sb.WriteString(indent)
+						*bp = append(*bp, indent...)
 						if needsCompress {
 							inSpace := false
 							for j := 0; j < contentEnd; j++ {
 								c := contentPart[j]
 								if c == ' ' || c == '\t' {
 									if !inSpace {
-										sb.WriteByte(' ')
+										*bp = append(*bp, ' ')
 										inSpace = true
 									}
 								} else {
-									sb.WriteByte(c)
+									*bp = append(*bp, c)
 									inSpace = false
 								}
 							}
 						} else {
-							sb.WriteString(contentPart[:contentEnd])
+							*bp = append(*bp, contentPart[:contentEnd]...)
 						}
 						isEmpty = false
 					}
@@ -419,7 +436,7 @@ func CleanText(text string) string {
 		}
 	}
 
-	result := sb.String()
+	result := string(*bp)
 
 	if hasUnwanted {
 		result = unwantedCharReplacer.Replace(result)
@@ -776,21 +793,19 @@ func fastReplaceCommonEntities(text string) string {
 		return text
 	}
 
-	// Use pooled builder for better memory efficiency
-	sb := GetBuilder()
-	defer PutBuilder(sb)
-
-	sb.Grow(textLen)
+	// Use capacity-retaining pooled []byte for better memory efficiency
+	bp := GetByteBuf()
+	defer PutByteBuf(bp)
 
 	// Write prefix unchanged
 	if firstAmpersand > 0 {
-		sb.WriteString(text[:firstAmpersand])
+		*bp = append(*bp, text[:firstAmpersand]...)
 	}
 
 	i := firstAmpersand
 	for i < textLen {
 		if text[i] != '&' {
-			sb.WriteByte(text[i])
+			*bp = append(*bp, text[i])
 			i++
 			continue
 		}
@@ -798,7 +813,7 @@ func fastReplaceCommonEntities(text string) string {
 		// Check if we have at least 4 characters for the shortest entity (&lt;)
 		remainingLen := textLen - i
 		if remainingLen < 4 {
-			sb.WriteByte(text[i])
+			*bp = append(*bp, text[i])
 			i++
 			continue
 		}
@@ -808,7 +823,7 @@ func fastReplaceCommonEntities(text string) string {
 		matched := false
 		for _, e := range commonHTMLEntities {
 			if remainingLen >= len(e.token) && text[i:i+len(e.token)] == e.token {
-				sb.WriteString(e.repl)
+				*bp = append(*bp, e.repl...)
 				i += len(e.token)
 				matched = true
 				break
@@ -816,26 +831,24 @@ func fastReplaceCommonEntities(text string) string {
 		}
 		if !matched {
 			// Not a common entity, copy as-is
-			sb.WriteByte(text[i])
+			*bp = append(*bp, text[i])
 			i++
 		}
 	}
 
-	return sb.String()
+	return string(*bp)
 }
 
 // replaceHTMLEntitiesFull handles numeric entities and unknown named entities.
 func replaceHTMLEntitiesFull(text string) string {
-	// Use pooled builder for better memory efficiency
-	sb := GetBuilder()
-	defer PutBuilder(sb)
-
-	sb.Grow(len(text))
+	// Use capacity-retaining pooled []byte for better memory efficiency
+	bp := GetByteBuf()
+	defer PutByteBuf(bp)
 
 	i := 0
 	for i < len(text) {
 		if text[i] != '&' {
-			sb.WriteByte(text[i])
+			*bp = append(*bp, text[i])
 			i++
 			continue
 		}
@@ -843,14 +856,14 @@ func replaceHTMLEntitiesFull(text string) string {
 		// Find the end of the entity (semicolon or end of string)
 		end := i + 1
 		if end >= len(text) {
-			sb.WriteByte(text[i])
+			*bp = append(*bp, text[i])
 			break
 		}
 
 		// Check if this is a numeric entity
 		if text[end] == '#' {
 			replaced, consumed := replaceNumericEntity(text, i)
-			sb.WriteString(replaced)
+			*bp = append(*bp, replaced...)
 			i += consumed
 			continue
 		}
@@ -865,7 +878,7 @@ func replaceHTMLEntitiesFull(text string) string {
 		semi := strings.IndexByte(text[i:scanEnd], ';')
 		if semi == -1 {
 			// No semicolon found, write the '&' and continue
-			sb.WriteByte(text[i])
+			*bp = append(*bp, text[i])
 			i++
 			continue
 		}
@@ -876,7 +889,7 @@ func replaceHTMLEntitiesFull(text string) string {
 
 		// Validate entity name (alphanumeric only)
 		if !isValidEntityName(entityName) {
-			sb.WriteByte(text[i])
+			*bp = append(*bp, text[i])
 			i++
 			continue
 		}
@@ -884,11 +897,11 @@ func replaceHTMLEntitiesFull(text string) string {
 		// Try to decode using standard library for unknown entities
 		// This handles HTML5 named entities not in our replacer
 		decoded := decodeEntityFallback("&" + entityName + ";")
-		sb.WriteString(decoded)
+		*bp = append(*bp, decoded...)
 		i = semi + 1
 	}
 
-	return sb.String()
+	return string(*bp)
 }
 
 // replaceNumericEntity handles numeric character references like &#65; or &#x41;

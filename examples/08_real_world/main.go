@@ -1,5 +1,3 @@
-//go:build examples
-
 package main
 
 import (
@@ -14,7 +12,7 @@ import (
 // Perfect for understanding practical patterns.
 //
 // NOTE: For brevity, extraction errors are elided in most use cases below;
-// see 07_error_handling.go for proper error-handling patterns.
+// see 07_error_handling for proper error-handling patterns.
 func main() {
 	fmt.Println("=== Real-World Use Cases ===")
 	fmt.Println()

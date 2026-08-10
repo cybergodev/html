@@ -8,6 +8,24 @@ func IsExternalURL(url string) bool {
 	return hasHTTPScheme(url) || strings.HasPrefix(url, "//")
 }
 
+// schemeEnd returns the byte offset in url where the domain/host begins —
+// i.e. immediately after the scheme separator. It handles three forms:
+//   - "scheme://host/path" → returns the index after "://"
+//   - "//host/path"        → returns 2 (after the leading slashes)
+//   - "host/path" or other → returns 0 (no scheme)
+//
+// This centralizes the duplicated scheme-parsing logic previously inlined in
+// ExtractDomain, ExtractBaseFromURL, NormalizeBaseURL, and asDirectoryBase.
+func schemeEnd(url string) int {
+	if idx := strings.Index(url, "://"); idx >= 0 {
+		return idx + 3
+	}
+	if strings.HasPrefix(url, "//") {
+		return 2
+	}
+	return 0
+}
+
 // hasHTTPScheme reports whether url begins with an http:// or https:// scheme,
 // compared case-insensitively per RFC 3986 §3.1 (schemes are ASCII
 // case-insensitive). Browsers normalize HTTP:///HTTPS:// before any network
@@ -24,13 +42,7 @@ func hasHTTPScheme(url string) bool {
 // has no "://" or leading "//", the scheme is treated as absent and the input
 // is returned unchanged (the whole string is the "host").
 func ExtractDomain(url string) string {
-	// Find the start of the domain (after scheme)
-	start := 0
-	if idx := strings.Index(url, "://"); idx >= 0 {
-		start = idx + 3
-	} else if strings.HasPrefix(url, "//") {
-		start = 2
-	}
+	start := schemeEnd(url)
 
 	// Find the end of the domain (first slash)
 	if pathStart := strings.IndexByte(url[start:], '/'); pathStart >= 0 {
@@ -48,13 +60,7 @@ func ExtractBaseFromURL(url string) string {
 		return ""
 	}
 
-	// Find the start of the domain (after scheme)
-	start := 0
-	if idx := strings.Index(url, "://"); idx >= 0 {
-		start = idx + 3
-	} else if strings.HasPrefix(url, "//") {
-		start = 2
-	}
+	start := schemeEnd(url)
 
 	// Find the first slash after the domain
 	if pathStart := strings.IndexByte(url[start:], '/'); pathStart >= 0 {
@@ -80,13 +86,7 @@ func NormalizeBaseURL(baseURL string) string {
 
 	// For HTTP/HTTPS URLs, find the domain portion and ensure trailing slash
 	if IsExternalURL(baseURL) {
-		// Find the start of the domain (after scheme)
-		start := 0
-		if idx := strings.Index(baseURL, "://"); idx >= 0 {
-			start = idx + 3
-		} else if strings.HasPrefix(baseURL, "//") {
-			start = 2
-		}
+		start := schemeEnd(baseURL)
 
 		// Find the first slash after the domain
 		if pathStart := strings.IndexByte(baseURL[start:], '/'); pathStart >= 0 {
@@ -181,10 +181,7 @@ func asDirectoryBase(baseURL string) string {
 	if strings.HasSuffix(baseURL, "/") {
 		return baseURL
 	}
-	pathStart := 0
-	if schemeIdx := strings.Index(baseURL, "://"); schemeIdx >= 0 {
-		pathStart = schemeIdx + 3
-	}
+	pathStart := schemeEnd(baseURL)
 	if lastSlash := strings.LastIndexByte(baseURL[pathStart:], '/'); lastSlash >= 0 {
 		return baseURL[:pathStart+lastSlash+1]
 	}
