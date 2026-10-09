@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -146,12 +147,12 @@ func (n contentNodeAdapter) Parent() ContentNode {
 // It provides methods for extracting content, links, and media from HTML documents
 // with automatic encoding detection and caching support.
 type Processor struct {
-	config   *Config // Immutable after New(); never mutated, so no lock needed
-	cache    *internal.Cache[[16]byte]
-	scorer   internal.Scorer
-	audit    *auditCollector
-	closed   atomic.Bool
-	stats    *processorStats
+	config *Config // Immutable after New(); never mutated, so no lock needed
+	cache  *internal.Cache[[16]byte]
+	scorer internal.Scorer
+	audit  *auditCollector
+	closed atomic.Bool
+	stats  *processorStats
 
 	// Pre-computed format strings to avoid repeated strings.ToLower in hot path
 	imageFormat string
@@ -327,14 +328,16 @@ func (p *Processor) Close() error {
 }
 
 // validateInput performs common validation for HTML input.
-// It checks for nil/closed processor and input size limits.
+// It checks for nil/closed processor and input size limits. op names the
+// public operation in the resulting *InputError (e.g. "Extract",
+// "ExtractAllLinks") so oversize-input errors identify their true source.
 // Returns an error if validation fails, nil otherwise.
-func (p *Processor) validateInput(htmlBytes []byte) error {
+func (p *Processor) validateInput(htmlBytes []byte, op string) error {
 	if p == nil || p.closed.Load() {
 		return ErrProcessorClosed
 	}
 	if len(htmlBytes) > p.config.MaxInputSize {
-		return p.inputTooLargeError("Extract", len(htmlBytes))
+		return p.inputTooLargeError(op, len(htmlBytes))
 	}
 	return nil
 }
@@ -355,8 +358,8 @@ func (p *Processor) inputTooLargeError(op string, size int) error {
 // MaxInputSize, so the file is rejected before its contents are read into
 // memory. Non-regular files (pipes, devices, sockets) report an implausible
 // Stat size (often 0), so they are never rejected here — they are bounded
-// instead by the byte-level MaxInputSize check that runs after the read in
-// validateInput. Returns nil when the file is within the limit.
+// instead by the MaxInputSize+1 read cap in readBounded at read time.
+// Returns nil when the file is within the limit.
 func (p *Processor) errFileTooLarge(regular bool, size int64) error {
 	if !regular || size <= int64(p.config.MaxInputSize) {
 		return nil
@@ -410,7 +413,7 @@ func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
 	}
 
 	// Pre-check the file size against MaxInputSize so an oversized file is
-	// rejected before os.ReadFile materializes it in memory. The byte-level
+	// rejected before its contents are materialized in memory. The byte-level
 	// check in validateInput still guards downstream processing; this guard
 	// closes the read-time memory-exhaustion window for untrusted paths.
 	// AllowedBaseDir confines WHICH file may be read, not how large it is.
@@ -425,14 +428,38 @@ func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
 		return nil, err
 	}
 
-	data, err := os.ReadFile(cleanPath)
+	// Open and read bounded rather than os.ReadFile: the Stat pre-check above
+	// only bounds regular files whose size did not change since the Stat, so
+	// the actual read must enforce its own byte ceiling (see readBounded).
+	f, err := os.Open(cleanPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, newFileError("ReadFile", cleanPath, ErrFileNotFound)
 		}
 		return nil, newFileError("ReadFile", cleanPath, err)
 	}
+	defer func() { _ = f.Close() }() // best-effort close of a read-only handle
 
+	return p.readBounded(f, cleanPath)
+}
+
+// readBounded reads the remaining contents of r, hard-capped at MaxInputSize+1
+// bytes. Non-regular files (FIFOs, character devices, sockets) report an
+// implausible Stat size — often 0 — so the Stat-based pre-checks in
+// validateAndReadFile and readContained never reject them, and a regular file
+// can also grow between its Stat and the read. Without this cap those inputs
+// streamed unbounded bytes into memory before validateInput ever saw the
+// length. Reading one byte past the limit distinguishes "exactly at the limit"
+// from "over the limit" so the standard ErrInputTooLarge error is produced
+// here, identical to the byte-input path.
+func (p *Processor) readBounded(r io.Reader, path string) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, int64(p.config.MaxInputSize)+1))
+	if err != nil {
+		return nil, newFileError("ReadFile", path, err)
+	}
+	if len(data) > p.config.MaxInputSize {
+		return nil, p.inputTooLargeError("ExtractFromFile", len(data))
+	}
 	return data, nil
 }
 
@@ -466,7 +493,7 @@ func (p *Processor) readContained(cleanPath string) ([]byte, error) {
 		}
 		return nil, newFileError("ReadFile", cleanPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // best-effort close of a read-only handle
 
 	realTarget, err := realPath(f)
 	if err != nil {
@@ -487,14 +514,17 @@ func (p *Processor) readContained(cleanPath string) ([]byte, error) {
 
 	// Pre-check size against MaxInputSize on the same verified handle (no
 	// second path resolution, no TOCTOU window) so an oversized file inside
-	// the allowed tree is rejected before io.ReadAll loads it into memory.
+	// the allowed tree is rejected before its contents are loaded into memory.
 	if info, err := f.Stat(); err == nil {
 		if err := p.errFileTooLarge(info.Mode().IsRegular(), info.Size()); err != nil {
 			return nil, err
 		}
 	}
 
-	return io.ReadAll(f)
+	// The Stat pre-check cannot see non-regular files (pipes under the allowed
+	// tree, devices) or growth since the Stat; readBounded enforces the byte
+	// ceiling on the actual read.
+	return p.readBounded(f, cleanPath)
 }
 
 // resolveRealPath opens path, resolves its true on-disk location, and closes it.
@@ -506,16 +536,51 @@ func resolveRealPath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // best-effort close of a read-only handle
 	return realPath(f)
 }
 
 // pathWithin reports whether target is realBase or located beneath it. Both
 // inputs must be cleaned, absolute paths in the same canonical form.
+//
+// On Windows the comparison is ASCII case-insensitive, matching the
+// platform's case-insensitive filesystems (NTFS/FAT/ReFS): a base and target
+// differing only in drive-letter or component casing denote the same
+// location and must not fail containment. Both sides are normally
+// canonicalized by realPath, but casing can still differ across junction
+// boundaries. Other platforms compare byte-exactly, as before.
 func pathWithin(realBase, target string) bool {
 	base := filepath.Clean(realBase)
 	if !strings.HasSuffix(base, string(filepath.Separator)) {
 		base += string(filepath.Separator)
 	}
-	return strings.HasPrefix(filepath.Clean(target)+string(filepath.Separator), base)
+	target = filepath.Clean(target) + string(filepath.Separator)
+	if runtime.GOOS == "windows" {
+		return asciiEqualFoldPrefix(target, base)
+	}
+	return strings.HasPrefix(target, base)
+}
+
+// asciiEqualFoldPrefix reports whether s begins with prefix, comparing bytes
+// case-insensitively for ASCII letters only. Non-ASCII bytes (UTF-8
+// lead/continuation bytes) are compared exactly, so no rune is split or
+// spuriously folded; the prefix boundaries used by pathWithin fall on
+// separator bytes, making the comparison well-defined.
+func asciiEqualFoldPrefix(s, prefix string) bool {
+	if len(s) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		c, p := s[i], prefix[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 32
+		}
+		if p >= 'A' && p <= 'Z' {
+			p += 32
+		}
+		if c != p {
+			return false
+		}
+	}
+	return true
 }

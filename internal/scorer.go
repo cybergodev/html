@@ -351,7 +351,7 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, cc *candi
 		return contentMetrics{}
 	}
 
-	isSkip := node.Type == html.ElementNode && (IsNonContentElement(node.Data) || metricsSkipTags[node.Data] || s.ShouldRemove(node))
+	isSkip := node.Type == html.ElementNode && (IsNonContentElement(node.Data) || metricsSkipTags(node.Data) || s.ShouldRemove(node))
 
 	var m contentMetrics
 	if node.Type == html.ElementNode && !isSkip {
@@ -384,14 +384,7 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, cc *candi
 		// Mirrors collectContentMetrics' text-node handling verbatim so the two
 		// paths cannot diverge (guarded by TestScoreArticleCandidatesMatchesNaiveLoop).
 		data := node.Data
-		dataLen := len(data)
-		hasNBSP := false
-		for i := 0; i+1 < dataLen; i++ {
-			if data[i] == 0xC2 && data[i+1] == 0xA0 {
-				hasNBSP = true
-				break
-			}
-		}
+		hasNBSP := strings.Contains(data, " ")
 		if hasNBSP {
 			data = strings.ReplaceAll(data, " ", " ")
 		}

@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"math/rand"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -279,7 +281,7 @@ func BenchmarkIsVideoURL(b *testing.B) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		for _, url := range urls {
 			IsVideoURL(url)
 		}
@@ -291,7 +293,7 @@ func BenchmarkDetectVideoType(b *testing.B) {
 	url := "https://example.com/video.mp4"
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		DetectVideoType(url)
 	}
 }
@@ -301,7 +303,7 @@ func BenchmarkDetectAudioType(b *testing.B) {
 	url := "https://example.com/audio.mp3"
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		DetectAudioType(url)
 	}
 }
@@ -353,7 +355,7 @@ func BenchmarkHasMediaReference(b *testing.B) {
 	content := "<html><body><p>" + strings.Repeat("the quick brown fox jumps over the lazy dog. ", 2000) + "</p></body></html>"
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = HasMediaReference(content)
 	}
 }
@@ -395,5 +397,131 @@ func TestDetectMediaTypeByExtension(t *testing.T) {
 				t.Errorf("detectMediaTypeByExtension(%q) = %q, want %q", tt.url, got, tt.want)
 			}
 		})
+	}
+}
+
+// oracleVideoRegex / oracleAudioRegex are byte-for-byte copies of the two media
+// URL regexes ScanMediaURLs replaced. They exist only in this test file as the
+// differential-equivalence oracle: the scanner must reproduce FindAllString's
+// matches exactly, forever.
+var (
+	oracleVideoRegex = regexp.MustCompile(`(?i)https?://[^\s<>"',;)}\]]{1,500}\.(?:mp4|webm|ogg|mov|avi|wmv|flv|mkv|m4v|3gp)`)
+	oracleAudioRegex = regexp.MustCompile(`(?i)https?://[^\s<>"',;)}\]]{1,500}\.(?:mp3|wav|ogg|m4a|aac|flac|wma|opus|oga)`)
+)
+
+// scanMediaURLsForTest collects ScanMediaURLs matches into a slice, mirroring
+// FindAllString's collect-at-most-cap semantics.
+func scanMediaURLsForTest(html string, video bool, cap int) []string {
+	var out []string
+	ScanMediaURLs(html, video, cap, func(url string) bool {
+		out = append(out, url)
+		return true
+	})
+	return out
+}
+
+// TestScanMediaURLsMatchesRegex runs the scanner against both oracle regexes on
+// a corpus of hand-picked edge cases (greedy backoff, caps, case folding,
+// disallowed bytes, adjacency) plus deterministic pseudo-random inputs.
+func TestScanMediaURLsMatchesRegex(t *testing.T) {
+	corpus := []string{
+		`<video src="https://cdn.example.com/v/1.mp4"></video>`,
+		`https://x.test/a.mp4`,
+		`HTTPS://X.TEST/A.MP4`,
+		`hTtPs://x.test/a.Mp4?t=1`,
+		`http://x.test/a.mp4#frag`,
+		`https://x.test/a.mp4.mp3`,    // greedy: longest run, rightmost ext
+		`https://x.test/a.mp4zz`,      // ext mid-run, match ends early
+		`https://x.test/a.ogg`,        // in both extension sets
+		`https://x.test/a.oga`,        // audio only
+		`https://x.test/a.mp3`,        // audio only
+		`https://x.test/`,             // empty run: no match
+		`https://<img>`,               // run starts with disallowed byte
+		`https://x`,                   // no dot: no match
+		`https://x.`,                  // dot with nothing after: no match
+		`https://x.mp`,                // incomplete ext: no match
+		`xhttps://a.mp4`,              // match starts at inner h
+		`https://a.mp4https://b.mp3`,  // adjacent URLs, non-overlapping
+		`https://a.mp4;https://b.mp4`, // ';' terminates the run
+		`https://a b.mp4`,             // space terminates the run → no .mp4
+		`see https://cdn/v/1.mp4, and (https://cdn/v/2.webm) ok`,
+		`<a href="https://s.test/t.wav">w</a>`,
+		`https://p.test/dir.d/x.mov?q="quoted"`,
+		`https://p.test/'sq.mp4'`,
+		`https://p.test/)par.mp4(`,
+		`https://p.test/}brace.mp4{`,
+		`https://p.test/]bracket.mp4[`,
+		`https://p.test/\back.mp4`,
+		`https://h.test/` + strings.Repeat("a", 600) + `.mp4`,  // run capped at 500
+		`https://h.test/` + strings.Repeat("ab.", 300) + `mp4`, // many dots, rightmost wins
+		`https://e.test/e.mp4.mp4.mp4`,
+		`no urls here at all`,
+		``,
+		`h h h hthttp://a.mp4`,
+		`httpa://a.mp4`,
+		`https:/a.mp4`,
+		`https://a.M4V`,
+		`https://a.3GP`,
+		`https://a.OPUS`,
+		"\t\nhttps://tabbed.mp4\r\n",
+		`https://mix.test/p.mp4 and https://mix.test/q.mp3 and https://mix.test/r.wav`,
+	}
+	// Deterministic pseudo-random corpus: URL-ish fragments glued together.
+	rng := rand.New(rand.NewSource(1))
+	fragments := []string{
+		"https://", "http://", "hTtP://", "HTTP://", "x.test/", "a", "b.",
+		".mp4", ".mp3", ".wav", ".ogg", ".oga", ".m4v", ".MP4", "z", "<", ">",
+		" ", "\t", "\n", ";", ",", "'", `"`, ")", "}", "]", `\`, "=", "?", "#",
+		"h", "H", "thttp://q.mp4", "ttps://", "s", "//", ".", strings.Repeat("c", 60),
+	}
+	var sb strings.Builder
+	for i := 0; i < 300; i++ {
+		sb.Reset()
+		n := 3 + rng.Intn(25)
+		for j := 0; j < n; j++ {
+			sb.WriteString(fragments[rng.Intn(len(fragments))])
+		}
+		corpus = append(corpus, sb.String())
+	}
+
+	for _, tc := range corpus {
+		for _, video := range []bool{true, false} {
+			oracle := oracleVideoRegex
+			if !video {
+				oracle = oracleAudioRegex
+			}
+			want := oracle.FindAllString(tc, 1000)
+			got := scanMediaURLsForTest(tc, video, 1000)
+			if len(want) != len(got) {
+				t.Fatalf("video=%v corpus=%q: got %d matches %q, want %d %q",
+					video, tc, len(got), got, len(want), want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("video=%v corpus=%q: match %d = %q, want %q (all: %q vs %q)",
+						video, tc, i, got[i], want[i], got, want)
+				}
+			}
+		}
+	}
+}
+
+// TestScanMediaURLsCapAndEarlyStop verifies the match cap mirrors
+// FindAllString's limit and that onURL's false stops the scan.
+func TestScanMediaURLsCapAndEarlyStop(t *testing.T) {
+	html := `https://a.test/1.mp4 https://b.test/2.mp4 https://c.test/3.mp4`
+
+	got := scanMediaURLsForTest(html, true, 2)
+	if len(got) != 2 || got[0] != `https://a.test/1.mp4` || got[1] != `https://b.test/2.mp4` {
+		t.Fatalf("cap=2: got %q", got)
+	}
+
+	var first string
+	ScanMediaURLs(html, true, 1000, func(url string) bool {
+		first = url
+		return false
+	})
+	if first != `https://a.test/1.mp4` {
+		t.Fatalf("early stop: first callback saw %q", first)
 	}
 }

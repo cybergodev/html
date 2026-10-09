@@ -60,12 +60,16 @@ func (e *InputError) Error() string {
 	return fmt.Sprintf("html: %s failed: input too large (size=%d, max=%d)", e.Op, e.Size, e.MaxSize)
 }
 
-// Unwrap returns the underlying error for errors.Is() support.
-func (e *InputError) Unwrap() error {
-	if e.InputErr != nil {
-		return e.InputErr
+// Unwrap returns the wrapped errors for errors.Is()/errors.As() support.
+// When an underlying InputErr is present it is returned alongside
+// ErrInputTooLarge, so errors.Is(err, ErrInputTooLarge) holds for every
+// *InputError — including ones carrying a read failure — matching the
+// type's documented contract.
+func (e *InputError) Unwrap() []error {
+	if e.InputErr == nil {
+		return []error{ErrInputTooLarge}
 	}
-	return ErrInputTooLarge
+	return []error{e.InputErr, ErrInputTooLarge}
 }
 
 // newInputError creates a new InputError with the provided details.

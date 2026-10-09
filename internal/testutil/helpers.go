@@ -119,7 +119,7 @@ func NewTestProcessor(t *testing.T, cfg ...html.Config) *html.Processor {
 	}
 
 	t.Cleanup(func() {
-		p.Close()
+		_ = p.Close()
 	})
 
 	return p

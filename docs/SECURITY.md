@@ -103,7 +103,7 @@ cfg.EnableSanitization = true // Default: true
 - **Blocked Schemes**: `javascript:`, `vbscript:`, `file:`
 - **Validated Schemes**: `data:` URLs validated for size (100,000 bytes max), safe content, and media type whitelist
 - **Additional Protection**: NFC Unicode normalization and fullwidth character normalization to prevent bypass attacks
-- **SVG Block**: `image/svg+xml` data URLs explicitly blocked
+- **SVG Block**: `image/svg+xml` data URLs explicitly blocked — by the DOM sanitizer *and* by `IsValidURL`, which gates the non-sanitizing paths (`ExtractAllLinks`, the raw-HTML media scan); both enforce the same `safeMediaTypes` whitelist via the shared `dataURLMediaType` extraction
 
 #### 3. Resource Exhaustion
 
@@ -113,6 +113,8 @@ cfg.EnableSanitization = true // Default: true
   - Input size limits (50MB default)
   - Cache size limits with automatic eviction
   - Efficient string builders with pre-allocated capacity
+  - File reads hard-capped at `MaxInputSize+1` bytes (`readBounded`), bounding non-regular files (FIFOs, devices) and Stat→read growth the size pre-check cannot see
+  - Audit log entries capped (`AuditConfig.MaxEntries`, default 10,000) with drop-oldest-half eviction; `AuditEntry.URL` truncated to 256 chars on every record
   - No unbounded allocations
 
 **Regex DoS (ReDoS)**
@@ -148,7 +150,7 @@ if len(htmlContent) <= maxHTMLForRegex {
 
 **Hash Collision Attacks**
 - **Threat**: Crafted inputs produce same cache key, causing incorrect results
-- **Mitigation**: xxHash-style non-cryptographic hash with 128-bit (16-byte) output for cache keys (effective collision resistance ~64 bits; the second 8 bytes are deterministically derived from the first 8, providing output-space separation but not doubling collision entropy)
+- **Mitigation**: Non-cryptographic `hash/maphash` digest (AES-NI accelerated; seeded randomly per process for hash-flooding resistance) with 128-bit (16-byte) output for cache keys (effective collision resistance ~64 bits; the second 8 bytes are derived from the first 8 via a splitmix64 finalizer, providing output-space separation but not doubling collision entropy)
 - **Key generation**: Config flags + format options + content (with 5-point sampling for large documents)
 - **Large document handling**: Multi-point sampling (5 regions) for documents exceeding 64KB ensures modifications anywhere in the document are detected
 
@@ -163,17 +165,15 @@ if len(htmlContent) <= maxHTMLForRegex {
 The library uses `unsafe` in a limited number of locations for performance-critical operations:
 
 1. **`internal/unsafe.go`** - Zero-allocation string/bytes conversions:
-   - `StringToBytes(s string) []byte` - Read-only conversion for cache key generation and hashing
+   - `StringToBytes(s string) []byte` - Read-only conversion used by charset detection in `internal/encoding.go`
    - `BytesToString(b []byte) string` - For encoding detection output
    - Both functions require callers to respect the read-only contract (documented in function comments)
    - Safe memory-isolated encoding conversion is available via `DetectAndConvertToUTF8StringSafe` in `internal/encoding.go`
 
-2. **`cachekey.go`** - Cache key hashing performance:
-   - `hashMixBytesInline` uses `unsafe.Pointer` and `unsafe.Add` for 8-byte/32-byte block processing in the xxHash-style hash function
-   - Read-only operation on byte slices from `StringToBytes` (which are backed by immutable strings)
-
-3. **`internal/encoding.go`** - Encoding detection:
+2. **`internal/encoding.go`** - Encoding detection:
    - Uses `unsafe.Pointer` for performance-critical byte processing during character encoding detection
+
+(`cachekey.go` previously used `unsafe` in a hand-rolled xxHash-style hash; it now hashes with `hash/maphash` and contains no `unsafe` operations.)
 
 **Safety Properties**:
 - All unsafe operations are read-only (no mutation of underlying data)
@@ -199,7 +199,7 @@ The library uses `unsafe` in a limited number of locations for performance-criti
 **Misleading Links**
 - **Scope**: Library preserves link text and URLs without validation
 - **Responsibility**: Application must verify link destinations
-- **Detection**: Use `LinkInfo.IsExternal` to identify external links
+- **Detection**: `LinkInfo.IsExternal` is true for absolute (http/https or protocol-relative) URLs — including same-domain ones — and false for relative URLs; compare hosts yourself for a strict external-link check
 
 #### 2. Privacy Concerns
 
@@ -448,8 +448,9 @@ go mod verify
 If you discover a security vulnerability, please follow responsible disclosure:
 
 1. **Do Not** open a public GitHub issue
-2. **Email** security concerns to: [security contact - to be added]
-3. **Include**:
+2. **Preferred**: use [Private Vulnerability Reporting](https://github.com/cybergodev/html/security/advisories/new) — enable it in *Settings → Code security and analysis* if not yet active
+3. Alternatively, **email** security concerns to: `[security email - to be configured by maintainer]`
+4. **Include**:
    - Description of the vulnerability
    - Steps to reproduce
    - Potential impact
@@ -473,7 +474,7 @@ Security fixes are released as:
 
 ### Automated Testing
 
-The library includes comprehensive security-focused tests with **84%+ code coverage** (main package; internal packages exceed 87%):
+The library includes comprehensive security-focused tests with **~90% code coverage** (main package; internal packages exceed 91%):
 
 ```bash
 # Run all tests including security tests
@@ -482,8 +483,8 @@ go test -v ./...
 # Run with race detector
 go test -race ./...
 
-# Run concurrency stress tests
-go test -v -run TestStress
+# Run concurrency tests
+go test -v -run TestConcurrent
 
 # Run with coverage
 go test -cover ./...
@@ -564,6 +565,28 @@ func FuzzExtract(f *testing.F) {
 > This section highlights security-relevant changes per release. For the complete
 > change history (features, performance, bug fixes), see [CHANGES.md](../CHANGES.md).
 
+### v1.4.7 (2026-08-11)
+
+- Cache keys now use `hash/maphash` (AES-NI, per-process random seed) instead of a hand-rolled xxHash — offline collision precomputation is no longer possible
+- Cache keys are generated from raw input bytes before encoding detection, and the `Encoding` setting is mixed into the key, preventing collisions across forced-encoding configurations
+
+### v1.4.6 (2026-07-22)
+
+- `IsValidURL` blocks `javascript:`/`vbscript:`/`file:` schemes (including disguised forms: leading control/space, embedded tab, uppercase, `.mp4`-suffix) on sanitizer-bypass paths (`ExtractAllLinks`, raw-HTML media scan)
+- `ExtractFromFile` pre-reads `Stat` and rejects oversized files, preventing memory exhaustion from untrusted paths
+- `isSafeURIWithAudit` strips leading/trailing C0 controls and internal tab/LF/CR before scheme detection, closing an XSS-class bypass (`\x01javascript:`, `java&#9;script:`)
+- `AuditSink.Close` panics are now recovered, matching the `Record`/`Write` protection
+- HTML entity decoding is bounded to `maxEntityScanLen`, closing an O(N²) CPU-exhaustion DoS reachable from any text node via runs of bare `&`
+- `DetectCharsetSmart` now honors `ForcedEncoding`/`Config.Encoding` even with smart detection enabled
+
+### v1.4.5 (2026-07-08)
+
+- `AllowedBaseDir` containment now resolves symlinks and Windows junctions via a handle-based, TOCTOU-free check, closing a bypass where an in-tree reparse point pointing outside the allowed dir was followed by `os.ReadFile`
+- Package-level entry points (`Extract*`, `ExtractAllLinks`, `ExtractBatch*`) now recover a pool-`New` panic and return `ErrInternalPanic` instead of letting it escape to callers
+- Data URLs with an empty media type (`data:;base64,...`) are now rejected — previously arbitrary base64 payload bypassed the safe-MIME whitelist
+- Table `colspan`/`rowspan` clamped to 1000 (HTML spec ceiling) to close a memory-exhaustion vector; oversized non-data URIs are now sanitized/rejected before emission
+- Pooled `[]byte`/node-slice buffers above 64 KiB / 8192 entries are no longer retained in `sync.Pool`, eliminating the retention footgun where one multi-MB buffer was reused for every later small request
+
 ### v1.4.4 (2026-06-26)
 - `ExtractAllLinks` and link extraction now honor `ProcessingTimeout` via cooperative cancellation; a fired deadline surfaces as `ErrProcessingTimeout` instead of running to completion — DoS hardening for the link path
 - Zero-byte cache-key sentinel replaced with an explicit `hasCacheKey` flag — a legitimately all-zero hash was previously treated as "no key" (cache-integrity fix)
@@ -596,7 +619,7 @@ func FuzzExtract(f *testing.F) {
 - Defense-in-depth for fast-path vulnerabilities (S-06 to S-16)
 - Enhanced numeric entity validation prevents DoS via long strings
 - Improved cache key collision resistance (5-point sampling)
-- `maxWalkDepth` (50,000 nodes) prevents memory exhaustion attacks
+- `maxWalkDepth` (50,000 nodes) prevents memory exhaustion attacks (since renamed to `maxWalkNodes` and documented as a total visited-node limit)
 
 ### v1.3.0 (2026-03-03)
 - Library confirmed fully thread-safe (100+ race detection iterations)

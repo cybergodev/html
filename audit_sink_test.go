@@ -11,11 +11,15 @@ package html
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/cybergodev/html/internal"
 	stdxhtml "golang.org/x/net/html"
 )
 
@@ -73,7 +77,7 @@ func TestChannelAuditSinkDroppedCount(t *testing.T) {
 	t.Parallel()
 
 	sink := NewChannelAuditSink(1) // buffer of 1
-	defer sink.Close()
+	defer func() { _ = sink.Close() }()
 
 	// First Write fills the buffer; subsequent Writes are dropped.
 	sink.Write(AuditEntry{EventType: AuditEventBlockedTag, Message: "0"})
@@ -167,7 +171,7 @@ func TestFilteredSink(t *testing.T) {
 
 		s2 := NewFilteredSink(nil, nil)
 		s2.Write(AuditEntry{}) // nil underlying sink — must not panic
-		s2.Close()
+		_ = s2.Close()
 	})
 }
 
@@ -228,7 +232,7 @@ func TestLevelFilteredSink(t *testing.T) {
 
 		s2 := NewLevelFilteredSink(nil, AuditLevelWarning)
 		s2.Write(AuditEntry{Level: AuditLevelCritical}) // nil underlying sink
-		s2.Close()
+		_ = s2.Close()
 	})
 }
 
@@ -250,7 +254,7 @@ func TestRecordEncodingIssue(t *testing.T) {
 			LogEncodingIssues: true,
 		}
 		c := newAuditCollector(cfg)
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordEncodingIssue("windows-1252", "fallback encoding used")
 
@@ -274,7 +278,7 @@ func TestRecordEncodingIssue(t *testing.T) {
 			LogEncodingIssues: false,
 		}
 		c := newAuditCollector(cfg)
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordEncodingIssue("utf-8", "test")
 		if got := len(c.GetEntries()); got != 0 {
@@ -290,7 +294,7 @@ func TestRecordEncodingIssue(t *testing.T) {
 			LogEncodingIssues: true,
 		}
 		c := newAuditCollector(cfg)
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordEncodingIssue("utf-8", "test")
 		if got := len(c.GetEntries()); got != 0 {
@@ -333,7 +337,7 @@ func TestWriterAuditSinkWriteError(t *testing.T) {
 
 	var buf bytes.Buffer
 	sink := NewWriterAuditSink(&buf)
-	defer sink.Close()
+	defer func() { _ = sink.Close() }()
 
 	// This entry has a valid structure — Marshal should succeed and the output
 	// should be non-empty. The marshal-error branch is hard to hit because
@@ -375,7 +379,7 @@ func TestAuditRecorderAdapterViaExtraction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// HTML with dangerous content that triggers sanitization audit events.
 	dangerousHTML := []byte(`<html><body>
@@ -416,7 +420,7 @@ func TestAuditRecorderAdapterNilCollector(t *testing.T) {
 	t.Parallel()
 
 	a := &auditRecorderAdapter{collector: nil}
-	a.RecordBlockedTag("script")   // must not panic
+	a.RecordBlockedTag("script") // must not panic
 	a.RecordBlockedAttr("onclick", "evil()")
 	a.RecordBlockedURL("javascript:alert(1)", "xss")
 }
@@ -428,7 +432,7 @@ func TestAuditCollectorWait(t *testing.T) {
 	t.Run("non-nil collector", func(t *testing.T) {
 		t.Parallel()
 		c := newAuditCollector(AuditConfig{Enabled: true})
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		c.Wait() // non-nil path
 	})
 
@@ -448,7 +452,7 @@ func TestAuditCollectorRecordPathTraversal(t *testing.T) {
 		t.Parallel()
 		cfg := AuditConfig{Enabled: true, LogPathTraversal: true}
 		c := newAuditCollector(cfg)
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordPathTraversal("../../../etc/passwd")
 		entries := c.GetEntries()
@@ -464,7 +468,7 @@ func TestAuditCollectorRecordPathTraversal(t *testing.T) {
 		t.Parallel()
 		cfg := AuditConfig{Enabled: true, LogPathTraversal: false}
 		c := newAuditCollector(cfg)
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordPathTraversal("../../../etc/passwd")
 		if len(c.GetEntries()) != 0 {
@@ -487,7 +491,7 @@ func TestAuditCollectorRecordTimeout(t *testing.T) {
 		t.Parallel()
 		cfg := AuditConfig{Enabled: true, LogTimeouts: true}
 		c := newAuditCollector(cfg)
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordTimeout(5 * time.Second)
 		if len(c.GetEntries()) != 1 {
@@ -499,7 +503,7 @@ func TestAuditCollectorRecordTimeout(t *testing.T) {
 		t.Parallel()
 		cfg := AuditConfig{Enabled: true, LogTimeouts: false}
 		c := newAuditCollector(cfg)
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordTimeout(time.Second)
 		if len(c.GetEntries()) != 0 {
@@ -528,7 +532,7 @@ func TestProcessorAuditMethodsWithAuditEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Trigger a blocked tag so audit entries exist.
 	_, _ = p.Extract([]byte(`<html><body><script>x</script><p>ok</p></body></html>`))
@@ -558,7 +562,7 @@ func TestProcessorDetectEncodingError(t *testing.T) {
 	t.Run("valid encoding works", func(t *testing.T) {
 		t.Parallel()
 		p, _ := New()
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		// Normal UTF-8 input should succeed.
 		s, err := p.detectEncoding([]byte(`<html><body><p>hello</p></body></html>`))
@@ -579,7 +583,7 @@ func TestProcessorDetectEncodingError(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() failed: %v", err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		// Non-ASCII bytes with an invalid encoding should trigger the error path.
 		_, extractErr := p.Extract([]byte("<html><body>\xff\xfe\x00\x01</body></html>"))
@@ -603,7 +607,7 @@ func TestProcessorDetectEncodingError(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() failed: %v", err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		// Feed non-ASCII bytes to trigger the conversion error path.
 		_, _ = p.Extract([]byte("<html><body>\xff\xfe\x00\x01test</body></html>"))
@@ -633,7 +637,7 @@ func TestAuditCollectorRecordBlockedAttr(t *testing.T) {
 	t.Run("records when enabled", func(t *testing.T) {
 		t.Parallel()
 		c := newAuditCollector(AuditConfig{Enabled: true, LogBlockedAttrs: true})
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordBlockedAttr("onclick", "evil()")
 		if len(c.GetEntries()) != 1 {
@@ -644,7 +648,7 @@ func TestAuditCollectorRecordBlockedAttr(t *testing.T) {
 	t.Run("no-op when disabled", func(t *testing.T) {
 		t.Parallel()
 		c := newAuditCollector(AuditConfig{Enabled: true, LogBlockedAttrs: false})
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordBlockedAttr("onclick", "evil()")
 		if len(c.GetEntries()) != 0 {
@@ -660,7 +664,7 @@ func TestAuditCollectorRecordBlockedURL(t *testing.T) {
 	t.Run("records when enabled", func(t *testing.T) {
 		t.Parallel()
 		c := newAuditCollector(AuditConfig{Enabled: true, LogBlockedURLs: true})
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordBlockedURL("javascript:alert(1)", "xss")
 		if len(c.GetEntries()) != 1 {
@@ -671,7 +675,7 @@ func TestAuditCollectorRecordBlockedURL(t *testing.T) {
 	t.Run("no-op when disabled", func(t *testing.T) {
 		t.Parallel()
 		c := newAuditCollector(AuditConfig{Enabled: true, LogBlockedURLs: false})
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordBlockedURL("javascript:alert(1)", "xss")
 		if len(c.GetEntries()) != 0 {
@@ -687,7 +691,7 @@ func TestAuditCollectorRecordDepthViolation(t *testing.T) {
 	t.Run("records when enabled", func(t *testing.T) {
 		t.Parallel()
 		c := newAuditCollector(AuditConfig{Enabled: true, LogDepthViolations: true})
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordDepthViolation(100, 50)
 		if len(c.GetEntries()) != 1 {
@@ -698,7 +702,7 @@ func TestAuditCollectorRecordDepthViolation(t *testing.T) {
 	t.Run("no-op when disabled", func(t *testing.T) {
 		t.Parallel()
 		c := newAuditCollector(AuditConfig{Enabled: true, LogDepthViolations: false})
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		c.RecordDepthViolation(100, 50)
 		if len(c.GetEntries()) != 0 {
@@ -726,7 +730,7 @@ func TestScorerAdapterCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	_, _ = p.Extract([]byte(`<html><body>
 		<nav><a href="/">Home</a></nav>
@@ -821,6 +825,343 @@ func TestScorerAdapterDirect(t *testing.T) {
 		s := &scorerAdapter{external: &removingScorer{}}
 		if s.ShouldRemove(nil) {
 			t.Error("ShouldRemove(nil) should return false")
+		}
+	})
+}
+
+// TestAuditCollectorRecordRawValueTruncation pins the IncludeRawValues branch
+// of auditCollector.Record at its boundaries (audit.go): the length cap, the
+// rune-safe back-off (a cut must not split a multi-byte UTF-8 rune), and the
+// entity-safe back-off (a cut must not split an &...; escape introduced by
+// sanitizeRawValue). These branches are unreachable through extraction-level
+// tests because sanitization raw values are short.
+func TestAuditCollectorRecordRawValueTruncation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		maxLen      int
+		rawValue    string
+		wantRawTail string // expected RawValue after sanitize + truncate
+	}{
+		{
+			name:        "short value passes through sanitized",
+			maxLen:      200,
+			rawValue:    "plain value",
+			wantRawTail: "plain value",
+		},
+		{
+			name:        "exact length boundary is not truncated",
+			maxLen:      4,
+			rawValue:    "abcd",
+			wantRawTail: "abcd",
+		},
+		{
+			name:        "cut backs off to rune boundary",
+			maxLen:      2,
+			rawValue:    "héllo", // é is 2 bytes; cut at byte 2 splits it
+			wantRawTail: "h...",
+		},
+		{
+			name:        "cut backs off in front of split entity",
+			maxLen:      3,
+			rawValue:    "a&b", // sanitized to "a&amp;b"; cut at 3 would split "&amp;"
+			wantRawTail: "a...",
+		},
+		{
+			name:        "zero max length disables truncation",
+			maxLen:      0,
+			rawValue:    "abc&<>",
+			wantRawTail: "abc&amp;&lt;&gt;",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := AuditConfig{
+				Enabled:            true,
+				IncludeRawValues:   true,
+				MaxRawValueLength:  tt.maxLen,
+				LogInputViolations: true,
+			}
+			c := newAuditCollector(cfg)
+			defer func() { _ = c.Close() }()
+
+			c.Record(AuditEntry{EventType: AuditEventInputViolation, RawValue: tt.rawValue})
+
+			entries := c.GetEntries()
+			if len(entries) != 1 {
+				t.Fatalf("expected 1 entry, got %d", len(entries))
+			}
+			if got := entries[0].RawValue; got != tt.wantRawTail {
+				t.Errorf("RawValue = %q, want %q", got, tt.wantRawTail)
+			}
+		})
+	}
+
+	t.Run("raw value stripped when IncludeRawValues is false", func(t *testing.T) {
+		t.Parallel()
+		cfg := AuditConfig{Enabled: true, IncludeRawValues: false, LogInputViolations: true}
+		c := newAuditCollector(cfg)
+		defer func() { _ = c.Close() }()
+
+		c.Record(AuditEntry{EventType: AuditEventInputViolation, RawValue: "secret-value"})
+
+		entries := c.GetEntries()
+		if len(entries) != 1 {
+			t.Fatalf("expected 1 entry, got %d", len(entries))
+		}
+		if got := entries[0].RawValue; got != "" {
+			t.Errorf("RawValue = %q, want empty when IncludeRawValues=false", got)
+		}
+	})
+
+	t.Run("Record is a no-op when disabled", func(t *testing.T) {
+		t.Parallel()
+		cfg := AuditConfig{Enabled: false}
+		c := newAuditCollector(cfg)
+		defer func() { _ = c.Close() }()
+
+		c.Record(AuditEntry{EventType: AuditEventBlockedTag})
+		if entries := c.GetEntries(); len(entries) != 0 {
+			t.Errorf("expected 0 entries when disabled, got %d", len(entries))
+		}
+	})
+
+	t.Run("Record on nil collector is safe", func(t *testing.T) {
+		t.Parallel()
+		var c *auditCollector
+		c.Record(AuditEntry{EventType: AuditEventBlockedTag})
+	})
+}
+
+// TestChannelAuditSinkWriteAfterClose pins the isClosed guard of
+// ChannelAuditSink.Write: writes after Close are silently ignored (no drop
+// counted, no send on a closed channel).
+func TestChannelAuditSinkWriteAfterClose(t *testing.T) {
+	t.Parallel()
+
+	sink := NewChannelAuditSink(10)
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+
+	sink.Write(AuditEntry{EventType: AuditEventBlockedTag, Message: "late"}) // must not panic
+	if got := sink.DroppedCount(); got != 0 {
+		t.Errorf("DroppedCount() = %d, want 0 (post-close writes are ignored, not dropped)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Audit entry bounding (GEN-001 security fixes)
+// ---------------------------------------------------------------------------
+
+// TestAuditRecordTruncatesURL verifies Record truncates AuditEntry.URL as the
+// last line of defense: data URLs are exempt from MaxURLLength upstream, and a
+// recording site that forgets internal.TruncateAuditURL must not be able to
+// flood the in-memory log or any sink with an arbitrarily large value.
+func TestAuditRecordTruncatesURL(t *testing.T) {
+	t.Parallel()
+
+	collector := newAuditCollector(AuditConfig{
+		Enabled:        true,
+		LogBlockedURLs: true,
+		Sink:           NewWriterAuditSink(io.Discard),
+	})
+	defer func() { _ = collector.Close() }()
+
+	huge := strings.Repeat("A", 10_000)
+	collector.RecordBlockedURL(huge, "test")
+
+	entries := collector.GetEntries()
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(entries))
+	}
+	if got, want := entries[0].URL, internal.TruncateAuditURL(huge); got != want {
+		t.Errorf("entry.URL = %d bytes, want the truncated form (%d bytes)", len(got), len(want))
+	}
+	if !strings.HasSuffix(entries[0].URL, "...[truncated]") {
+		t.Error("entry.URL should carry the truncation marker")
+	}
+}
+
+// TestAuditCollectorMaxEntriesEviction verifies the retention cap: when full,
+// the oldest half of the entries are dropped in one move and the most recent
+// events survive in order.
+func TestAuditCollectorMaxEntriesEviction(t *testing.T) {
+	t.Parallel()
+
+	collector := newAuditCollector(AuditConfig{
+		Enabled:        true,
+		LogBlockedTags: true,
+		MaxEntries:     4,
+		Sink:           NewWriterAuditSink(io.Discard),
+	})
+	defer func() { _ = collector.Close() }()
+
+	for i := 0; i < 5; i++ {
+		collector.RecordBlockedTag(fmt.Sprintf("tag-%d", i))
+	}
+
+	entries := collector.GetEntries()
+	// Records 1..4 fill the cap; record 5 evicts the oldest half (2), leaving 3.
+	if len(entries) != 3 {
+		t.Fatalf("got %d entries, want 3", len(entries))
+	}
+	for i, want := range []string{"tag-2", "tag-3", "tag-4"} {
+		if entries[i].Tag != want {
+			t.Errorf("entries[%d].Tag = %q, want %q", i, entries[i].Tag, want)
+		}
+	}
+}
+
+// TestAuditCollectorZeroMaxEntriesUsesDefault verifies a zero MaxEntries
+// (hand-built AuditConfig literals) falls back to the default cap instead of
+// silently disabling retention.
+func TestAuditCollectorZeroMaxEntriesUsesDefault(t *testing.T) {
+	t.Parallel()
+
+	collector := newAuditCollector(AuditConfig{Enabled: true})
+	if collector.maxEntries != DefaultMaxAuditEntries {
+		t.Errorf("maxEntries = %d, want default %d", collector.maxEntries, DefaultMaxAuditEntries)
+	}
+}
+
+// TestConfigValidateAuditMaxEntries covers the Audit.MaxEntries bounds.
+func TestConfigValidateAuditMaxEntries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		maxEntries int
+		wantErr    bool
+	}{
+		{"zero uses default", 0, false},
+		{"one", 1, false},
+		{"upper bound", 100000, false},
+		{"negative", -1, true},
+		{"above upper bound", 100001, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := DefaultConfig()
+			cfg.Audit.MaxEntries = tt.maxEntries
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var cfgErr *ConfigError
+				if !errors.As(err, &cfgErr) || cfgErr.Field != "Audit.MaxEntries" {
+					t.Errorf("error should be a *ConfigError on Audit.MaxEntries, got %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestChannelAuditSinkConcurrentWriteClose drives Write against Close from
+// many goroutines at once. The RLock/isClosed/Lock ordering in Write and Close
+// makes a send on a closed channel impossible; a regression in that ordering
+// panics here ("send on closed channel") and the race detector cross-checks
+// the bookkeeping. Concurrent Close calls must also stay idempotent.
+func TestChannelAuditSinkConcurrentWriteClose(t *testing.T) {
+	t.Parallel()
+
+	const writers = 8
+	const writesEach = 500
+
+	sink := NewChannelAuditSink(64)
+	consumerDone := make(chan struct{})
+	received := 0
+	go func() {
+		defer close(consumerDone)
+		for range sink.Channel() {
+			received++
+		}
+	}()
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			for j := 0; j < writesEach; j++ {
+				sink.Write(AuditEntry{EventType: AuditEventBlockedTag, Message: "x"})
+			}
+		}(i)
+	}
+	// Closers race the writers and each other; double Close must be a no-op.
+	var closeWg sync.WaitGroup
+	closeWg.Add(1)
+	go func() {
+		defer closeWg.Done()
+		<-start
+		for i := 0; i < 10; i++ {
+			if err := sink.Close(); err != nil {
+				t.Errorf("Close() = %v, want nil", err)
+			}
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+	closeWg.Wait()
+	<-consumerDone
+
+	if got := sink.DroppedCount(); got < 0 {
+		t.Errorf("DroppedCount() = %d, want >= 0", got)
+	}
+}
+
+// TestSEC003SinkConstructorsNoPanic pins the panic-protection contract on the
+// audit sink constructors: public API must not panic on hostile caller input
+// (a negative channel buffer size previously reached make(chan, -1), and a nil
+// writer produced a logger that dereferenced nil on every Write).
+func TestSEC003SinkConstructorsNoPanic(t *testing.T) {
+	t.Parallel()
+
+	t.Run("negative channel buffer is clamped", func(t *testing.T) {
+		t.Parallel()
+		sink := NewChannelAuditSink(-5)
+		defer func() { _ = sink.Close() }() // best-effort cleanup
+		// Unbuffered: a write with no consumer would drop only when full;
+		// with capacity 0 and no consumer the non-blocking send drops.
+		sink.Write(AuditEntry{EventType: AuditEventBlockedTag, Message: "x"})
+		if got := sink.DroppedCount(); got != 1 {
+			t.Errorf("DroppedCount() = %d, want 1 on an unbuffered unconsumed channel", got)
+		}
+	})
+
+	t.Run("nil logger writer falls back to stderr", func(t *testing.T) {
+		t.Parallel()
+		sink := NewLoggerAuditSinkWithWriter(nil)
+		if sink == nil {
+			t.Fatal("sink is nil")
+		}
+		sink.Write(AuditEntry{EventType: AuditEventBlockedTag, Message: "x"}) // must not panic
+		if err := sink.Close(); err != nil {
+			t.Errorf("Close() = %v, want nil", err)
+		}
+	})
+
+	t.Run("nil ChannelAuditSink receiver methods", func(t *testing.T) {
+		t.Parallel()
+		var sink *ChannelAuditSink
+		if ch := sink.Channel(); ch != nil {
+			t.Error("Channel() on nil sink = non-nil channel, want nil")
+		}
+		sink.Write(AuditEntry{}) // no-op, must not panic
+		if err := sink.Close(); err != nil {
+			t.Errorf("Close() = %v, want nil", err)
+		}
+		if got := sink.DroppedCount(); got != 0 {
+			t.Errorf("DroppedCount() = %d, want 0", got)
 		}
 	})
 }

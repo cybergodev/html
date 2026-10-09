@@ -461,7 +461,7 @@ func BenchmarkGetTextContent(b *testing.B) {
 	doc, _ := html.Parse(strings.NewReader(`<html><body><p>Hello World</p><p>More text</p></body></html>`))
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		GetTextContent(doc)
 	}
 }
@@ -469,7 +469,7 @@ func BenchmarkGetTextContent(b *testing.B) {
 func BenchmarkCleanText(b *testing.B) {
 	text := "Hello    World\n\nWith   multiple   spaces"
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		CleanText(text)
 	}
 }
@@ -516,7 +516,7 @@ func TestIsValidURL(t *testing.T) {
 		{"https URL", "https://example.com/path", true},
 		{"URL with query", "/path?query=value", true},
 		{"URL with fragment", "/path#section", true},
-		{"data URL small", "data:text/plain;base64,SGVsbG8=", true},
+		{"data URL small", "data:image/png;base64,SGVsbG8=", true},
 		{"protocol relative", "//example.com/path", true},
 		{"URL with port", "http://example.com:8080/path", true},
 		{"dot relative path", "./image.png", true},
@@ -577,7 +577,7 @@ func TestIsValidURLDataURIs(t *testing.T) {
 
 	t.Run("valid data URIs", func(t *testing.T) {
 		validDataURIs := []string{
-			"data:text/plain,Hello",
+			"data:image/png,Hello",
 			"data:image/png;base64,iVBORw0KGgo=",
 		}
 
@@ -594,6 +594,16 @@ func TestIsValidURLDataURIs(t *testing.T) {
 			"data:text/plain,\x01",                     // control character
 			"data:text/html,<h1>Hello</h1>",            // contains < and >
 			"data:image/svg+xml,<svg></svg>",           // contains < and >
+			// Non-whitelisted media types are rejected even when the charset
+			// scan alone would pass — IsValidURL enforces the sanitizer's
+			// safeMediaTypes policy (svg/text execute when rendered).
+			"data:image/svg+xml,%3Csvg%20onload%3Dalert(1)%3E", // percent-encoded SVG, no raw <>"'
+			"data:text/html,%3Cscript%3Ealert(1)%3C/script%3E", // percent-encoded HTML
+			"data:text/plain,Hello",                            // not in safeMediaTypes
+			"data:text/css;base64,Ym9keXt9",                    // not in safeMediaTypes
+			"data:,Hello",                                      // missing media type
+			"data:;base64,SGVsbG8=",                            // missing media type
+			"data:image/png;base64SGVsbG8=",                    // no comma — malformed
 		}
 
 		for _, uri := range invalidDataURIs {
@@ -871,5 +881,35 @@ func TestIsValidURL_HTTPSchemeCaseInsensitive(t *testing.T) {
 		if !IsValidURL(u) {
 			t.Errorf("IsValidURL(%q) = false, want true (scheme is case-insensitive)", u)
 		}
+	}
+}
+
+// TestCleanTextClassificationRewrite pins the equivalence seams of the
+// vectorized classification scan: each flag's trigger shapes and, critically,
+// the NBSP→space rewrite creating a NEW adjacent-space pair that the per-line
+// compression pass must still collapse (anyCompressible re-evaluation).
+func TestCleanTextClassificationRewrite(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ name, in, want string }{
+		{"nbsp alone", "a b", "a b"},
+		{"nbsp then space becomes a pair", "x  y", "x y"},
+		{"space then nbsp becomes a pair", "x  y", "x y"},
+		{"nbsp across lines", "l1\n \nl2", "l1\n\nl2"},
+		{"ampersand only", "Tom & Jerry", "Tom & Jerry"},
+		{"entity with newlines", "a &amp;\nb", "a &\nb"},
+		{"checkbox glyphs", "a☒b☐c☑d", "a[X]b[ ]c[X]d"},
+		{"trailing space on sole line", "word  ", "word"},
+		{"double space no newline", "a  b", "a b"},
+		{"tab no newline", "a\tb", "a b"},
+		{"uppercase entity path", "A&amp;B", "A&B"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := CleanText(tt.in); got != tt.want {
+				t.Errorf("CleanText(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }

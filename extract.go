@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cybergodev/html/internal"
 	stdxhtml "golang.org/x/net/html"
@@ -69,6 +70,18 @@ func escapeMarkdownText(s string) string {
 	return s
 }
 
+// escapeMarkdownURLDest percent-encodes the parentheses in a Markdown
+// link/image destination. An unescaped ')' would terminate the destination
+// early and spill the rest of the URL into rendered text. Percent-encoding —
+// rather than backslash-escaping — keeps the destination a valid URL that
+// survives copy-paste. Fast path: most destinations contain no parentheses.
+func escapeMarkdownURLDest(url string) string {
+	if !strings.ContainsAny(url, "()") {
+		return url
+	}
+	return strings.ReplaceAll(strings.ReplaceAll(url, "(", "%28"), ")", "%29")
+}
+
 // Timeout goroutine management constants.
 // These prevent goroutine leaks when many timeout operations occur.
 const (
@@ -123,11 +136,7 @@ func recoverPanic[T any](fn func() (T, error)) (result T, err error) {
 // more than one Config is provided and ErrInvalidConfig (wrapped in *ConfigError)
 // if the supplied configuration is invalid.
 func Extract(htmlBytes []byte, cfg ...Config) (*Result, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return nil, err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (*Result, error) {
+	return withConfig(cfg, func(p *Processor) (*Result, error) {
 		return p.Extract(htmlBytes)
 	})
 }
@@ -145,11 +154,7 @@ func Extract(htmlBytes []byte, cfg ...Config) (*Result, error) {
 // *FileError wrapping ErrFileNotFound, ErrInvalidFilePath, or a path-traversal
 // rejection (see Config.AllowedBaseDir).
 func ExtractFromFile(filePath string, cfg ...Config) (*Result, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return nil, err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (*Result, error) {
+	return withConfig(cfg, func(p *Processor) (*Result, error) {
 		return p.ExtractFromFile(filePath)
 	})
 }
@@ -167,11 +172,7 @@ func ExtractFromFile(filePath string, cfg ...Config) (*Result, error) {
 //
 // Returns the same errors as [Extract].
 func ExtractText(htmlBytes []byte, cfg ...Config) (string, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return "", err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (string, error) {
+	return withConfig(cfg, func(p *Processor) (string, error) {
 		return p.ExtractText(htmlBytes)
 	})
 }
@@ -187,11 +188,7 @@ func ExtractText(htmlBytes []byte, cfg ...Config) (string, error) {
 //
 // Returns the same errors as [ExtractFromFile].
 func ExtractTextFromFile(filePath string, cfg ...Config) (string, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return "", err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (string, error) {
+	return withConfig(cfg, func(p *Processor) (string, error) {
 		return p.ExtractTextFromFile(filePath)
 	})
 }
@@ -204,11 +201,7 @@ func ExtractTextFromFile(filePath string, cfg ...Config) (string, error) {
 //
 // Returns the same errors as [ExtractWithContext].
 func ExtractTextWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return "", err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (string, error) {
+	return withConfig(cfg, func(p *Processor) (string, error) {
 		return p.ExtractTextWithContext(ctx, htmlBytes)
 	})
 }
@@ -221,11 +214,7 @@ func ExtractTextWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config
 //
 // Returns the same errors as [ExtractFromFileWithContext].
 func ExtractTextFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return "", err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (string, error) {
+	return withConfig(cfg, func(p *Processor) (string, error) {
 		return p.ExtractTextFromFileWithContext(ctx, filePath)
 	})
 }
@@ -239,11 +228,7 @@ func ExtractTextFromFileWithContext(ctx context.Context, filePath string, cfg ..
 // Returns the same errors as [Extract], plus context.Canceled or
 // context.DeadlineExceeded when ctx is cancelled.
 func ExtractWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (*Result, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return nil, err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (*Result, error) {
+	return withConfig(cfg, func(p *Processor) (*Result, error) {
 		return p.ExtractWithContext(ctx, htmlBytes)
 	})
 }
@@ -257,11 +242,7 @@ func ExtractWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (*
 // Returns the same errors as [ExtractFromFile], plus context.Canceled or
 // context.DeadlineExceeded when ctx is cancelled.
 func ExtractFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (*Result, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return nil, err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (*Result, error) {
+	return withConfig(cfg, func(p *Processor) (*Result, error) {
 		return p.ExtractFromFileWithContext(ctx, filePath)
 	})
 }
@@ -321,7 +302,7 @@ func (p *Processor) extractCoreWithContext(ctx context.Context, htmlBytes []byte
 	}
 
 	// Validate processor state and input size
-	if err := p.validateInput(htmlBytes); err != nil {
+	if err := p.validateInput(htmlBytes, "Extract"); err != nil {
 		return nil, err
 	}
 
@@ -387,12 +368,10 @@ func (p *Processor) extractCoreWithContext(ctx context.Context, htmlBytes []byte
 
 	if err != nil {
 		p.stats.errorCount.Add(1)
-		if p.audit != nil {
-			if errors.Is(err, ErrProcessingTimeout) {
-				p.audit.RecordTimeout(p.config.ProcessingTimeout)
-			} else if errors.Is(err, ErrMaxDepthExceeded) {
-				p.audit.RecordDepthViolation(p.config.MaxDepth+1, p.config.MaxDepth)
-			}
+		// Depth violations are recorded at the violation site in
+		// validateDepthTraversal, which knows the actual offending depth.
+		if p.audit != nil && errors.Is(err, ErrProcessingTimeout) {
+			p.audit.RecordTimeout(p.config.ProcessingTimeout)
 		}
 		return nil, err
 	}
@@ -702,7 +681,7 @@ func (p *Processor) isBlankContent(content string) bool {
 	if n == 0 {
 		return true
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		c := content[i]
 		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
 			return false
@@ -750,6 +729,11 @@ func (p *Processor) validateDepthTraversal(root *stdxhtml.Node, initialDepth int
 		stack = stack[:len(stack)-1]
 
 		if entry.depth > p.config.MaxDepth {
+			// Record the actual offending depth (not a MaxDepth+1 stand-in)
+			// so audit consumers can gauge how hostile the document was.
+			if p.audit != nil {
+				p.audit.RecordDepthViolation(entry.depth, p.config.MaxDepth)
+			}
 			return ErrMaxDepthExceeded
 		}
 
@@ -935,7 +919,7 @@ func (p *Processor) formatInlineImages(textWithPlaceholders string, images []Ima
 			if altText == "" {
 				altText = "Image " + strconv.Itoa(images[i].Position)
 			}
-			markdown := "![" + escapeMarkdownText(altText) + "](" + images[i].URL + ")"
+			markdown := "![" + escapeMarkdownText(altText) + "](" + escapeMarkdownURLDest(images[i].URL) + ")"
 			replacements = append(replacements, placeholder, markdown)
 		}
 		if len(replacements) > 0 {
@@ -944,8 +928,11 @@ func (p *Processor) formatInlineImages(textWithPlaceholders string, images []Ima
 		}
 
 	case "html":
-		// Build replacements with pooled builder for HTML tags
-		htmlImg := internal.GetBuilder()
+		// Build replacements with a pooled TrackedBuilder: it retains its
+		// backing array across the per-image Reset, unlike the *strings.Builder
+		// previously pooled here whose Reset() nils the buffer (see pool.go).
+		htmlImg := internal.GetTrackedBuilder()
+		defer internal.PutTrackedBuilder(htmlImg)
 		replacements := make([]string, 0, len(images)*2)
 		for i := range images {
 			if images[i].Position == 0 {
@@ -954,25 +941,24 @@ func (p *Processor) formatInlineImages(textWithPlaceholders string, images []Ima
 			placeholder := "[IMAGE:" + strconv.Itoa(images[i].Position) + "]"
 			htmlImg.Reset()
 			htmlImg.Grow(len(images[i].URL) + len(images[i].Alt) + len(images[i].Width) + len(images[i].Height) + imageHTMLBufExtra)
-			htmlImg.WriteString(`<img src="`)
-			htmlImg.WriteString(htmlstd.EscapeString(images[i].URL))
-			htmlImg.WriteString(`" alt="`)
-			htmlImg.WriteString(htmlstd.EscapeString(images[i].Alt))
-			htmlImg.WriteString(`"`)
+			_, _ = htmlImg.WriteString(`<img src="`)
+			_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].URL))
+			_, _ = htmlImg.WriteString(`" alt="`)
+			_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].Alt))
+			_, _ = htmlImg.WriteString(`"`)
 			if images[i].Width != "" {
-				htmlImg.WriteString(` width="`)
-				htmlImg.WriteString(htmlstd.EscapeString(images[i].Width))
-				htmlImg.WriteString(`"`)
+				_, _ = htmlImg.WriteString(` width="`)
+				_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].Width))
+				_, _ = htmlImg.WriteString(`"`)
 			}
 			if images[i].Height != "" {
-				htmlImg.WriteString(` height="`)
-				htmlImg.WriteString(htmlstd.EscapeString(images[i].Height))
-				htmlImg.WriteString(`"`)
+				_, _ = htmlImg.WriteString(` height="`)
+				_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].Height))
+				_, _ = htmlImg.WriteString(`"`)
 			}
-			htmlImg.WriteString(">")
+			_, _ = htmlImg.WriteString(">")
 			replacements = append(replacements, placeholder, htmlImg.String())
 		}
-		internal.PutBuilder(htmlImg)
 		if len(replacements) > 0 {
 			replacer := strings.NewReplacer(replacements...)
 			return replacer.Replace(textWithPlaceholders)
@@ -1000,13 +986,25 @@ func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkI
 		}
 	}
 
-	// Direct string scanning to avoid regex overhead
-	sb := internal.GetBuilder()
-	defer internal.PutBuilder(sb)
-	sb.Grow(len(textWithPlaceholders))
+	// Direct string scanning to avoid regex overhead. The TrackedBuilder
+	// retains its backing array across pool round-trips, unlike the
+	// *strings.Builder previously pooled here whose Reset() nils the buffer
+	// (see pool.go).
+	tb := internal.GetTrackedBuilder()
+	defer internal.PutTrackedBuilder(tb)
+	tb.Grow(len(textWithPlaceholders))
 
 	i := 0
 	n := len(textWithPlaceholders)
+	// noEndTagFrom is the smallest index from which a scan for the closing
+	// [/LINK] token is known to have failed: no closing token exists at or
+	// after it. Closing-tag scans only ever start further right, so one
+	// failed scan settles every later one. Without this floor, text holding
+	// many unmatched "[LINK:n]" tokens rescanned the whole tail once per
+	// token, making replacement quadratic (measured 128ms at 8k tokens on a
+	// 64KB document, ~31s of CPU at 1MB) while pinning the withTimeout
+	// goroutine slot for the duration.
+	noEndTagFrom := n + 1
 	for i < n {
 		// Look for [LINK:
 		if textWithPlaceholders[i] == '[' && i+6 <= n && textWithPlaceholders[i:i+6] == "[LINK:" {
@@ -1020,11 +1018,13 @@ func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkI
 				position, err := strconv.Atoi(textWithPlaceholders[numStart:j])
 				if err == nil {
 					j++ // skip ']'
-					// Find [/LINK]
+					// Find [/LINK]. The textStart < noEndTagFrom guard skips
+					// scans that a previous failure already proved futile,
+					// keeping the whole pass linear.
 					textStart := j
 					endTag := "[/LINK]"
 					found := false
-					for j <= n-len(endTag) {
+					for textStart < noEndTagFrom && j <= n-len(endTag) {
 						if textWithPlaceholders[j] == '[' && textWithPlaceholders[j:j+7] == endTag {
 							// Found the closing tag
 							linkText := textWithPlaceholders[textStart:j]
@@ -1032,32 +1032,32 @@ func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkI
 							link, ok := linkMap[position]
 							if !ok {
 								// Unknown position, output just the text
-								sb.WriteString(linkText)
+								_, _ = tb.WriteString(linkText)
 							} else {
 								if linkText == "" {
 									linkText = "Link " + strconv.Itoa(position)
 								}
 								switch format {
 								case "markdown":
-									sb.WriteByte('[')
-									sb.WriteString(escapeMarkdownText(linkText))
-									sb.WriteString("](")
-									sb.WriteString(link.URL)
-									sb.WriteByte(')')
+									_ = tb.WriteByte('[')
+									_, _ = tb.WriteString(escapeMarkdownText(linkText))
+									_, _ = tb.WriteString("](")
+									_, _ = tb.WriteString(escapeMarkdownURLDest(link.URL))
+									_ = tb.WriteByte(')')
 								case "html":
-									sb.WriteString(`<a href="`)
-									sb.WriteString(htmlstd.EscapeString(link.URL))
-									sb.WriteString(`"`)
+									_, _ = tb.WriteString(`<a href="`)
+									_, _ = tb.WriteString(htmlstd.EscapeString(link.URL))
+									_, _ = tb.WriteString(`"`)
 									if link.Title != "" {
-										sb.WriteString(` title="`)
-										sb.WriteString(htmlstd.EscapeString(link.Title))
-										sb.WriteString(`"`)
+										_, _ = tb.WriteString(` title="`)
+										_, _ = tb.WriteString(htmlstd.EscapeString(link.Title))
+										_, _ = tb.WriteString(`"`)
 									}
-									sb.WriteString(`>`)
-									sb.WriteString(htmlstd.EscapeString(linkText))
-									sb.WriteString("</a>")
+									_, _ = tb.WriteString(`>`)
+									_, _ = tb.WriteString(htmlstd.EscapeString(linkText))
+									_, _ = tb.WriteString("</a>")
 								default:
-									sb.WriteString(linkText)
+									_, _ = tb.WriteString(linkText)
 								}
 							}
 							j += len(endTag)
@@ -1066,11 +1066,16 @@ func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkI
 						}
 						j++
 					}
+					if !found && textStart < noEndTagFrom {
+						// This scan ran to the end without a match: no closing
+						// token exists at or after textStart.
+						noEndTagFrom = textStart
+					}
 					if !found {
 						// No closing [/LINK] tag present: write the opening tag
 						// literally and resume scanning from textStart so that
 						// trailing content is preserved rather than dropped.
-						sb.WriteString(textWithPlaceholders[i:textStart])
+						_, _ = tb.WriteString(textWithPlaceholders[i:textStart])
 						j = textStart
 					}
 					i = j
@@ -1078,15 +1083,15 @@ func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkI
 				}
 			}
 			// Failed to parse, write as-is
-			sb.WriteByte(textWithPlaceholders[i])
+			_ = tb.WriteByte(textWithPlaceholders[i])
 			i++
 		} else {
-			sb.WriteByte(textWithPlaceholders[i])
+			_ = tb.WriteByte(textWithPlaceholders[i])
 			i++
 		}
 	}
 
-	return sb.String()
+	return tb.String()
 }
 
 // extractImagesAndLinks collects images and/or links from node in a single
@@ -1203,6 +1208,11 @@ func (p *Processor) parseLinkNode(n *stdxhtml.Node) LinkInfo {
 	return link
 }
 
+// countWords counts whitespace-separated words, additionally counting each
+// CJK ideograph, kana, or Hangul syllable as one word. CJK text is
+// conventionally written without inter-word spaces, so a whitespace-only
+// scan reported a whole paragraph as a single word and skewed WordCount and
+// ReadingTime for CJK documents.
 func (p *Processor) countWords(text string) int {
 	if text == "" {
 		return 0
@@ -1210,17 +1220,45 @@ func (p *Processor) countWords(text string) int {
 	n := len(text)
 	count := 0
 	inWord := false
-	for i := 0; i < n; i++ {
+	for i := 0; i < n; {
 		c := text[i]
-		isSpace := c == ' ' || c == '\t' || c == '\n' || c == '\r'
-		if isSpace {
+		if c < utf8.RuneSelf {
+			if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+				inWord = false
+			} else if !inWord {
+				inWord = true
+				count++
+			}
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if isCJKRune(r) {
+			count++ // each CJK character reads as one word
 			inWord = false
 		} else if !inWord {
+			// Non-CJK multi-byte scripts (Cyrillic, Greek, accented Latin,
+			// emoji, ...) follow the same run-of-non-space rule as ASCII.
 			inWord = true
 			count++
 		}
+		i += size
 	}
 	return count
+}
+
+// isCJKRune reports whether r is a CJK ideograph, kana, or Hangul syllable —
+// the scripts whose text is conventionally written without inter-word spaces.
+func isCJKRune(r rune) bool {
+	switch {
+	case r >= 0x4E00 && r <= 0x9FFF, // CJK Unified Ideographs
+		r >= 0x3400 && r <= 0x4DBF, // CJK Extension A
+		r >= 0xF900 && r <= 0xFAFF, // CJK Compatibility Ideographs
+		r >= 0x3040 && r <= 0x30FF, // Hiragana / Katakana
+		r >= 0xAC00 && r <= 0xD7AF: // Hangul Syllables
+		return true
+	}
+	return false
 }
 
 func (p *Processor) calculateReadingTime(wordCount int) time.Duration {

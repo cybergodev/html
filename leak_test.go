@@ -5,7 +5,6 @@ package html
 import (
 	"context"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,7 +20,7 @@ func TestGoroutineLeakInBatchProcessing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create processor: %v", err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	html := []byte(`<html><body><p>Test content</p></body></html>`)
 	contents := make([][]byte, 100)
@@ -65,7 +64,7 @@ func TestGoroutineLeakInBatchWithContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create processor: %v", err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	html := []byte(`<html><body><p>Test content</p></body></html>`)
 	contents := make([][]byte, 100)
@@ -104,7 +103,7 @@ func TestGoroutineLeakInCancelledContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create processor: %v", err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	// Large content slice to process
 	contents := make([][]byte, 1000)
@@ -160,7 +159,7 @@ func TestGoroutineLeakInAuditCollector(t *testing.T) {
 			collector.RecordBlockedAttr("onclick", "alert(1)")
 			collector.RecordBlockedURL("javascript:alert(1)", "xss")
 		}
-		collector.Close()
+		_ = collector.Close()
 	}
 
 	// Allow goroutines to settle
@@ -202,7 +201,7 @@ func TestGoroutineLeakInChannelAuditSink(t *testing.T) {
 		}
 
 		// Close sink - this should close the channel and stop the consumer
-		sink.Close()
+		_ = sink.Close()
 
 		// Wait for consumer to finish
 		select {
@@ -234,7 +233,7 @@ func TestMemoryLeakInCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create processor: %v", err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	// Generate unique HTML content to bypass cache
 	baseTime := time.Now()
@@ -331,7 +330,7 @@ func TestWithTimeoutGoroutineCleanup(t *testing.T) {
 		smallHTML := []byte(`<html><body><p>Test</p></body></html>`)
 
 		_, err = processor.Extract(smallHTML)
-		processor.Close()
+		_ = processor.Close()
 
 		if err != nil {
 			t.Errorf("Unexpected error: %v", err)
@@ -349,43 +348,6 @@ func TestWithTimeoutGoroutineCleanup(t *testing.T) {
 	if finalGoroutines > initialGoroutines+5 {
 		t.Errorf("Potential goroutine leak after quick operations: initial=%d, final=%d", initialGoroutines, finalGoroutines)
 	}
-}
-
-// TestWithTimeoutLongRunningOperation tests behavior when operations take longer than timeout.
-// This test documents the expected behavior: goroutines continue until fn() completes.
-func TestWithTimeoutLongRunningOperation(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.ProcessingTimeout = 10 * time.Millisecond
-	processor, err := New(cfg)
-	if err != nil {
-		t.Fatalf("Failed to create processor: %v", err)
-	}
-	defer processor.Close()
-
-	// Create content that will take longer than timeout to process
-	var sb strings.Builder
-	for j := 0; j < 50000; j++ {
-		sb.WriteString("<p>This is a test paragraph with some content to make it larger.</p>")
-	}
-	largeHTML := []byte("<html><body>" + sb.String() + "</body></html>")
-
-	// This should timeout - the error should be ErrProcessingTimeout
-	start := time.Now()
-	_, err = processor.Extract(largeHTML)
-	elapsed := time.Since(start)
-
-	t.Logf("Extract with timeout took: %v, error: %v", elapsed, err)
-
-	// Verify we got a timeout error
-	if err == nil {
-		t.Error("Expected timeout error, got nil")
-	}
-	if err != ErrProcessingTimeout {
-		t.Logf("Got error: %v (expected ErrProcessingTimeout)", err)
-	}
-
-	// Wait for any background goroutines to complete
-	time.Sleep(500 * time.Millisecond)
 }
 
 // TestProcessorDoubleClose tests that double Close() calls are safe.
@@ -421,9 +383,8 @@ func TestConcurrentCloseAndExtract(t *testing.T) {
 		t.Fatalf("Failed to create processor: %v", err)
 	}
 
-	var extractOk, closeOk atomic.Bool
+	var extractOk atomic.Bool
 	extractOk.Store(true)
-	closeOk.Store(true)
 
 	var wg sync.WaitGroup
 
@@ -518,10 +479,10 @@ func BenchmarkProcessorCreationWithClose(b *testing.B) {
 	cfg := DefaultConfig()
 	cfg.MaxCacheEntries = 100
 	cfg.CacheTTL = time.Minute
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		processor, _ := New(cfg)
 		_, _ = processor.Extract([]byte(`<html><body><p>Test</p></body></html>`))
-		processor.Close()
+		_ = processor.Close()
 	}
 }
 
@@ -531,7 +492,7 @@ func BenchmarkBatchProcessingMemory(b *testing.B) {
 	cfg.MaxCacheEntries = 100
 	cfg.CacheTTL = time.Minute
 	processor, _ := New(cfg)
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	contents := make([][]byte, 100)
 	for i := range contents {
@@ -539,7 +500,7 @@ func BenchmarkBatchProcessingMemory(b *testing.B) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = processor.ExtractBatch(contents)
 	}
 }

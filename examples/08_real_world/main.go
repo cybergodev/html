@@ -21,7 +21,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	// ============================================================
 	// Use Case 1: Blog Article Extraction

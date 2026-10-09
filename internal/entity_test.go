@@ -1,5 +1,10 @@
 package internal
 
+// entity_test.go — consolidated HTML entity tests and benchmarks.
+// Merges comprehensive_entity_test.go and entity_benchmark_test.go so all
+// entity-decoding coverage and the benchmarks that guard its performance live
+// in one file.
+
 import (
 	"fmt"
 	"strings"
@@ -22,35 +27,9 @@ func TestComprehensiveHTMLEntityConversion(t *testing.T) {
 		mustNotContain []string
 		explanation    string
 	}{
-		// Non-breaking spaces - all forms should convert to regular space (U+0020)
-		{
-			name:           "nbsp_named_entity",
-			html:           "A&nbsp;B",
-			mustContain:    []string{"A B"},
-			mustNotContain: []string{"\u00a0", "&nbsp;"},
-			explanation:    "&nbsp; should convert to regular space (0x20), not non-breaking space (0xa0)",
-		},
-		{
-			name:           "nbsp_decimal_numeric",
-			html:           "A&#160;B",
-			mustContain:    []string{"A B"},
-			mustNotContain: []string{"\u00a0", "&#160;"},
-			explanation:    "&#160; should convert to regular space",
-		},
-		{
-			name:           "nbsp_hexadecimal_numeric",
-			html:           "A&#xa0;B",
-			mustContain:    []string{"A B"},
-			mustNotContain: []string{"\u00a0", "&#xa0;"},
-			explanation:    "&#xa0; should convert to regular space",
-		},
-		{
-			name:           "nbsp_uppercase_hex",
-			html:           "A&#xA0;B",
-			mustContain:    []string{"A B"},
-			mustNotContain: []string{"\u00a0"},
-			explanation:    "&#xA0; (uppercase) should convert to regular space",
-		},
+		// Non-breaking space variants are pinned exactly (all four forms) by
+		// TestHTMLEntityByteRepresentation rows nbsp_to_space/nbsp_160_to_space/
+		// nbsp_a0_to_space, so they are not repeated here as substring checks.
 
 		// Basic XML entities
 		{
@@ -277,25 +256,11 @@ func TestHTMLEntityByteRepresentation(t *testing.T) {
 
 			result := GetTextContent(doc)
 
+			// In Go, string equality is byte-for-byte equality, so this single
+			// check pins both the decoded characters and their UTF-8 bytes.
 			if result != tc.expected {
 				t.Errorf("Entity %q converted to %q (% x), expected %q (% x)",
 					tc.entity, result, result, tc.expected, tc.expected)
-			}
-
-			// Verify bytes are correct UTF-8
-			expectedBytes := []byte(tc.expected)
-			resultBytes := []byte(result)
-
-			if len(expectedBytes) != len(resultBytes) {
-				t.Errorf("Byte length mismatch: got %d bytes (% x), expected %d bytes (% x)",
-					len(resultBytes), resultBytes, len(expectedBytes), expectedBytes)
-			}
-
-			for i := 0; i < len(resultBytes) && i < len(expectedBytes); i++ {
-				if resultBytes[i] != expectedBytes[i] {
-					t.Errorf("Byte mismatch at position %d: got 0x%02x, expected 0x%02x",
-						i, resultBytes[i], expectedBytes[i])
-				}
 			}
 		})
 	}
@@ -409,4 +374,81 @@ func ExampleReplaceHTMLEntities() {
 	result := ReplaceHTMLEntities(input)
 	fmt.Println(result)
 	// Output:  © 2025 — Test €100
+}
+
+// Benchmarks for entity replacement performance
+
+var (
+	// Text with only common entities (fast path)
+	benchCommonEntities = "This is a test &nbsp; with &amp; common &lt; entities &gt; like &quot; quotes &apos; and &copy; copyright &reg; registered &mdash; dash &ndash; end."
+
+	// Text with mixed common and rare entities
+	benchMixedEntities = "Test &nbsp; text &amp; with &euro; euro &pound; pound &yen; yen &sect; section &para; paragraph &plusmn; plusminus &times; multiply &divide; divide &frac12; half &deg; degree &micro; micro &middot; dot &bull; bullet &dagger; dagger &permil; permille."
+
+	// Text with numeric entities
+	benchNumericEntities = "Text with &#65; &#x41; &#160; &#xa0; &#8212; &#x2014; &#169; &#xa9; numeric &#8364; &#x20ac; entities."
+
+	// Text with no entities (should be very fast)
+	benchNoEntities = "This is just plain text without any HTML entities at all in it. Should be very fast to process."
+
+	// Long text with common entities
+	benchLongCommon = repeatString("Test &nbsp; text &amp; with &lt; entities &gt; and ", 100)
+)
+
+func repeatString(s string, count int) string {
+	result := ""
+	for i := 0; i < count; i++ {
+		result += s
+	}
+	return result
+}
+
+func BenchmarkReplaceHTMLEntities_CommonEntities(b *testing.B) {
+	b.SetBytes(int64(len(benchCommonEntities)))
+	for b.Loop() {
+		ReplaceHTMLEntities(benchCommonEntities)
+	}
+}
+
+func BenchmarkReplaceHTMLEntities_MixedEntities(b *testing.B) {
+	b.SetBytes(int64(len(benchMixedEntities)))
+	for b.Loop() {
+		ReplaceHTMLEntities(benchMixedEntities)
+	}
+}
+
+func BenchmarkReplaceHTMLEntities_NumericEntities(b *testing.B) {
+	b.SetBytes(int64(len(benchNumericEntities)))
+	for b.Loop() {
+		ReplaceHTMLEntities(benchNumericEntities)
+	}
+}
+
+func BenchmarkReplaceHTMLEntities_NoEntities(b *testing.B) {
+	b.SetBytes(int64(len(benchNoEntities)))
+	for b.Loop() {
+		ReplaceHTMLEntities(benchNoEntities)
+	}
+}
+
+func BenchmarkReplaceHTMLEntities_LongText(b *testing.B) {
+	b.SetBytes(int64(len(benchLongCommon)))
+	for b.Loop() {
+		ReplaceHTMLEntities(benchLongCommon)
+	}
+}
+
+// Benchmark fastReplaceCommonEntities directly
+func BenchmarkFastReplaceCommonEntities(b *testing.B) {
+	b.SetBytes(int64(len(benchCommonEntities)))
+	for b.Loop() {
+		fastReplaceCommonEntities(benchCommonEntities)
+	}
+}
+
+func BenchmarkFastReplaceCommonEntities_LongText(b *testing.B) {
+	b.SetBytes(int64(len(benchLongCommon)))
+	for b.Loop() {
+		fastReplaceCommonEntities(benchLongCommon)
+	}
 }

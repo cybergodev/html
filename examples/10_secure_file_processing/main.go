@@ -41,7 +41,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	// ============================================================
 	// 1. Files inside the sandbox
@@ -55,6 +55,20 @@ func main() {
 			continue
 		}
 		fmt.Printf("  %s: %q (%d words)\n", filepath.Base(path), r.Title, r.WordCount)
+	}
+
+	// Other file-based entry points honor the same sandbox.
+	text, err := processor.ExtractTextFromFile(insideA)
+	if err != nil {
+		fmt.Printf("  ExtractTextFromFile: ERROR %v\n", err)
+	} else {
+		fmt.Printf("  ExtractTextFromFile → %d chars of plain text\n", len(text))
+	}
+	links, err := processor.ExtractAllLinksFromFile(insideA)
+	if err != nil {
+		fmt.Printf("  ExtractAllLinksFromFile: ERROR %v\n", err)
+	} else {
+		fmt.Printf("  ExtractAllLinksFromFile → %d link resource(s)\n", len(links))
 	}
 	fmt.Println()
 
@@ -101,6 +115,7 @@ func main() {
 	// ============================================================
 	fmt.Println("=== Summary ===")
 	fmt.Println("• Config.AllowedBaseDir sandboxes all file reads")
+	fmt.Println("• Every *FromFile entry point (Extract, ExtractText, ExtractAllLinks, batch) shares it")
 	fmt.Println("• Containment resolves through the OS handle — symlinks/junctions can't escape")
 	fmt.Println("• Refusals surface as *html.FileError; missing files → html.ErrFileNotFound")
 	fmt.Println("• Relative paths containing '..' are rejected as path-traversal attempts")
@@ -128,7 +143,8 @@ func makeSandbox() (base string, cleanup func(), err error) {
 
 	files := map[string]string{
 		filepath.Join(base, "article.html"): "<html><head><title>Sandboxed Article</title></head>" +
-			"<body><article><h1>Sandboxed Article</h1><p>Content inside the allowed directory.</p></article></body></html>",
+			"<body><article><h1>Sandboxed Article</h1><p>Content inside the allowed directory." +
+			"<a href=\"https://example.com/docs\">Read the docs</a></p></article></body></html>",
 		filepath.Join(base, "nested", "page.html"): "<html><head><title>Nested Page</title></head>" +
 			"<body><article><h1>Nested Page</h1><p>Content in a nested subdirectory, still inside the sandbox.</p></article></body></html>",
 		filepath.Join(tmp, "outside", "secret.html"): "<html><body><p>This file lives OUTSIDE the sandbox.</p></body></html>",

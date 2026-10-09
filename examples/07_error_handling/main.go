@@ -38,7 +38,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create processor: %v", err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	_, err = processor.Extract([]byte(""))
 	if err != nil {
@@ -65,7 +65,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer smallProcessor.Close()
+	defer func() { _ = smallProcessor.Close() }()
 
 	largeInput := strings.Repeat("<div>", 500) // ~2.5 KB, exceeds 1 KB limit
 	_, err = smallProcessor.Extract([]byte(largeInput))
@@ -93,6 +93,18 @@ func main() {
 		fmt.Printf("  MaxSize: %d\n", inputErr.MaxSize)
 	}
 
+	// Config errors: New validates the config and returns *ConfigError
+	// (wrapping ErrInvalidConfig). A zero-value Config fails because
+	// MaxInputSize must be positive — always start from DefaultConfig().
+	_, err = html.New(html.Config{})
+	var cfgErr *html.ConfigError
+	if errors.As(err, &cfgErr) {
+		fmt.Printf("\nConfigError: field=%s, message=%q\n", cfgErr.Field, cfgErr.Message)
+	}
+	if errors.Is(err, html.ErrInvalidConfig) {
+		fmt.Println("  ✓ errors.Is(err, html.ErrInvalidConfig)")
+	}
+
 	fmt.Println("\n✓ Use errors.As() to access error details")
 
 	// ============================================================
@@ -110,7 +122,7 @@ func main() {
 	fmt.Println("✓ Always use defer p.Close() for cleanup")
 
 	// Demonstrate: using after close returns error
-	p.Close() // Close is idempotent - safe to call multiple times
+	_ = p.Close() // Close is idempotent - safe to call multiple times
 	_, err = p.Extract([]byte("<html></html>"))
 	if errors.Is(err, html.ErrProcessorClosed) {
 		fmt.Println("✓ ErrProcessorClosed returned after Close()")
@@ -126,7 +138,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create processor: %v", err)
 	}
-	defer processor2.Close()
+	defer func() { _ = processor2.Close() }()
 
 	docs := [][]byte{
 		[]byte("<html><body><p>Doc 1 - Valid</p></body></html>"),

@@ -174,3 +174,31 @@ func withProcessorBatch(pooled bool, cfg Config, itemCount int, fn func(*Process
 	}
 	return fn(p)
 }
+
+// withConfig resolves cfg and runs fn on a Processor following the package-level
+// convenience-function contract: a pooled default-config Processor when no
+// Config is supplied, or a one-shot Processor built from the caller's Config.
+// It centralizes the resolveConfig + withProcessor preamble that every
+// package-level wrapper repeats, so a config error (ErrMultipleConfigs, or
+// ErrInvalidConfig wrapped in *ConfigError) surfaces identically from all of
+// them.
+func withConfig[T any](cfg []Config, fn func(*Processor) (T, error)) (T, error) {
+	c, pooled, err := resolveConfig(cfg...)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return withProcessor(pooled, c, fn)
+}
+
+// withConfigBatch is the batch counterpart of withConfig. On config-resolution
+// failure it returns a BatchResult with all itemCount items marked failed,
+// matching the uniformErrorBatch behavior the batch wrappers previously
+// implemented inline.
+func withConfigBatch(cfg []Config, itemCount int, fn func(*Processor) *BatchResult) *BatchResult {
+	c, pooled, err := resolveConfig(cfg...)
+	if err != nil {
+		return uniformErrorBatch(itemCount, err)
+	}
+	return withProcessorBatch(pooled, c, itemCount, fn)
+}

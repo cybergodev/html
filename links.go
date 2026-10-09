@@ -23,40 +23,10 @@ import (
 // Returns the same errors as [Processor.Extract].
 func (p *Processor) ExtractAllLinks(htmlBytes []byte) ([]LinkResource, error) {
 	return recoverPanic(func() ([]LinkResource, error) {
-		// Validate input
-		if len(htmlBytes) == 0 {
-			return []LinkResource{}, nil
-		}
-
-		// Validate processor state and input size
-		if err := p.validateInput(htmlBytes); err != nil {
-			return nil, err
-		}
-
-		startTime := time.Now()
-
-		// Detect encoding and convert to UTF-8 using configured encoding
-		utf8String, err := p.detectEncoding(htmlBytes)
-		if err != nil {
-			return nil, err
-		}
-
-		// Process with timeout if configured. The context here is background
-		// (this is the no-context entry point); extractLinksRespectingDeadline
-		// applies only the ProcessingTimeout deadline when configured.
-		var links []LinkResource
-		links, err = p.extractLinksRespectingDeadline(context.Background(), utf8String)
-
-		if err != nil {
-			p.stats.errorCount.Add(1)
-			return nil, err
-		}
-
-		processingTime := time.Since(startTime)
-		p.stats.totalProcessTime.Add(int64(processingTime))
-		p.stats.totalProcessed.Add(1)
-
-		return links, nil
+		// The context is background (this is the no-context entry point);
+		// extractAllLinksCore applies only the ProcessingTimeout deadline when
+		// configured.
+		return p.extractAllLinksCore(context.Background(), htmlBytes)
 	})
 }
 
@@ -67,10 +37,7 @@ func (p *Processor) ExtractAllLinks(htmlBytes []byte) ([]LinkResource, error) {
 // Returns the same errors as [Processor.ExtractFromFile].
 func (p *Processor) ExtractAllLinksFromFile(filePath string) ([]LinkResource, error) {
 	return recoverPanic(func() ([]LinkResource, error) {
-		if p == nil {
-			return nil, ErrProcessorClosed
-		}
-		if p.closed.Load() {
+		if p == nil || p.closed.Load() {
 			return nil, ErrProcessorClosed
 		}
 
@@ -90,60 +57,7 @@ func (p *Processor) ExtractAllLinksFromFile(filePath string) ([]LinkResource, er
 // returns context.Canceled or context.DeadlineExceeded when ctx is cancelled.
 func (p *Processor) ExtractAllLinksWithContext(ctx context.Context, htmlBytes []byte) ([]LinkResource, error) {
 	return recoverPanic(func() ([]LinkResource, error) {
-		// Early cancellation check
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		// Validate input
-		if len(htmlBytes) == 0 {
-			return []LinkResource{}, nil
-		}
-
-		// Validate processor state and input size
-		if err := p.validateInput(htmlBytes); err != nil {
-			return nil, err
-		}
-
-		startTime := time.Now()
-
-		// Check cancellation before encoding detection
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		// Detect encoding using configured encoding setting
-		utf8String, err := p.detectEncoding(htmlBytes)
-		if err != nil {
-			return nil, err
-		}
-
-		// Check cancellation before processing
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		// Process with timeout if configured, deriving the deadline from ctx so
-		// cooperative checks honor both the user's context and ProcessingTimeout.
-		var links []LinkResource
-		links, err = p.extractLinksRespectingDeadline(ctx, utf8String)
-
-		if err != nil {
-			p.stats.errorCount.Add(1)
-			return nil, err
-		}
-
-		processingTime := time.Since(startTime)
-		p.stats.totalProcessTime.Add(int64(processingTime))
-		p.stats.totalProcessed.Add(1)
-
-		return links, nil
+		return p.extractAllLinksCore(ctx, htmlBytes)
 	})
 }
 
@@ -159,10 +73,7 @@ func (p *Processor) ExtractAllLinksFromFileWithContext(ctx context.Context, file
 		default:
 		}
 
-		if p == nil {
-			return nil, ErrProcessorClosed
-		}
-		if p.closed.Load() {
+		if p == nil || p.closed.Load() {
 			return nil, ErrProcessorClosed
 		}
 
@@ -194,11 +105,7 @@ func (p *Processor) ExtractAllLinksFromFileWithContext(ctx context.Context, file
 //
 // Returns the same errors as [Extract].
 func ExtractAllLinks(htmlBytes []byte, cfg ...Config) ([]LinkResource, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return nil, err
-	}
-	return withProcessor(pooled, c, func(p *Processor) ([]LinkResource, error) {
+	return withConfig(cfg, func(p *Processor) ([]LinkResource, error) {
 		return p.ExtractAllLinks(htmlBytes)
 	})
 }
@@ -214,11 +121,7 @@ func ExtractAllLinks(htmlBytes []byte, cfg ...Config) ([]LinkResource, error) {
 //
 // Returns the same errors as [ExtractFromFile].
 func ExtractAllLinksFromFile(filePath string, cfg ...Config) ([]LinkResource, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return nil, err
-	}
-	return withProcessor(pooled, c, func(p *Processor) ([]LinkResource, error) {
+	return withConfig(cfg, func(p *Processor) ([]LinkResource, error) {
 		return p.ExtractAllLinksFromFile(filePath)
 	})
 }
@@ -234,11 +137,7 @@ func ExtractAllLinksFromFile(filePath string, cfg ...Config) ([]LinkResource, er
 //
 // Returns the same errors as [ExtractWithContext].
 func ExtractAllLinksWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) ([]LinkResource, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return nil, err
-	}
-	return withProcessor(pooled, c, func(p *Processor) ([]LinkResource, error) {
+	return withConfig(cfg, func(p *Processor) ([]LinkResource, error) {
 		return p.ExtractAllLinksWithContext(ctx, htmlBytes)
 	})
 }
@@ -254,13 +153,70 @@ func ExtractAllLinksWithContext(ctx context.Context, htmlBytes []byte, cfg ...Co
 //
 // Returns the same errors as [ExtractFromFileWithContext].
 func ExtractAllLinksFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) ([]LinkResource, error) {
-	c, pooled, err := resolveConfig(cfg...)
+	return withConfig(cfg, func(p *Processor) ([]LinkResource, error) {
+		return p.ExtractAllLinksFromFileWithContext(ctx, filePath)
+	})
+}
+
+// extractAllLinksCore is the shared body of the ExtractAllLinks entry points,
+// mirroring extractCoreWithContext on the Extract path: processor-state and
+// size validation, encoding detection, deadline-bounded processing, and
+// statistics accounting are implemented once instead of being duplicated
+// across the context and no-context variants.
+func (p *Processor) extractAllLinksCore(ctx context.Context, htmlBytes []byte) ([]LinkResource, error) {
+	// Early cancellation check
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Validate processor state and input size. This runs before the empty-input
+	// check so a closed processor consistently reports ErrProcessorClosed, the
+	// same contract the Extract path enforces.
+	if err := p.validateInput(htmlBytes, "ExtractAllLinks"); err != nil {
+		return nil, err
+	}
+
+	if len(htmlBytes) == 0 {
+		return []LinkResource{}, nil
+	}
+
+	startTime := time.Now()
+
+	// Check cancellation before encoding detection
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Detect encoding and convert to UTF-8 using the configured encoding
+	utf8String, err := p.detectEncoding(htmlBytes)
 	if err != nil {
 		return nil, err
 	}
-	return withProcessor(pooled, c, func(p *Processor) ([]LinkResource, error) {
-		return p.ExtractAllLinksFromFileWithContext(ctx, filePath)
-	})
+
+	// Check cancellation before processing
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Process with timeout if configured, deriving the deadline from ctx so
+	// cooperative checks honor both the user's context and ProcessingTimeout.
+	links, err := p.extractLinksRespectingDeadline(ctx, utf8String)
+	if err != nil {
+		p.stats.errorCount.Add(1)
+		return nil, err
+	}
+
+	processingTime := time.Since(startTime)
+	p.stats.totalProcessTime.Add(int64(processingTime))
+	p.stats.totalProcessed.Add(1)
+
+	return links, nil
 }
 
 // extractLinksRespectingDeadline runs link extraction honoring both the caller's

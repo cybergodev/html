@@ -382,7 +382,7 @@ func BenchmarkDetectCharset(b *testing.B) {
 
 	ed := NewEncodingDetector()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = ed.DetectCharset(data)
 	}
 }
@@ -396,7 +396,7 @@ func BenchmarkToUTF8_Windows1252(b *testing.B) {
 
 	ed := NewEncodingDetector()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, _ = ed.ToUTF8(data, "windows-1252")
 	}
 }
@@ -406,7 +406,7 @@ func BenchmarkDetectAndConvert(b *testing.B) {
 
 	ed := NewEncodingDetector()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, _, _ = ed.DetectAndConvert(data)
 	}
 }
@@ -859,5 +859,125 @@ func TestScoreEncodingMatchOptimized(t *testing.T) {
 				t.Errorf("scoreEncodingMatchOptimized(%q, %q) = %d, want > 0", tt.data, tt.charset, got)
 			}
 		})
+	}
+}
+
+// ===========================================================================
+// String convenience wrappers (merged from encoding_convenience_test.go).
+// TestToUTF8 and TestDetectAndConvert above already pin the byte-slice
+// conversion behavior exactly, so the former weak non-empty-only wrapper
+// tests (TestConvertToUTF8, TestDetectAndConvertToUTF8) were dropped.
+// ===========================================================================
+
+// TestDetectAndConvertToUTF8String drives both the sharing (String) and the
+// copying (StringSafe) wrapper through one table, pinning the exact output
+// string and charset for each input shape.
+func TestDetectAndConvertToUTF8String(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		data           []byte
+		forcedEncoding string
+		wantResult     string
+		wantCharset    string
+	}{
+		{
+			name:           "auto-detect UTF-8",
+			data:           []byte("<html><head><meta charset=\"utf-8\"></head><body>Hello</body></html>"),
+			forcedEncoding: "",
+			wantResult:     "<html><head><meta charset=\"utf-8\"></head><body>Hello</body></html>",
+			wantCharset:    "utf-8",
+		},
+		{
+			name:           "forced UTF-8",
+			data:           []byte("Hello World"),
+			forcedEncoding: "utf-8",
+			wantResult:     "Hello World",
+			wantCharset:    "utf-8",
+		},
+		{
+			name:           "forced Windows-1252",
+			data:           []byte{0x48, 0x65, 0x6C, 0x6C, 0x6F}, // "Hello" (pure ASCII subset)
+			forcedEncoding: "windows-1252",
+			wantResult:     "Hello",
+			wantCharset:    "windows-1252",
+		},
+		{
+			// An unrecognized forced encoding is echoed back as the charset;
+			// the data is still converted best-effort (ASCII passes through).
+			name:           "invalid forced encoding",
+			data:           []byte("Hello"),
+			forcedEncoding: "invalid-xyz",
+			wantResult:     "Hello",
+			wantCharset:    "invalid-xyz",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			result, charset, err := DetectAndConvertToUTF8String(tt.data, tt.forcedEncoding)
+			if err != nil {
+				t.Fatalf("DetectAndConvertToUTF8String() error = %v", err)
+			}
+			if result != tt.wantResult {
+				t.Errorf("result = %q, want %q", result, tt.wantResult)
+			}
+			if charset != tt.wantCharset {
+				t.Errorf("charset = %q, want %q", charset, tt.wantCharset)
+			}
+
+			safeResult, safeCharset, safeErr := DetectAndConvertToUTF8StringSafe(tt.data, tt.forcedEncoding)
+			if safeErr != nil {
+				t.Fatalf("DetectAndConvertToUTF8StringSafe() error = %v", safeErr)
+			}
+			if safeResult != tt.wantResult {
+				t.Errorf("safe result = %q, want %q", safeResult, tt.wantResult)
+			}
+			if safeCharset != tt.wantCharset {
+				t.Errorf("safe charset = %q, want %q", safeCharset, tt.wantCharset)
+			}
+		})
+	}
+}
+
+// TestDetectAndConvertToUTF8StringMemoryIsolation verifies that the Safe version
+// provides memory isolation while the regular version shares memory for ASCII input.
+func TestDetectAndConvertToUTF8StringMemoryIsolation(t *testing.T) {
+	t.Parallel()
+
+	original := []byte("Hello World")
+
+	// Test the regular function - note that modifying input after the call
+	// is UNSAFE and only done here for testing purposes
+	result, charset, err := DetectAndConvertToUTF8String(original, "")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if charset != "utf-8" {
+		t.Errorf("Expected utf-8 charset, got %s", charset)
+	}
+	if result != "Hello World" {
+		t.Errorf("Expected 'Hello World', got '%s'", result)
+	}
+
+	// Test the safe version - it should always return a copy
+	safeResult, safeCharset, safeErr := DetectAndConvertToUTF8StringSafe(original, "")
+	if safeErr != nil {
+		t.Fatalf("Unexpected error in safe version: %v", safeErr)
+	}
+	if safeCharset != "utf-8" {
+		t.Errorf("Expected utf-8 charset in safe version, got %s", safeCharset)
+	}
+	if safeResult != "Hello World" {
+		t.Errorf("Expected 'Hello World' in safe version, got '%s'", safeResult)
+	}
+
+	// Modify original - safeResult should be unaffected
+	original[0] = 'X'
+	if safeResult != "Hello World" {
+		t.Errorf("Safe version should be isolated from input modifications, got '%s'", safeResult)
 	}
 }

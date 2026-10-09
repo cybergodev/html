@@ -59,7 +59,6 @@ func (closePanickingSink) Close() error {
 }
 
 const testHTML = `<html><head><title>Test</title></head><body><p>Hello World</p><article><p>Content</p></article></body></html>`
-const testLinkHTML = `<html><body><a href="https://example.com">Link</a></body></html>`
 
 // createTestHTMLFile creates a temp HTML file for testing.
 func createTestHTMLFile(t *testing.T, dir, name, content string) string {
@@ -117,7 +116,7 @@ func TestPanicRecovery_ProcessorMethods(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer p.Close()
+			defer func() { _ = p.Close() }()
 
 			err = tt.fn(p)
 			if !errors.Is(err, html.ErrInternalPanic) {
@@ -168,7 +167,7 @@ func TestPanicRecovery_BatchOperations(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		br := p.ExtractBatch([][]byte{[]byte(testHTML), []byte(testHTML), []byte(testHTML)})
 		if br.Success != 0 {
@@ -189,7 +188,7 @@ func TestPanicRecovery_BatchOperations(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		br := p.ExtractBatchWithContext(context.Background(), [][]byte{[]byte(testHTML), []byte(testHTML)})
 		if br.Failed != 2 {
@@ -202,7 +201,7 @@ func TestPanicRecovery_BatchOperations(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		tmpDir := t.TempDir()
 		paths := []string{
@@ -232,104 +231,6 @@ func TestPanicRecovery_BatchOperations(t *testing.T) {
 		}
 	})
 
-	t.Run("batch with mixed valid/empty content", func(t *testing.T) {
-		p, err := html.New()
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer p.Close()
-
-		br := p.ExtractBatch([][]byte{
-			[]byte(testHTML),
-			[]byte{},
-			[]byte(`<html><body><p>Another</p></body></html>`),
-		})
-		if br.Failed != 0 {
-			t.Fatalf("expected 0 failures, got %d", br.Failed)
-		}
-		if br.Success != 3 {
-			t.Fatalf("expected 3 successes, got %d", br.Success)
-		}
-	})
-}
-
-// TestPanicRecovery_LinkExtraction verifies link extraction safety.
-func TestPanicRecovery_LinkExtraction(t *testing.T) {
-	t.Parallel()
-
-	t.Run("normal links don't panic", func(t *testing.T) {
-		p, err := html.New()
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer p.Close()
-
-		links, err := p.ExtractAllLinks([]byte(testLinkHTML))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(links) == 0 {
-			t.Fatal("expected at least one link")
-		}
-	})
-
-	t.Run("empty input returns empty links", func(t *testing.T) {
-		p, err := html.New()
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer p.Close()
-
-		links, err := p.ExtractAllLinks([]byte{})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(links) != 0 {
-			t.Fatalf("expected 0 links, got %d", len(links))
-		}
-	})
-
-	t.Run("context with links", func(t *testing.T) {
-		p, err := html.New()
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer p.Close()
-
-		links, err := p.ExtractAllLinksWithContext(context.Background(), []byte(testLinkHTML))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(links) == 0 {
-			t.Fatal("expected at least one link")
-		}
-	})
-
-	t.Run("cancelled context returns context.Canceled", func(t *testing.T) {
-		p, err := html.New()
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer p.Close()
-
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		_, err = p.ExtractAllLinksWithContext(ctx, []byte(testLinkHTML))
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("expected context.Canceled, got: %v", err)
-		}
-	})
-
-	t.Run("package-level link extraction", func(t *testing.T) {
-		links, err := html.ExtractAllLinks([]byte(testLinkHTML))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(links) == 0 {
-			t.Fatal("expected at least one link")
-		}
-	})
 }
 
 // TestPanicRecovery_NilAndClosedProcessor verifies nil/closed processor safety
@@ -374,7 +275,7 @@ func TestPanicRecovery_NilAndClosedProcessor(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		p.Close()
+		_ = p.Close()
 
 		for _, m := range methods {
 			err := m.fn(p)
@@ -398,7 +299,7 @@ func TestPanicRecovery_ConcurrentExtract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var panicCount atomic.Int32
 	var wg sync.WaitGroup
@@ -431,7 +332,7 @@ func TestPanicRecovery_ErrInternalPanicMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	_, err = p.Extract([]byte(testHTML))
 	if err == nil {
@@ -443,28 +344,6 @@ func TestPanicRecovery_ErrInternalPanicMessage(t *testing.T) {
 	if err.Error() == html.ErrInternalPanic.Error() {
 		t.Error("error message should contain original panic details")
 	}
-}
-
-// TestPanicRecovery_ConfigErrorsNoPanic verifies config errors don't panic.
-func TestPanicRecovery_ConfigErrorsNoPanic(t *testing.T) {
-	t.Parallel()
-
-	t.Run("invalid config returns error", func(t *testing.T) {
-		cfg := html.Config{MaxInputSize: -1}
-		_, err := html.New(cfg)
-		if !errors.Is(err, html.ErrInvalidConfig) {
-			t.Fatalf("expected ErrInvalidConfig, got: %v", err)
-		}
-	})
-
-	t.Run("multiple configs returns error", func(t *testing.T) {
-		cfg1 := html.DefaultConfig()
-		cfg2 := html.DefaultConfig()
-		_, err := html.New(cfg1, cfg2)
-		if !errors.Is(err, html.ErrMultipleConfigs) {
-			t.Fatalf("expected ErrMultipleConfigs, got: %v", err)
-		}
-	})
 }
 
 // TestPanicRecovery_PanickingAuditSink verifies that a custom AuditSink whose

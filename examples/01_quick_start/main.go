@@ -9,6 +9,9 @@ import (
 
 // This example demonstrates the fastest way to get started with the library.
 // Perfect for first-time users who want to see immediate results.
+//
+// NOTE: Section 4 elides extraction errors for brevity;
+// see 07_error_handling for proper error-handling patterns.
 func main() {
 	fmt.Println("=== Quick Start ===")
 	fmt.Println()
@@ -51,7 +54,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	docs := []string{
 		`<article><h1>First Post</h1><p>Content 1</p></article>`,
@@ -94,7 +97,7 @@ func main() {
 	fullBodyCfg := html.DefaultConfig()
 	fullBodyCfg.ExtractArticle = false
 	fullBodyProc, _ := html.New(fullBodyCfg)
-	defer fullBodyProc.Close()
+	defer func() { _ = fullBodyProc.Close() }()
 	fullResult, _ := fullBodyProc.Extract([]byte(pageWithExtra))
 	fmt.Printf("   ExtractArticle=false:\n     %s\n", fullResult.Text)
 

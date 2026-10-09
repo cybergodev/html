@@ -85,7 +85,7 @@ func TestExtractToMarkdownEncoding(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() failed: %v", err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		markdown, err := p.ExtractToMarkdown(htmlBytes)
 		if err != nil {
@@ -112,7 +112,7 @@ func TestExtractToMarkdownEncoding(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() failed: %v", err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		markdown, err := p.ExtractToMarkdown(htmlBytes)
 		if err != nil {
@@ -178,7 +178,7 @@ func TestExtractAllLinksWithEncoding(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() failed: %v", err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		links, err := p.ExtractAllLinks(htmlBytes)
 		if err != nil {
@@ -199,7 +199,7 @@ func TestExtractAllLinksWithEncoding(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() failed: %v", err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		links, err := p.ExtractAllLinks(htmlBytes)
 		if err != nil {
@@ -233,7 +233,7 @@ func TestExtractWithForcedEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	result, err := p.Extract(htmlBytes)
 	if err != nil {

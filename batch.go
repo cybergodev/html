@@ -54,11 +54,7 @@ func uniformErrorBatch(n int, err error) *BatchResult {
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
 func ExtractBatch(htmlContents [][]byte, cfg ...Config) *BatchResult {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return uniformErrorBatch(len(htmlContents), err)
-	}
-	return withProcessorBatch(pooled, c, len(htmlContents), func(p *Processor) *BatchResult {
+	return withConfigBatch(cfg, len(htmlContents), func(p *Processor) *BatchResult {
 		return p.ExtractBatch(htmlContents)
 	})
 }
@@ -70,11 +66,7 @@ func ExtractBatch(htmlContents [][]byte, cfg ...Config) *BatchResult {
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
 func ExtractBatchWithContext(ctx context.Context, htmlContents [][]byte, cfg ...Config) *BatchResult {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return uniformErrorBatch(len(htmlContents), err)
-	}
-	return withProcessorBatch(pooled, c, len(htmlContents), func(p *Processor) *BatchResult {
+	return withConfigBatch(cfg, len(htmlContents), func(p *Processor) *BatchResult {
 		return p.ExtractBatchWithContext(ctx, htmlContents)
 	})
 }
@@ -86,11 +78,7 @@ func ExtractBatchWithContext(ctx context.Context, htmlContents [][]byte, cfg ...
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
 func ExtractBatchFiles(filePaths []string, cfg ...Config) *BatchResult {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return uniformErrorBatch(len(filePaths), err)
-	}
-	return withProcessorBatch(pooled, c, len(filePaths), func(p *Processor) *BatchResult {
+	return withConfigBatch(cfg, len(filePaths), func(p *Processor) *BatchResult {
 		return p.ExtractBatchFiles(filePaths)
 	})
 }
@@ -102,11 +90,7 @@ func ExtractBatchFiles(filePaths []string, cfg ...Config) *BatchResult {
 // An optional Config can be provided to customize extraction behavior.
 // If no config is provided, DefaultConfig() is used.
 func ExtractBatchFilesWithContext(ctx context.Context, filePaths []string, cfg ...Config) *BatchResult {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return uniformErrorBatch(len(filePaths), err)
-	}
-	return withProcessorBatch(pooled, c, len(filePaths), func(p *Processor) *BatchResult {
+	return withConfigBatch(cfg, len(filePaths), func(p *Processor) *BatchResult {
 		return p.ExtractBatchFilesWithContext(ctx, filePaths)
 	})
 }
@@ -287,7 +271,7 @@ func closedBatchResult(count int) *BatchResult {
 		Errors:  make([]error, count),
 		Failed:  count,
 	}
-	for i := 0; i < count; i++ {
+	for i := range count {
 		br.Errors[i] = ErrProcessorClosed
 	}
 	return br

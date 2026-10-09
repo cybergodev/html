@@ -25,34 +25,6 @@ func isStructureRow(cells []CellData) bool {
 	return hasWidthDefinitions && !hasRealContent
 }
 
-// expandColspanCells expands cells with colspan > 1 into multiple placeholder cells.
-// This is needed for Markdown format which doesn't support colspan.
-func expandColspanCells(rawCells []CellData) []CellData {
-	cells := make([]CellData, 0, len(rawCells))
-
-	for _, rawCell := range rawCells {
-		// Add the original cell
-		cells = append(cells, rawCell)
-
-		// Add placeholder cells for colspan > 1
-		originalAlign := rawCell.Align
-		for i := 1; i < rawCell.Colspan; i++ {
-			cells = append(cells, CellData{
-				Text:            " ",
-				Align:           originalAlign,
-				Colspan:         1,
-				Rowspan:         rawCell.Rowspan,
-				IsHeader:        rawCell.IsHeader,
-				Width:           "",
-				IsExpanded:      true,
-				OriginalColspan: 1,
-			})
-		}
-	}
-
-	return cells
-}
-
 // anyRowspan reports whether any cell in the table declares rowspan > 1.
 // applyRowspanGrid uses it to skip its grid rebuild when the table has no
 // rowspans (the common case), since the rebuild is then an identity transform.

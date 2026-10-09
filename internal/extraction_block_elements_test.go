@@ -397,7 +397,7 @@ func BenchmarkNewBlockElementExtraction(b *testing.B) {
 	</main>`
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		doc, err := html.Parse(strings.NewReader(htmlContent))
 		if err != nil {
 			b.Fatalf("Failed to parse HTML: %v", err)

@@ -27,7 +27,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	doc := []byte(`<html><body><article><h1>Contexts</h1><p>Cooperative cancellation lets callers stop work early.</p></article></body></html>`)
 
@@ -101,7 +101,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer timeoutProc.Close()
+	defer func() { _ = timeoutProc.Close() }()
 	fmt.Printf("  Configured ProcessingTimeout: %v\n", timeoutCfg.ProcessingTimeout)
 	fmt.Println("  On a large/slow document a fired budget → html.ErrProcessingTimeout")
 	fmt.Println("  (not triggered live: small inputs finish well under budget.)")

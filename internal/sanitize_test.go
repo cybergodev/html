@@ -88,7 +88,7 @@ func BenchmarkSanitizeHTML(b *testing.B) {
 	htmlContent := `<html><body><div>Content<script>alert('test')</script><style>body{}</style><noscript>No JS</noscript>More</div></body></html>`
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		SanitizeHTML(htmlContent)
 	}
 }
@@ -678,7 +678,7 @@ func mustRenderBody(t *testing.T, doc *html.Node) string {
 	}
 	var buf bytes.Buffer
 	for child := body.FirstChild; child != nil; child = child.NextSibling {
-		html.Render(&buf, child)
+		_ = html.Render(&buf, child)
 	}
 	return buf.String()
 }
@@ -845,4 +845,129 @@ func TestFindBodyElement(t *testing.T) {
 			t.Errorf("findBodyElement on a body-less document returned %v, want nil", got)
 		}
 	})
+}
+
+// urlCaptureAudit records every blocked URL verbatim so tests can assert the
+// exact value passed to the audit recorder.
+type urlCaptureAudit struct {
+	urls    []string
+	reasons []string
+}
+
+func (c *urlCaptureAudit) RecordBlockedTag(string)          {}
+func (c *urlCaptureAudit) RecordBlockedAttr(string, string) {}
+func (c *urlCaptureAudit) RecordBlockedURL(url, reason string) {
+	c.urls = append(c.urls, url)
+	c.reasons = append(c.reasons, reason)
+}
+
+// TestSanitizeSVGDataURLAuditTruncation verifies the SVG data-URL block passes
+// a truncated URL to the audit recorder. data: URLs are exempt from the
+// MaxURLLength gate in isSafeURIWithAudit and this branch runs before the
+// MaxDataURILength check inside isValidDataURLWithAudit, so it can receive a
+// value as large as MaxInputSize; recording it verbatim would let a single
+// attribute flood the audit log with megabytes (GEN-001 audit finding).
+func TestSanitizeSVGDataURLAuditTruncation(t *testing.T) {
+	t.Parallel()
+
+	hugeSVG := "data:image/svg+xml," + strings.Repeat("A", 200_000)
+	var audit urlCaptureAudit
+	if isSafeURIWithAudit(hugeSVG, &audit) {
+		t.Fatal("isSafeURIWithAudit should reject an SVG data URL")
+	}
+	if len(audit.urls) != 1 {
+		t.Fatalf("recorded %d blocked URLs, want 1", len(audit.urls))
+	}
+	if got, want := audit.urls[0], TruncateAuditURL(hugeSVG); got != want {
+		t.Errorf("recorded URL = %d bytes, want the truncated form (%d bytes)",
+			len(got), len(want))
+	}
+	if !strings.HasSuffix(audit.urls[0], "...[truncated]") {
+		t.Error("recorded URL should carry the truncation marker")
+	}
+}
+
+// referenceContainsDangerousScheme is the pre-fast-path implementation of
+// containsDangerousScheme, kept verbatim as the differential oracle for the
+// printable-ASCII fast path now at the top of that function.
+func referenceContainsDangerousScheme(uri string) bool {
+	if uri == "" {
+		return false
+	}
+	normalized := normalizeURIForSecurity(uri)
+	trimmed := strings.TrimSpace(normalized)
+	schemeStripped := strings.Trim(trimmed, c0ControlOrSpace)
+	lowerURI := strings.ToLower(stripURLWhitespace(schemeStripped))
+
+	if isDangerousScheme(lowerURI, "javascript:") ||
+		isDangerousScheme(lowerURI, "vbscript:") ||
+		isDangerousScheme(lowerURI, "file:") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "//") {
+		restLower := strings.ToLower(strings.TrimLeft(trimmed[2:], " \t\n\r"))
+		if isDangerousScheme(restLower, "javascript:") ||
+			isDangerousScheme(restLower, "vbscript:") ||
+			isDangerousScheme(restLower, "data:") ||
+			isDangerousScheme(restLower, "file:") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestContainsDangerousSchemeFastPathEquivalence drives both the optimized
+// containsDangerousScheme and its reference pipeline over a corpus of scheme
+// disguises and requires identical verdicts.
+func TestContainsDangerousSchemeFastPathEquivalence(t *testing.T) {
+	corpus := []string{
+		"javascript:alert(1)",
+		"JavaScript:alert(1)",
+		"JAVASCRIPT:alert(1)",
+		"vbscript:msg",
+		"file:///etc/passwd",
+		"FILE:///x",
+		"javascript\t:alert(1)",
+		"\x01javascript:alert(1)",
+		" javascript:alert(1)",
+		"//javascript:alert(1)",
+		"// javascript:alert(1)",
+		"//vbscript:x",
+		"//data:text/html,x",
+		"//file:/x",
+		"ｊａｖａｓｃｒｉｐｔ:alert(1)", // fullwidth
+		"https://ok.test/a.mp4",
+		"/relative/path",
+		"mailto:a@b.test",
+		"data:image/png;base64,AAAA",
+		"http://file.example.com/", // "file." substring, not a scheme
+		"notjavascript:x",
+		"xjavascript:x",
+		"a\tb\rc\nd",
+		"sp ace.js",
+		";drop;",
+		strings.Repeat("j", 64) + ":x",
+	}
+	for _, uri := range corpus {
+		want := referenceContainsDangerousScheme(uri)
+		got := containsDangerousScheme(uri)
+		if got != want {
+			t.Errorf("containsDangerousScheme(%q) = %v, reference = %v", uri, got, want)
+		}
+	}
+}
+
+// TestIsPlainPrintableASCIIPartitions pins the fast-path predicate: printable
+// ASCII passes; whitespace, controls, DEL, and any 8-bit byte fail.
+func TestIsPlainPrintableASCIIPartitions(t *testing.T) {
+	for b := 0; b < 256; b++ {
+		s := string([]byte{byte(b)})
+		want := b >= 0x21 && b <= 0x7E
+		if got := isPlainPrintableASCII(s); got != want {
+			t.Errorf("isPlainPrintableASCII(%q) = %v, want %v", s, got, want)
+		}
+	}
+	if isPlainPrintableASCII("") {
+		t.Error("empty string must not be plain printable ASCII")
+	}
 }

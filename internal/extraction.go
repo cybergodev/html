@@ -10,6 +10,7 @@ import (
 	"golang.org/x/net/html"
 )
 
+// TrackedBuilder Write* methods satisfy io.Writer but always return nil errors (plain byte-slice append); the discards in this file are deliberate.
 // writeInt writes a non-negative integer to the builder without allocating a string.
 func writeInt(tb *table.TrackedBuilder, n int) {
 	if n < 10 {
@@ -17,7 +18,7 @@ func writeInt(tb *table.TrackedBuilder, n int) {
 		return
 	}
 	var buf [20]byte
-	tb.Write(strconv.AppendInt(buf[:0], int64(n), 10))
+	_, _ = tb.Write(strconv.AppendInt(buf[:0], int64(n), 10))
 }
 
 // ExtractTextWithStructureAndImages extracts text content from an HTML node tree
@@ -58,7 +59,7 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 			hasTrailingSpace := strings.HasSuffix(textData, " ") || strings.HasSuffix(textData, "\t")
 			content := strings.TrimSpace(textData)
 			if content != "" {
-				tb.WriteString(content)
+				_, _ = tb.WriteString(content)
 				// Preserve trailing space UNLESS next sibling is a namespace tag
 				// Namespace tags (ix:*, xbrl:*, etc.) should be concatenated without spaces
 				if hasTrailingSpace {
@@ -81,7 +82,7 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 			content := strings.TrimSpace(textData)
 			if content != "" {
 				table.EnsureSpacing(tb, ' ')
-				tb.WriteString(content)
+				_, _ = tb.WriteString(content)
 				// Preserve trailing space from original HTML
 				if hasTrailingSpace {
 					_ = tb.WriteByte(' ')
@@ -101,16 +102,16 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 			}
 			*imageCounter++
 			table.EnsureNewline(tb)
-			tb.WriteString("[IMAGE:")
+			_, _ = tb.WriteString("[IMAGE:")
 			writeInt(tb, *imageCounter)
-			tb.WriteString("]\n")
+			_, _ = tb.WriteString("]\n")
 			return
 		}
 		if node.Data == "a" && linkCounter != nil {
 			*linkCounter++
-			tb.WriteString("[LINK:")
+			_, _ = tb.WriteString("[LINK:")
 			writeInt(tb, *linkCounter)
-			tb.WriteString("]")
+			_, _ = tb.WriteString("]")
 			// Continue processing children for link text
 		}
 		if node.Data == "br" {
@@ -157,13 +158,13 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 			// Add Markdown list/indentation prefix (list markers for <li>,
 			// padding-left based indentation for other indented blocks).
 			if listPrefix := blockListPrefix(node); listPrefix != "" {
-				tb.WriteString(listPrefix)
+				_, _ = tb.WriteString(listPrefix)
 			}
 			startLen = tb.Len()
 		} else if isBlockElement && startLen == 0 {
 			// First element - add list/indentation prefix if applicable.
 			if listPrefix := blockListPrefix(node); listPrefix != "" {
-				tb.WriteString(listPrefix)
+				_, _ = tb.WriteString(listPrefix)
 				startLen = tb.Len()
 			}
 		}
@@ -173,7 +174,7 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 		}
 		// Add closing link tag after processing children
 		if node.Data == "a" && linkCounter != nil {
-			tb.WriteString("[/LINK]")
+			_, _ = tb.WriteString("[/LINK]")
 		}
 		hasContent := tb.Len() > startLen
 		if isBlockElement && hasContent {

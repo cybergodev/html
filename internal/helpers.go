@@ -123,32 +123,22 @@ func normalizeText(s string) string {
 		return s
 	}
 
-	// Single scan to detect what processing is needed
+	// First-modification scan via vectorized stdlib searches: firstMod is the
+	// earliest position of any trigger — a newline/CR, an '&', or an NBSP pair
+	// (whose trigger position is the start of its 2-byte UTF-8 sequence). The
+	// former byte-at-a-time loop was a profiled cost on text-heavy documents.
 	n := len(s)
-	hasNBSP := false
-	hasNewline := false
-	hasAmpersand := false
+	nlIdx := strings.IndexByte(s, '\n')
+	crIdx := strings.IndexByte(s, '\r')
+	ampIdx := strings.IndexByte(s, '&')
+	nbspIdx := strings.Index(s, " ")
+	hasNewline := nlIdx >= 0 || crIdx >= 0
+	hasAmpersand := ampIdx >= 0
+	hasNBSP := nbspIdx >= 0
 	firstMod := -1
-
-	for i := 0; i < n; i++ {
-		c := s[i]
-		switch {
-		case c == '\n' || c == '\r':
-			if firstMod == -1 {
-				firstMod = i
-			}
-			hasNewline = true
-		case c == '&':
-			if firstMod == -1 {
-				firstMod = i
-			}
-			hasAmpersand = true
-		case c == 0xC2 && i+1 < n && s[i+1] == 0xA0:
-			// UTF-8 encoding of NBSP (U+00A0)
-			if firstMod == -1 {
-				firstMod = i
-			}
-			hasNBSP = true
+	for _, idx := range [...]int{nlIdx, crIdx, ampIdx, nbspIdx} {
+		if idx >= 0 && (firstMod == -1 || idx < firstMod) {
+			firstMod = idx
 		}
 	}
 
@@ -298,39 +288,22 @@ func CleanText(text string) string {
 		return ""
 	}
 
-	// Fast path: check if processing is needed
+	// Classification scan: each flag is a whole-text property expressible as a
+	// vectorized stdlib search, so the former byte-at-a-time loop is replaced by
+	// a handful of SIMD-backed scans (the loop was a profiled hotspot at document
+	// scale). hasMultipleSpaces matches the loop it replaces exactly: a tab
+	// anywhere, or two adjacent spaces — the loop's prevSpace tracked only the
+	// immediately preceding space, so "a  b" and "x\ty" are precisely the shapes
+	// that set it.
+	hasNewlines := strings.IndexByte(text, '\n') >= 0
+	hasTabs := strings.IndexByte(text, '\t') >= 0
+	hasMultipleSpaces := hasTabs || strings.Contains(text, "  ")
+	hasNBSP := strings.Contains(text, " ")
+	hasAmpersand := strings.IndexByte(text, '&') >= 0
+	hasUnwanted := strings.Contains(text, "☒") ||
+		strings.Contains(text, "☐") ||
+		strings.Contains(text, "☑")
 	n := len(text)
-	hasNewlines := false
-	hasMultipleSpaces := false
-	hasNBSP := false
-	hasUnwanted := false
-	hasAmpersand := false
-	prevSpace := false
-
-	for i := 0; i < n; i++ {
-		c := text[i]
-		switch {
-		case c == '\n':
-			hasNewlines = true
-		case c == '\t':
-			hasMultipleSpaces = true
-		case c == ' ':
-			if prevSpace {
-				hasMultipleSpaces = true
-			}
-			prevSpace = true
-			continue
-		case c == 0xC2 && i+1 < n && text[i+1] == 0xA0:
-			hasNBSP = true
-		case c == '&':
-			hasAmpersand = true
-		case c == 0xE2 && i+2 < n:
-			if text[i+1] == 0x98 && (text[i+2] == 0x92 || text[i+2] == 0x90 || text[i+2] == 0x91) {
-				hasUnwanted = true
-			}
-		}
-		prevSpace = false
-	}
 
 	if !hasNewlines && !hasMultipleSpaces && !hasNBSP && !hasUnwanted {
 		if hasAmpersand {
@@ -339,6 +312,10 @@ func CleanText(text string) string {
 		return text
 	}
 
+	// When the classification pass found no tab and no adjacent spaces, no line
+	// below can need compression either — the per-line scans are skipped.
+	anyCompressible := hasMultipleSpaces
+
 	// Normalize NBSP (U+00A0, UTF-8 0xC2 0xA0) to a regular space, matching
 	// normalizeText and GetTextContent. hasNBSP routed us here, but the body
 	// below only matches ' ' and '\t', so without this the NBSP bytes passed
@@ -346,6 +323,10 @@ func CleanText(text string) string {
 	if hasNBSP {
 		text = strings.ReplaceAll(text, " ", " ")
 		n = len(text)
+		// The NBSP→space rewrite can create new adjacent-space pairs (NBSP
+		// followed by space becomes two spaces), so re-evaluate
+		// anyCompressible on the rewritten text.
+		anyCompressible = anyCompressible || strings.Contains(text, "  ")
 	}
 
 	// Use a capacity-retaining pooled []byte instead of BuilderPool: a pooled
@@ -379,20 +360,24 @@ func CleanText(text string) string {
 
 				contentLen := len(contentPart)
 				if contentLen > 0 {
-					// Scan for compression need
+					// Scan for compression need. Skipped entirely when the
+					// classification pass proved no tab or space pair exists
+					// anywhere in the text (anyCompressible).
 					needsCompress := false
-					prevSp := false
-					for j := 0; j < contentLen; j++ {
-						c := contentPart[j]
-						if c == '\t' {
-							needsCompress = true
-							break
+					if anyCompressible {
+						prevSp := false
+						for j := 0; j < contentLen; j++ {
+							c := contentPart[j]
+							if c == '\t' {
+								needsCompress = true
+								break
+							}
+							if c == ' ' && prevSp {
+								needsCompress = true
+								break
+							}
+							prevSp = c == ' '
 						}
-						if c == ' ' && prevSp {
-							needsCompress = true
-							break
-						}
-						prevSp = c == ' '
 					}
 
 					// Trim trailing spaces/tabs
@@ -447,10 +432,15 @@ func CleanText(text string) string {
 	return result
 }
 
-// maxWalkDepth limits the maximum traversal depth to prevent memory exhaustion
-// from deeply nested or malformed HTML documents.
-// SECURITY: This limit prevents potential DoS attacks through deeply nested structures.
-const maxWalkDepth = 50000
+// maxWalkNodes caps the number of nodes a single WalkNodes call may visit,
+// bounding the traversal stack's memory on pathologically large documents.
+// Despite the historical name (maxWalkDepth), this is a total node-count
+// limit, NOT a tree-depth limit — nesting depth is bounded separately by
+// Config.MaxDepth before any recursive pass runs.
+// SECURITY: This limit prevents potential DoS attacks through extremely large
+// node counts. Traversal past the cap stops silently; callers that must know
+// use WalkNodesWithTruncation.
+const maxWalkNodes = 50000
 
 // WalkNodes traverses the HTML node tree iteratively using an explicit stack
 // to avoid potential stack overflow on deeply nested documents.
@@ -458,8 +448,8 @@ const maxWalkDepth = 50000
 // stops for that branch (node's children are not visited).
 // Optimized with pooled stack slice to reduce allocations.
 //
-// SECURITY: Traversal is limited to maxWalkDepth (50,000) nodes to prevent
-// memory exhaustion attacks through deeply nested or recursive structures.
+// SECURITY: Traversal is limited to maxWalkNodes (50,000) visited nodes to
+// prevent memory exhaustion attacks through extremely large structures.
 // If the limit is exceeded, traversal stops early without notification.
 // For applications that need to know if traversal was truncated, use WalkNodesWithTruncation.
 func WalkNodes(node *html.Node, fn func(*html.Node) bool) {
@@ -472,11 +462,11 @@ func WalkNodes(node *html.Node, fn func(*html.Node) bool) {
 // stops for that branch (node's children are not visited).
 //
 // Returns:
-//   - truncated: true if traversal was stopped due to exceeding maxWalkDepth limit
+//   - truncated: true if traversal was stopped due to exceeding the maxWalkNodes limit
 //   - visited: the number of nodes visited before completion or truncation
 //
-// SECURITY: Traversal is limited to maxWalkDepth (50,000) nodes to prevent
-// memory exhaustion attacks through deeply nested or recursive structures.
+// SECURITY: Traversal is limited to maxWalkNodes (50,000) visited nodes to
+// prevent memory exhaustion attacks through extremely large structures.
 //
 // Optimized with pooled stack slice to reduce allocations.
 func WalkNodesWithTruncation(node *html.Node, fn func(*html.Node) bool) (truncated bool, visited int) {
@@ -498,7 +488,7 @@ func WalkNodesWithTruncation(node *html.Node, fn func(*html.Node) bool) (truncat
 	for len(stack) > 0 {
 		// SECURITY: Check depth limit to prevent memory exhaustion
 		visitedCount++
-		if visitedCount > maxWalkDepth {
+		if visitedCount > maxWalkNodes {
 			// Stop traversal to prevent memory exhaustion
 			// Update the pointer for pool return before returning
 			*stackPtr = stack
@@ -622,23 +612,11 @@ func GetTextContent(node *html.Node) string {
 			// Extract trimmed content and apply normalizations in one pass
 			trimmed := data[start : end+1]
 
-			// Fast check: does the trimmed content need any processing?
-			hasNBSP := false
-			hasNewline := false
-			hasAmp := false
-			for i := 0; i < len(trimmed); i++ {
-				c := trimmed[i]
-				if c == '\n' || c == '\r' {
-					hasNewline = true
-				} else if c == '&' {
-					hasAmp = true
-				} else if c == 0xC2 && i+1 < len(trimmed) && trimmed[i+1] == 0xA0 {
-					hasNBSP = true
-				}
-			}
-
+			// textNeedsNormalization checks exactly the three triggers the
+			// per-byte loop it replaced tested for (newline/CR, '&', NBSP); a
+			// false result proves the normalization pass below is an identity.
 			var text string
-			if !hasNBSP && !hasNewline && !hasAmp {
+			if !textNeedsNormalization(trimmed) {
 				text = trimmed
 			} else {
 				// Build normalized text in a pooled scratch buffer.
@@ -723,6 +701,34 @@ var entityReplacer = strings.NewReplacer(
 	"&micro;", "µ",
 )
 
+// needsEntityDecoding reports whether s contains an '&' that could begin an
+// entity reference the decoding passes might rewrite: one followed by '#'
+// (numeric) or followed by a ';' within maxEntityScanLen (named). Both
+// entityReplacer entries and replaceHTMLEntitiesFull rewrite text only at such
+// positions, so a false result proves those passes would return their input
+// unchanged. A lone '&' without a terminator (e.g. "Tom & Jerry") is extremely
+// common in extracted text, so this guard lets ReplaceHTMLEntities skip both
+// the replacer pass — which allocates a full copy even when it replaces
+// nothing — and the full per-entity walk.
+func needsEntityDecoding(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '&' {
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '#' {
+			return true
+		}
+		scanEnd := i + maxEntityScanLen
+		if scanEnd > len(s) {
+			scanEnd = len(s)
+		}
+		if strings.IndexByte(s[i:scanEnd], ';') >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // ReplaceHTMLEntities replaces HTML entities with their corresponding characters.
 // It handles both named entities (like &amp;, &nbsp;) and numeric entities (like &#65;, &#x41;).
 // For unknown entities, it falls back to the standard library's html.UnescapeString.
@@ -736,17 +742,27 @@ func ReplaceHTMLEntities(text string) string {
 	// This avoids the overhead of strings.NewReplacer for the majority case
 	result := fastReplaceCommonEntities(text)
 	if result != text {
-		// If we replaced entities, still need to handle numeric ones
+		// Common entities were replaced. The full pass below only rewrites
+		// numeric or unknown named entities; when none remain possible, the
+		// replaced result is already final and the extra full-document copy
+		// (pooled buffer + string conversion) is skipped.
+		if !needsEntityDecoding(result) {
+			return result
+		}
+		// Still need to handle numeric and unknown named entities
 		return replaceHTMLEntitiesFull(result)
 	}
 
 	// Slow path: an '&' is present but no common entity matched. Every entry in
-	// entityReplacer is of the form "&name;", so it cannot match when the text
-	// contains no ';'. A lone '&' is extremely common in extracted text (e.g.
-	// "Tom & Jerry"), and strings.NewReplacer allocates a full copy even when it
-	// replaces nothing — guarding on ';' eliminated ~8.6% of all allocations.
-	// When a ';' is present the original behavior is preserved; either way
-	// replaceHTMLEntitiesFull (which always runs below) decodes every entity.
+	// entityReplacer is of the form "&name;", so it cannot match when no '&' is
+	// followed by a ';' at all; needsEntityDecoding establishes exactly that
+	// (plus the '#' numeric form) in one allocation-free scan, a strictly
+	// stronger guard than the previous ';' presence check. When a terminator is
+	// present the original behavior is preserved; either way
+	// replaceHTMLEntitiesFull (which runs below) decodes every entity.
+	if !needsEntityDecoding(text) {
+		return text
+	}
 	if strings.IndexByte(text, ';') != -1 {
 		text = entityReplacer.Replace(text)
 	}
@@ -760,32 +776,31 @@ func ReplaceHTMLEntities(text string) string {
 func fastReplaceCommonEntities(text string) string {
 	textLen := len(text)
 
-	// Single scan to find first ampersand AND check for common entities
-	// This merges two separate loops into one for better cache locality
-	firstAmpersand := -1
-	hasCommonEntity := false
-
-	for i := 0; i < textLen; i++ {
-		if text[i] == '&' {
-			if firstAmpersand == -1 {
-				firstAmpersand = i
-			}
-			// Immediately check for a common entity at this position (table-driven).
-			if !hasCommonEntity {
-				remLen := textLen - i
-				for _, e := range commonHTMLEntities {
-					if remLen >= len(e.token) && text[i:i+len(e.token)] == e.token {
-						hasCommonEntity = true
-						break
-					}
-				}
-			}
-		}
-	}
+	// Locate the first ampersand with the vectorized IndexByte, then hop
+	// ampersand-to-ampersand checking each against the common-entity table.
+	// The previous byte-at-a-time scan walked the whole text once per call.
+	firstAmpersand := strings.IndexByte(text, '&')
 
 	// Fast path: no ampersands means no entities possible
 	if firstAmpersand == -1 {
 		return text
+	}
+
+	hasCommonEntity := false
+	for i := firstAmpersand; i < textLen && !hasCommonEntity; {
+		// Check for a common entity at this position (table-driven).
+		remLen := textLen - i
+		for _, e := range commonHTMLEntities {
+			if remLen >= len(e.token) && text[i:i+len(e.token)] == e.token {
+				hasCommonEntity = true
+				break
+			}
+		}
+		next := strings.IndexByte(text[i+1:], '&')
+		if next < 0 {
+			break
+		}
+		i += 1 + next
 	}
 
 	// Fast path: ampersands present but no common entities
@@ -805,8 +820,16 @@ func fastReplaceCommonEntities(text string) string {
 	i := firstAmpersand
 	for i < textLen {
 		if text[i] != '&' {
-			*bp = append(*bp, text[i])
-			i++
+			// Copy the span through the next '&' (or the rest of the text)
+			// in one append instead of one byte at a time.
+			next := strings.IndexByte(text[i:], '&')
+			if next < 0 {
+				*bp = append(*bp, text[i:]...)
+				break
+			}
+			next += i
+			*bp = append(*bp, text[i:next]...)
+			i = next
 			continue
 		}
 
@@ -840,6 +863,9 @@ func fastReplaceCommonEntities(text string) string {
 }
 
 // replaceHTMLEntitiesFull handles numeric entities and unknown named entities.
+// Runs between '&' positions are appended as whole spans rather than
+// byte-by-byte: the entities themselves are far shorter than the text around
+// them, so the bulk appends dominate the loop on entity-bearing input.
 func replaceHTMLEntitiesFull(text string) string {
 	// Use capacity-retaining pooled []byte for better memory efficiency
 	bp := GetByteBuf()
@@ -848,8 +874,16 @@ func replaceHTMLEntitiesFull(text string) string {
 	i := 0
 	for i < len(text) {
 		if text[i] != '&' {
-			*bp = append(*bp, text[i])
-			i++
+			// Copy the span through the next '&' (or the rest of the text)
+			// in one append instead of one byte at a time.
+			next := strings.IndexByte(text[i:], '&')
+			if next < 0 {
+				*bp = append(*bp, text[i:]...)
+				break
+			}
+			next += i
+			*bp = append(*bp, text[i:next]...)
+			i = next
 			continue
 		}
 
@@ -1042,12 +1076,30 @@ func IsValidURL(url string) bool {
 		return false
 	}
 
-	// Special handling for data URLs - stricter validation with size limit
+	// Special handling for data URLs - stricter validation with size limit.
+	//
+	// SECURITY: the media-type policy must match the DOM sanitizer exactly.
+	// IsValidURL gates paths that deliberately bypass sanitization
+	// (ExtractAllLinks, the raw-HTML video/audio scan), so without the
+	// safeMediaTypes whitelist a percent-encoded data URL declaring a
+	// script-executing type — "data:image/svg+xml,%3Csvg onload=…%3E" contains
+	// no raw <>"' and passed the charset scan below — would reach results as a
+	// clickable link. dataURLMediaType is shared with isValidDataURLWithAudit
+	// so the two gates enforce one policy (see isSafeURIWithAudit).
 	if strings.HasPrefix(url, "data:") {
 		if urlLen > MaxDataURILength {
 			return false
 		}
-		for i := 5; i < urlLen; i++ {
+		// commaIdx <= 5 covers a missing comma and "data:,…" (empty media part).
+		commaIdx := strings.IndexByte(url, ',')
+		if commaIdx <= 5 {
+			return false
+		}
+		mediaType, ok := dataURLMediaType(url[5:commaIdx])
+		if !ok || !isValidMediaType(mediaType) || !isSafeMediaType(mediaType) {
+			return false
+		}
+		for i := commaIdx + 1; i < urlLen; i++ {
 			b := url[i]
 			if b < 32 || b > 126 || b == '<' || b == '>' || b == '"' || b == '\'' || b == '\\' {
 				return false

@@ -21,12 +21,12 @@ func TestTrackedBuilder(t *testing.T) {
 	t.Run("tracks last character after WriteString", func(t *testing.T) {
 		tb := table.NewTrackedBuilder()
 
-		tb.WriteString("hello")
+		_, _ = tb.WriteString("hello")
 		if tb.LastChar != 'o' {
 			t.Errorf("LastChar = %c, want 'o'", tb.LastChar)
 		}
 
-		tb.WriteString(" world")
+		_, _ = tb.WriteString(" world")
 		if tb.LastChar != 'd' {
 			t.Errorf("LastChar = %c, want 'd'", tb.LastChar)
 		}
@@ -35,12 +35,12 @@ func TestTrackedBuilder(t *testing.T) {
 	t.Run("tracks last character after WriteByte", func(t *testing.T) {
 		tb := table.NewTrackedBuilder()
 
-		tb.WriteByte('x')
+		_ = tb.WriteByte('x')
 		if tb.LastChar != 'x' {
 			t.Errorf("LastChar = %c, want 'x'", tb.LastChar)
 		}
 
-		tb.WriteByte('\n')
+		_ = tb.WriteByte('\n')
 		if tb.LastChar != '\n' {
 			t.Errorf("LastChar = %c, want newline", tb.LastChar)
 		}
@@ -49,7 +49,7 @@ func TestTrackedBuilder(t *testing.T) {
 	t.Run("EnsureNewline adds newline when needed", func(t *testing.T) {
 		tb := table.NewTrackedBuilder()
 
-		tb.WriteString("text")
+		_, _ = tb.WriteString("text")
 		table.EnsureNewline(tb)
 
 		if tb.LastChar != '\n' {
@@ -63,7 +63,7 @@ func TestTrackedBuilder(t *testing.T) {
 	t.Run("EnsureNewline does not add duplicate newline", func(t *testing.T) {
 		tb := table.NewTrackedBuilder()
 
-		tb.WriteString("text\n")
+		_, _ = tb.WriteString("text\n")
 		table.EnsureNewline(tb)
 
 		if tb.String() != "text\n" {
@@ -74,7 +74,7 @@ func TestTrackedBuilder(t *testing.T) {
 	t.Run("EnsureSpacing adds spacing when needed", func(t *testing.T) {
 		tb := table.NewTrackedBuilder()
 
-		tb.WriteString("text")
+		_, _ = tb.WriteString("text")
 		table.EnsureSpacing(tb, ' ')
 
 		if tb.LastChar != ' ' {
@@ -85,7 +85,7 @@ func TestTrackedBuilder(t *testing.T) {
 	t.Run("EnsureSpacing does not add after newline", func(t *testing.T) {
 		tb := table.NewTrackedBuilder()
 
-		tb.WriteString("text\n")
+		_, _ = tb.WriteString("text\n")
 		table.EnsureSpacing(tb, ' ')
 
 		if tb.String() != "text\n" {
@@ -108,7 +108,7 @@ func TestTrackedBuilder(t *testing.T) {
 
 	t.Run("Reset clears content and retains capacity", func(t *testing.T) {
 		tb := table.NewTrackedBuilder()
-		tb.WriteString("hello world")
+		_, _ = tb.WriteString("hello world")
 
 		oldCap := tb.Cap()
 		tb.Reset()
@@ -134,7 +134,7 @@ func TestTrackedBuilder(t *testing.T) {
 			t.Errorf("Cap() on fresh builder = %d, want 0", tb.Cap())
 		}
 
-		tb.WriteString("ab")
+		_, _ = tb.WriteString("ab")
 		if tb.Cap() < 2 {
 			t.Errorf("Cap() = %d, must be >= Len()=2", tb.Cap())
 		}
@@ -142,14 +142,14 @@ func TestTrackedBuilder(t *testing.T) {
 
 	t.Run("Bytes returns raw buffer", func(t *testing.T) {
 		tb := table.NewTrackedBuilder()
-		tb.WriteString("payload")
+		_, _ = tb.WriteString("payload")
 
 		got := tb.Bytes()
 		if string(got) != "payload" {
 			t.Errorf("Bytes() = %q, want 'payload'", string(got))
 		}
 		// Aliases the backing array, so subsequent writes change the returned slice.
-		tb.WriteByte('!')
+		_ = tb.WriteByte('!')
 		// The slice returned *before* the WriteByte may or may not have been
 		// resized depending on capacity; the important contract is that the
 		// buffer is accessible. Check via a fresh call.
@@ -197,7 +197,7 @@ func TestTrackedBuilder(t *testing.T) {
 
 		// Empty Write must not change LastChar.
 		oldLast := tb.LastChar
-		tb.Write([]byte{})
+		_, _ = tb.Write([]byte{})
 		if tb.LastChar != oldLast {
 			t.Errorf("Write([]byte{}) changed LastChar from %c to %c", oldLast, tb.LastChar)
 		}
@@ -778,7 +778,7 @@ func (a *realCellAccessor) GetTextContent(node *html.Node) string {
 	var extract func(*html.Node)
 	extract = func(n *html.Node) {
 		if n.Type == html.TextNode {
-			tb.WriteString(n.Data)
+			_, _ = tb.WriteString(n.Data)
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
 			extract(c)

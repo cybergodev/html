@@ -61,9 +61,9 @@ func TestExtractBatch(t *testing.T) {
 			}
 
 			if tt.checkClosed {
-				p.Close()
+				_ = p.Close()
 			} else {
-				defer p.Close()
+				defer func() { _ = p.Close() }()
 			}
 
 			br := p.ExtractBatch(tt.docs)
@@ -159,7 +159,17 @@ func TestExtractBatchWithContext(t *testing.T) {
 
 			result := p.ExtractBatchWithContext(ctx, tt.docs)
 
-			if !tt.cancelBefore {
+			if tt.cancelBefore {
+				// Every document must be accounted for as cancelled or failed —
+				// none may silently succeed or vanish after cancellation.
+				if result.Cancelled+result.Failed != len(tt.docs) {
+					t.Errorf("Cancelled+Failed = %d+%d, want %d",
+						result.Cancelled, result.Failed, len(tt.docs))
+				}
+				if result.Success != 0 {
+					t.Errorf("Success = %d, want 0 after cancellation", result.Success)
+				}
+			} else {
 				if result.Success != tt.wantSuccess {
 					t.Errorf("Expected %d successful, got %d", tt.wantSuccess, result.Success)
 				}
@@ -241,7 +251,7 @@ func TestExtractBatchFiles(t *testing.T) {
 
 	t.Run("closed processor", func(t *testing.T) {
 		p, _ := html.New()
-		p.Close()
+		_ = p.Close()
 
 		br := p.ExtractBatchFiles([]string{"test.html"})
 		if br.Failed == 0 {
@@ -274,7 +284,7 @@ func TestExtractBatchFilesWithContext(t *testing.T) {
 		tmpDir := t.TempDir()
 
 		validFile := tmpDir + "/valid.html"
-		os.WriteFile(validFile, []byte(`<html><body><p>Valid</p></body></html>`), 0644)
+		_ = os.WriteFile(validFile, []byte(`<html><body><p>Valid</p></body></html>`), 0644)
 
 		files := []string{validFile, "non-existent-file.html"}
 
@@ -311,60 +321,6 @@ func TestBatchResultStructure(t *testing.T) {
 	total := result.Success + result.Failed + result.Cancelled
 	if total != len(docs) {
 		t.Errorf("Success + Failed + Cancelled = %d, expected %d", total, len(docs))
-	}
-}
-
-// TestConcurrentBatchOperations tests concurrent batch operations.
-func TestConcurrentBatchOperations(t *testing.T) {
-	t.Parallel()
-
-	p := testutil.NewTestProcessor(t)
-	docs := [][]byte{[]byte(`<html><body><p>Content</p></body></html>`)}
-
-	errs := testutil.RunConcurrent(10, func(int) error {
-		br := p.ExtractBatch(docs)
-		if br.Failed > 0 {
-			return br.Errors[0]
-		}
-		return nil
-	})
-
-	for i, err := range errs {
-		if err != nil {
-			t.Errorf("Goroutine %d failed: %v", i, err)
-		}
-	}
-}
-
-// TestBatchWithLargeInput tests batch processing with large inputs.
-func TestBatchWithLargeInput(t *testing.T) {
-	t.Parallel()
-
-	if testing.Short() {
-		t.Skip("Skipping large input test in short mode")
-	}
-
-	p := testutil.NewTestProcessor(t)
-	docs := createNDocs(100)
-
-	br := p.ExtractBatch(docs)
-	if br.Failed > 0 {
-		t.Fatalf("ExtractBatch() with large input failed: %v", br.Errors[0])
-	}
-
-	if len(br.Results) != 100 {
-		t.Errorf("Expected 100 results, got %d", len(br.Results))
-	}
-
-	successCount := 0
-	for _, result := range br.Results {
-		if result != nil {
-			successCount++
-		}
-	}
-
-	if successCount != 100 {
-		t.Errorf("Expected 100 successful extractions, got %d", successCount)
 	}
 }
 

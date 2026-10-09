@@ -22,7 +22,7 @@ func TestExtractAllLinksOrderDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	first, err := p.ExtractAllLinks([]byte(htmlContent))
 	if err != nil {

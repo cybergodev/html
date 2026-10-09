@@ -42,7 +42,7 @@ func BenchmarkRealisticNoCache(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	doc := []byte(realisticDoc())
 
 	b.ReportAllocs()
@@ -59,9 +59,9 @@ func BenchmarkRealisticNoCache(b *testing.B) {
 // BenchmarkRealisticDefault measures the default-config path (cache + timeout goroutine).
 func BenchmarkRealisticDefault(b *testing.B) {
 	p, _ := html.New()
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	doc := []byte(realisticDoc())
-	p.Extract(doc) // prime cache
+	_, _ = p.Extract(doc) // prime cache
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -86,7 +86,7 @@ func BenchmarkRealisticWithMedia(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var sb strings.Builder
 	sb.WriteString(`<html><body><article>`)

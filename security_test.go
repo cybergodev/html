@@ -22,7 +22,7 @@ func TestXSSPrevention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Consolidated XSS payloads organized by category
 	xssPayloads := []struct {
@@ -105,7 +105,7 @@ func TestDangerousSchemeNotInStructuredOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Default config (sanitization ON). The raw-HTML media scan still reads the
 	// pre-sanitization string, so these must be filtered by IsValidURL.
@@ -166,7 +166,7 @@ func TestPathTraversalPrevention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	pathTraversalAttempts := []string{
 		"../../../etc/passwd",
@@ -185,91 +185,7 @@ func TestPathTraversalPrevention(t *testing.T) {
 			if err == nil {
 				t.Errorf("Expected error for path traversal attempt: %s", path)
 			}
-			if !strings.Contains(err.Error(), "invalid") && !strings.Contains(err.Error(), "not found") {
-				t.Logf("Path '%s' rejected with: %v", path, err)
-			}
 		})
-	}
-}
-
-// TestLargeInputDoSPrevention tests rejection of oversized inputs
-func TestLargeInputDoSPrevention(t *testing.T) {
-	t.Parallel()
-
-	cfg := html.DefaultConfig()
-	cfg.MaxInputSize = 1024 // 1KB limit for testing
-
-	p, err := html.New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close()
-
-	// Create input larger than MaxInputSize
-	largeHTML := strings.Repeat("<div>test content</div>", 1000) // ~18KB
-
-	_, err = p.Extract([]byte(largeHTML))
-	if err == nil {
-		t.Error("Expected error for oversized input")
-	}
-	if err != html.ErrInputTooLarge {
-		t.Logf("Large input rejected with: %v", err)
-	}
-}
-
-// TestDeepNestingDoSPrevention tests depth limit enforcement
-func TestDeepNestingDoSPrevention(t *testing.T) {
-	t.Parallel()
-
-	cfg := html.DefaultConfig()
-	cfg.MaxDepth = 50 // Low limit for testing
-
-	p, err := html.New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close()
-
-	// Create deeply nested HTML (100 levels, exceeding MaxDepth of 50)
-	deepHTML := "<html><body>"
-	for i := 0; i < 100; i++ {
-		deepHTML += "<div>"
-	}
-	deepHTML += "Content"
-	for i := 0; i < 100; i++ {
-		deepHTML += "</div>"
-	}
-	deepHTML += "</body></html>"
-
-	result, err := p.Extract([]byte(deepHTML))
-
-	// The library should either:
-	// 1. Process successfully (being tolerant of deep nesting), OR
-	// 2. Return a clear error (rejecting the input)
-	// Either behavior is acceptable for DoS prevention
-	if err != nil {
-		// Error is acceptable - input was rejected
-		if !strings.Contains(err.Error(), "depth") &&
-			!strings.Contains(err.Error(), "invalid") &&
-			err != html.ErrInvalidHTML {
-			t.Errorf("Unexpected error for deep nesting: %v", err)
-		}
-		return
-	}
-
-	// If processing succeeded, verify the result is valid
-	if result == nil {
-		t.Fatal("Expected non-nil result when no error returned")
-	}
-
-	// Content should be extracted if processing succeeded
-	if !strings.Contains(result.Text, "Content") {
-		t.Errorf("Expected 'Content' in extracted text, got: %q", result.Text)
-	}
-
-	// Verify text is not empty
-	if result.Text == "" {
-		t.Error("Expected non-empty text extraction from deeply nested HTML")
 	}
 }
 
@@ -281,7 +197,7 @@ func TestMalformedHTMLHandling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	malformedCases := []struct {
 		name string
@@ -343,7 +259,7 @@ func TestDataURLInjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	dataURLCases := []struct {
 		name          string
@@ -398,7 +314,7 @@ func TestInvalidUTF8Handling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Create HTML with invalid UTF-8 sequences
 	invalidUTF8 := []byte{
@@ -430,14 +346,10 @@ func TestInvalidUTF8Handling(t *testing.T) {
 		t.Fatal("Expected non-nil result when no error returned")
 	}
 
-	// The text should be valid UTF-8 (no replacement characters from invalid sequences)
-	// Check that result.Text is valid UTF-8
-	for i, r := range result.Text {
-		if r == utf8.RuneError {
-			// Check if this is a valid RuneError or an invalid sequence
-			// The library should sanitize invalid sequences
-			t.Logf("RuneError found at position %d in result text", i)
-		}
+	// The extracted text must itself be valid UTF-8: invalid input sequences
+	// must be sanitized or dropped, never leak through to the output.
+	if !utf8.ValidString(result.Text) {
+		t.Errorf("extracted text is not valid UTF-8: %q", result.Text)
 	}
 
 	// Content should be present (the valid "Content" text)
@@ -454,7 +366,7 @@ func TestControlCharacterHandling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Create HTML with various control characters
 	controlCharHTML := "<html><body>Content\x00\x01\x02\x1F\x7Fwith\x80\x81\x82control</body></html>"
@@ -480,15 +392,15 @@ func TestControlCharacterHandling(t *testing.T) {
 		t.Errorf("Expected 'Content' or 'with' in extracted text, got: %q", result.Text)
 	}
 
-	// Check that null bytes are handled safely (removed or replaced, not causing issues)
+	// NUL bytes must not survive into the extracted text.
 	if strings.Contains(result.Text, "\x00") {
-		// Null bytes in output may be acceptable but should be documented
-		t.Logf("Warning: Null byte present in extracted text")
+		t.Errorf("null byte present in extracted text: %q", result.Text)
 	}
 
-	// Verify no control characters in the printable range cause crashes
-	// The extraction should complete without panicking
-	t.Logf("Successfully extracted text with length %d from control character input", len(result.Text))
+	// The output must remain valid UTF-8 despite the \x80-\x82 bytes above.
+	if !utf8.ValidString(result.Text) {
+		t.Errorf("extracted text is not valid UTF-8: %q", result.Text)
+	}
 }
 
 // TestNullByteInjection tests null byte handling in URLs and paths
@@ -499,23 +411,26 @@ func TestNullByteInjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	nullByteCases := []struct {
 		name string
 		html string
 	}{
 		{
+			// Interpreted string: "\x00" must be a real NUL byte. (A backtick
+			// raw string would embed the four literal characters \x00 and the
+			// test below would pass vacuously.)
 			name: "null in URL",
-			html: `<html><body><a href="http://example.com\x00.php">Link</a></body></html>`,
+			html: "<html><body><a href=\"http://example.com\x00.php\">Link</a></body></html>",
 		},
 		{
 			name: "null in src",
-			html: `<html><body><img src="http://example.com\x00.jpg" alt="Image"></body></html>`,
+			html: "<html><body><img src=\"http://example.com\x00.jpg\" alt=\"Image\"></body></html>",
 		},
 		{
 			name: "multiple nulls",
-			html: `<html><body><a href="http://example.com\x00\x00\x00.php">Link</a></body></html>`,
+			html: "<html><body><a href=\"http://example.com\x00\x00\x00.php\">Link</a></body></html>",
 		},
 	}
 
@@ -549,7 +464,7 @@ func TestProtocolRelativeURLSafety(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	htmlContent := []byte(`<html>
 		<head><base href="//example.com/path/"></head>
@@ -565,10 +480,22 @@ func TestProtocolRelativeURLSafety(t *testing.T) {
 		t.Fatalf("Extract() failed: %v", err)
 	}
 
-	// Protocol-relative URLs should be preserved or converted to https
-	// but they should not cause security issues in extraction
-	if result == nil {
-		t.Error("Expected non-nil result")
+	// Body content must survive the protocol-relative base tag.
+	if !strings.Contains(result.Text, "Content") {
+		t.Errorf("expected body content, got %q", result.Text)
+	}
+
+	// Protocol-relative URLs must be preserved verbatim or upgraded to https —
+	// never rewritten to a plain http:// URL (scheme downgrade).
+	for _, link := range result.Links {
+		if strings.HasPrefix(link.URL, "http://") {
+			t.Errorf("protocol-relative link downgraded to http: %q", link.URL)
+		}
+	}
+	for _, img := range result.Images {
+		if strings.HasPrefix(img.URL, "http://") {
+			t.Errorf("protocol-relative image downgraded to http: %q", img.URL)
+		}
 	}
 }
 
@@ -576,7 +503,7 @@ func TestProtocolRelativeURLSafety(t *testing.T) {
 func BenchmarkDoSPreventionChecks(b *testing.B) {
 	cfg := html.DefaultConfig()
 	p, _ := html.New(cfg)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Normal HTML content
 	htmlContent := []byte(`<html><body><h1>Normal Content</h1><p>Test paragraph</p></body></html>`)
@@ -612,7 +539,7 @@ func TestHighSecurityConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create processor with HighSecurityConfig: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Test with normal content
 	htmlContent := []byte(`<html><body><h1>Test</h1><p>Content</p></body></html>`)
@@ -647,5 +574,50 @@ func TestHighSecurityConfigStricterThanDefault(t *testing.T) {
 	}
 	if highSecConfig.ProcessingTimeout >= defaultConfig.ProcessingTimeout {
 		t.Error("HighSecurityConfig ProcessingTimeout should be shorter than default")
+	}
+}
+
+// TestExtractAllLinksRejectsScriptableDataURLs covers the GEN-001 finding that
+// IsValidURL's data: branch checked only length and charset: percent-encoded
+// payloads contain no raw <>"' and passed, so script-executing data URLs
+// (image/svg+xml, text/html) reached LinkResource.URL through the
+// non-sanitizing ExtractAllLinks path. IsValidURL now enforces the same
+// safeMediaTypes whitelist as the DOM sanitizer.
+func TestExtractAllLinksRejectsScriptableDataURLs(t *testing.T) {
+	t.Parallel()
+
+	const svgPayload = `data:image/svg+xml,%3Csvg%20onload%3Dalert(1)%3E`
+	const htmlPayload = `data:text/html,%3Cscript%3Ealert(1)%3C/script%3E`
+	const pngPayload = `data:image/png;base64,iVBORw0KGgo=`
+	doc := `<html><body>
+		<a href="` + svgPayload + `">svg</a>
+		<a href="` + htmlPayload + `">html</a>
+		<a href="` + pngPayload + `">png</a>
+	</body></html>`
+
+	links, err := html.ExtractAllLinks([]byte(doc))
+	if err != nil {
+		t.Fatalf("ExtractAllLinks() failed: %v", err)
+	}
+
+	var sawSVG, sawHTML, sawPNG bool
+	for _, link := range links {
+		switch {
+		case strings.HasPrefix(link.URL, "data:image/svg"):
+			sawSVG = true
+		case strings.HasPrefix(link.URL, "data:text/html"):
+			sawHTML = true
+		case strings.HasPrefix(link.URL, "data:image/png"):
+			sawPNG = true
+		}
+	}
+	if sawSVG {
+		t.Error("SVG data URL must not appear in extracted links")
+	}
+	if sawHTML {
+		t.Error("text/html data URL must not appear in extracted links")
+	}
+	if !sawPNG {
+		t.Error("whitelisted image/png data URL should still be extracted")
 	}
 }

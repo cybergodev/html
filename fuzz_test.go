@@ -33,7 +33,7 @@ func FuzzExtract(f *testing.F) {
 		if err != nil {
 			t.Fatalf("Failed to create processor: %v", err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		// Should never panic
 		result, err := p.Extract([]byte(input))
@@ -64,7 +64,7 @@ func FuzzEncodingDetection(f *testing.F) {
 		if err != nil {
 			t.Fatalf("Failed to create processor: %v", err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		// Should handle any byte sequence without panic
 		_, _ = p.Extract(input)
@@ -93,7 +93,7 @@ func FuzzTableParsing(f *testing.F) {
 		if err != nil {
 			t.Fatalf("Failed to create processor: %v", err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		htmlContent := `<html><body>` + tableHTML + `</body></html>`
 		result, _ := p.Extract([]byte(htmlContent))
@@ -124,7 +124,7 @@ func FuzzExtractAllLinks(f *testing.F) {
 		if err != nil {
 			t.Fatalf("Failed to create processor: %v", err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		htmlContent := `<html><body>` + input + `</body></html>`
 		_, err = p.ExtractAllLinks([]byte(htmlContent))
@@ -133,6 +133,58 @@ func FuzzExtractAllLinks(f *testing.F) {
 		if err != nil {
 			// Error is acceptable for malformed input
 			t.Logf("Got error (acceptable): %v", err)
+		}
+	})
+}
+
+// FuzzMediaExtraction exercises the raw-HTML media scanner (the regex-free
+// ScanMediaURLs path) with arbitrary input: URL-ish fragments, truncated
+// schemes, mixed-case extensions, and hostile byte soup. The scanner's
+// index arithmetic is hand-rolled, so this target is its empirical
+// no-panic/no-index-out-of-range guarantee.
+func FuzzMediaExtraction(f *testing.F) {
+	seeds := []string{
+		`<video src="https://cdn.example.com/v/1.mp4"></video>`,
+		`<a href="HTTPS://X.TEST/A.MP4">x</a>`,
+		`https://h.test/` + strings.Repeat("a.", 300) + `mp4`,
+		`hTtPs://x.test/a.Mp4?t=1#f`,
+		`https://x.test/a.mp4.mp3.webm.ogg`,
+		`//protocol-relative.test/v.mp3`,
+		`https://`,
+		`https://x`,
+		`https://x.`,
+		`h`,
+		`ht`,
+		`htt`,
+		`http`,
+		`http:`,
+		`http:/`,
+		`http://`,
+		`https://\backslash.path.mp4`,
+		`https://x.test/"quoted',;)}].mp4`,
+		strings.Repeat("https://a.mp4", 200),
+		"\x00\x01https://\xff\xfe.mp4",
+	}
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, input string) {
+		cfg := html.DefaultConfig()
+		cfg.MaxCacheEntries = 0
+		p, err := html.New(cfg)
+		if err != nil {
+			t.Fatalf("Failed to create processor: %v", err)
+		}
+		defer func() { _ = p.Close() }()
+
+		htmlContent := `<html><body><article>` + input + `</article></body></html>`
+		result, err := p.Extract([]byte(htmlContent))
+		if err != nil {
+			return
+		}
+		if result == nil {
+			t.Error("Nil result with no error")
 		}
 	})
 }

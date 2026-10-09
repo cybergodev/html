@@ -7,22 +7,31 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
-var tagsToRemoveMap = map[string]bool{
+// isRemovedTag reports whether sanitization always strips the element tag.
+// It is consulted once per element node on the sanitize walk, so it is a
+// switch rather than a map lookup for the same hot-path reason as the
+// element classifications in elements.go.
+//
+// Note: <form> itself is intentionally NOT removed — server frameworks
+// (ASP.NET WebForms, JSF, JSP) wrap the entire page body in a single <form>,
+// so removing it would discard all visible content. Text extraction never
+// renders or submits forms, so the CSRF/UI-redress rationale that justifies
+// removing <input>/<button> does not apply to the <form> container itself.
+func isRemovedTag(tag string) bool {
+	switch tag {
 	// Script and style containers
-	"script": true, "style": true, "noscript": true,
 	// Embedded content (potential XSS vectors)
-	"iframe": true, "embed": true, "object": true,
-	// Form controls (potential CSRF/UI redress). Note: <form> itself is
-	// intentionally NOT removed — server frameworks (ASP.NET WebForms, JSF, JSP)
-	// wrap the entire page body in a single <form>, so removing it would discard
-	// all visible content. Text extraction never renders or submits forms, so the
-	// CSRF/UI-redress rationale that justifies removing <input>/<button> does not
-	// apply to the <form> container itself.
-	"input": true, "button": true,
+	// Form controls (potential CSRF/UI redress)
 	// SVG can contain JavaScript and event handlers
-	"svg": true,
 	// MathML can be abused for XSS in some browsers
-	"math": true,
+	case "script", "style", "noscript",
+		"iframe", "embed", "object",
+		"input", "button",
+		"svg",
+		"math":
+		return true
+	}
+	return false
 }
 
 // dangerousAttributes are always removed during sanitization.
@@ -58,8 +67,11 @@ const c0ControlOrSpace = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x
 // wastes disk space and risks leaking embedded sensitive content.
 const maxAuditURLLength = 256
 
-// truncateAuditURL truncates a URL for safe inclusion in audit log entries.
-func truncateAuditURL(url string) string {
+// TruncateAuditURL truncates a URL for safe inclusion in audit log entries.
+// It is exported (within the module) so the root package's audit collector can
+// apply the identical cap to every AuditEntry.URL as a last line of defense,
+// keeping the sanitizer call sites and the central collector on one policy.
+func TruncateAuditURL(url string) string {
 	if len(url) <= maxAuditURLLength {
 		return url
 	}
@@ -167,13 +179,60 @@ func findBodyElement(doc *html.Node) *html.Node {
 	return FindElementByTag(doc, "body")
 }
 
+// sanitizeNodeWithAudit sanitizes n and its entire subtree in place.
+//
+// The traversal is iterative with an explicit stack rather than recursive:
+// SanitizeDOM's callers pre-validate nesting depth, but SanitizeHTMLWithAudit
+// parses arbitrary strings, and a recursive walk on hostile deeply nested
+// input could exhaust the call stack before any depth guard ran. Children
+// are pushed in reverse so they pop in document order, exactly matching the
+// previous pre-order recursion, and sibling pointers saved on the stack are
+// unaffected by removals performed deeper in the walk. The stack is pooled,
+// but — unlike WalkNodes — deliberately has no node-count cap: sanitization
+// must never be silently truncated.
 func sanitizeNodeWithAudit(n *html.Node, audit AuditRecorder) {
+	if n == nil {
+		return
+	}
+
+	stackPtr := GetNodeSlice()
+	defer PutNodeSlice(stackPtr)
+	stack := *stackPtr
+
+	stack = append(stack, n)
+
+	for len(stack) > 0 {
+		node := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if !sanitizeNodeInPlace(node, audit) {
+			continue
+		}
+
+		// Push children so the first child pops next (pre-order).
+		segStart := len(stack)
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			stack = append(stack, child)
+		}
+		for i, j := segStart, len(stack)-1; i < j; i, j = i+1, j-1 {
+			stack[i], stack[j] = stack[j], stack[i]
+		}
+	}
+
+	*stackPtr = stack
+}
+
+// sanitizeNodeInPlace applies tag and attribute sanitization to a single
+// node, removing it from its parent when its tag is blocklisted. It reports
+// whether the node's subtree should still be traversed (false once the node
+// has been removed).
+func sanitizeNodeInPlace(n *html.Node, audit AuditRecorder) bool {
 	if n.Type == html.ElementNode {
 		tagName := strings.ToLower(n.Data)
-		if tagsToRemoveMap[tagName] {
+		if isRemovedTag(tagName) {
 			audit.RecordBlockedTag(n.Data)
 			removeNode(n)
-			return
+			return false
 		}
 
 		attrLen := len(n.Attr)
@@ -183,7 +242,7 @@ func sanitizeNodeWithAudit(n *html.Node, audit AuditRecorder) {
 			// is only resliced when something is actually removed or rewritten.
 			out := 0
 			modified := false
-			for i := 0; i < attrLen; i++ {
+			for i := range attrLen {
 				attr := n.Attr[i]
 				attrKey := strings.ToLower(attr.Key)
 				if len(attrKey) >= 2 && attrKey[0] == 'o' && attrKey[1] == 'n' {
@@ -229,12 +288,7 @@ func sanitizeNodeWithAudit(n *html.Node, audit AuditRecorder) {
 		}
 	}
 
-	child := n.FirstChild
-	for child != nil {
-		next := child.NextSibling
-		sanitizeNodeWithAudit(child, audit)
-		child = next
-	}
+	return true
 }
 
 func removeNode(n *html.Node) {
@@ -245,6 +299,53 @@ func removeNode(n *html.Node) {
 
 func isSafeURIWithAudit(uri string, audit AuditRecorder) bool {
 	if uri == "" {
+		return true
+	}
+
+	// Fast path: a plain printable-ASCII URI (see isPlainPrintableASCII) is
+	// unchanged by every normalization step below — NFC, the whitespace/C0 edge
+	// trims, tab/LF/CR stripping — and lowercasing collapses to ASCII folding,
+	// so the scheme policy can be applied with fold comparisons directly on
+	// uri. sanitizeNodeInPlace reaches here once per href/src/cite/... attribute
+	// on the sanitize walk, and the profiler showed the normalization pipeline
+	// dominating; non-ASCII or whitespace-bearing URIs fall through to the full
+	// pipeline where the disguise vectors this defense exists for live.
+	if isPlainPrintableASCII(uri) {
+		if len(uri) > MaxURLLength && !asciiFoldHasPrefix(uri, "data:") {
+			audit.RecordBlockedURL(TruncateAuditURL(uri), "URL exceeds size limit")
+			return false
+		}
+		if asciiFoldHasPrefix(uri, "javascript:") {
+			audit.RecordBlockedURL(TruncateAuditURL(uri), "javascript scheme")
+			return false
+		}
+		if asciiFoldHasPrefix(uri, "vbscript:") {
+			audit.RecordBlockedURL(TruncateAuditURL(uri), "vbscript scheme")
+			return false
+		}
+		if asciiFoldHasPrefix(uri, "file:") {
+			audit.RecordBlockedURL(TruncateAuditURL(uri), "file scheme")
+			return false
+		}
+		if strings.HasPrefix(uri, "//") {
+			rest := strings.TrimLeft(uri[2:], " \t\n\r")
+			if asciiFoldHasPrefix(rest, "javascript:") ||
+				asciiFoldHasPrefix(rest, "vbscript:") ||
+				asciiFoldHasPrefix(rest, "data:") ||
+				asciiFoldHasPrefix(rest, "file:") {
+				audit.RecordBlockedURL(TruncateAuditURL(uri), "dangerous protocol-relative URL")
+				return false
+			}
+		}
+		if asciiFoldHasPrefix(uri, "data:") {
+			if asciiFoldContains(uri, "image/svg+xml") {
+				audit.RecordBlockedURL(TruncateAuditURL(uri), "svg data url")
+				return false
+			}
+			if !isValidDataURLWithAudit(uri, audit) {
+				return false
+			}
+		}
 		return true
 	}
 
@@ -285,27 +386,31 @@ func isSafeURIWithAudit(uri string, audit AuditRecorder) bool {
 	// ceiling (MaxDataURILength) enforced in the data: branch below, and
 	// legitimate base64 images routinely exceed MaxURLLength.
 	if len(uri) > MaxURLLength && !strings.HasPrefix(lowerURI, "data:") {
-		audit.RecordBlockedURL(truncateAuditURL(uri), "URL exceeds size limit")
+		audit.RecordBlockedURL(TruncateAuditURL(uri), "URL exceeds size limit")
 		return false
 	}
 
-	// SECURITY: Check for dangerous schemes with multiple Unicode attack vectors
+	// SECURITY: Check for dangerous schemes with multiple Unicode attack vectors.
+	// Every RecordBlockedURL below passes TruncateAuditURL(uri): these branches
+	// are reached only after the MaxURLLength gate above, but the data: branch
+	// is exempt from that gate and can carry megabytes, and a future recorder
+	// implementation must never receive an unbounded URL.
 
 	// Check for javascript: scheme and its Unicode variants
 	if isDangerousScheme(lowerURI, "javascript:") {
-		audit.RecordBlockedURL(uri, "javascript scheme")
+		audit.RecordBlockedURL(TruncateAuditURL(uri), "javascript scheme")
 		return false
 	}
 
 	// Check for vbscript: scheme and its Unicode variants
 	if isDangerousScheme(lowerURI, "vbscript:") {
-		audit.RecordBlockedURL(uri, "vbscript scheme")
+		audit.RecordBlockedURL(TruncateAuditURL(uri), "vbscript scheme")
 		return false
 	}
 
 	// Check for file: scheme and its Unicode variants
 	if isDangerousScheme(lowerURI, "file:") {
-		audit.RecordBlockedURL(uri, "file scheme")
+		audit.RecordBlockedURL(TruncateAuditURL(uri), "file scheme")
 		return false
 	}
 
@@ -317,16 +422,18 @@ func isSafeURIWithAudit(uri string, audit AuditRecorder) bool {
 			isDangerousScheme(restLower, "vbscript:") ||
 			isDangerousScheme(restLower, "data:") ||
 			isDangerousScheme(restLower, "file:") {
-			audit.RecordBlockedURL(uri, "dangerous protocol-relative URL")
+			audit.RecordBlockedURL(TruncateAuditURL(uri), "dangerous protocol-relative URL")
 			return false
 		}
 	}
 
 	if strings.HasPrefix(lowerURI, "data:") {
 		// Explicitly block SVG data URLs - they can contain JavaScript
-		// This provides defense-in-depth in case SVG tag removal is bypassed
+		// This provides defense-in-depth in case SVG tag removal is bypassed.
+		// SVG data URLs are exempt from the MaxURLLength gate above, so this
+		// uri can be as large as MaxInputSize — truncate it for the audit log.
 		if strings.Contains(lowerURI, "image/svg+xml") {
-			audit.RecordBlockedURL(uri, "svg data url")
+			audit.RecordBlockedURL(TruncateAuditURL(uri), "svg data url")
 			return false
 		}
 		if !isValidDataURLWithAudit(trimmed, audit) {
@@ -411,6 +518,67 @@ func normalizeFullwidthToASCII(s string) string {
 	return b.String()
 }
 
+// isPlainPrintableASCII reports whether s is non-empty and consists solely of
+// printable ASCII bytes (0x21–0x7E): no C0 controls, no space, no DEL, and no
+// multi-byte UTF-8. For such a string every step of the scheme-normalization
+// pipeline is an identity — NFC (ASCII has no composable sequences), TrimSpace
+// and the C0+space edge trims (the edges are > 0x20), tab/LF/CR stripping
+// (none present), and fullwidth folding (fullwidth runes are 3-byte UTF-8) —
+// and lowercasing collapses to ASCII case folding. The scheme checks can then
+// run directly on s with fold comparisons, skipping the pipeline's string
+// allocations and rescans. This is the overwhelming majority of real URLs.
+func isPlainPrintableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if b := s[i]; b <= 0x20 || b > 0x7E {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+// asciiFoldContains reports whether substr (assumed lowercase ASCII) is
+// contained in s, ignoring ASCII case. For pure-ASCII s it is equivalent to
+// strings.Contains(strings.ToLower(s), substr) without the lowercase copy.
+func asciiFoldContains(s, substr string) bool {
+	substrLen := len(substr)
+	sLen := len(s)
+	if substrLen > sLen {
+		return false
+	}
+	for i := 0; i <= sLen-substrLen; i++ {
+		if asciiFoldHasPrefix(s[i:], substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsDangerousSchemeFast applies the same scheme policy as
+// containsDangerousScheme to a plain printable-ASCII uri (see
+// isPlainPrintableASCII): direct ASCII-fold prefix checks replace the
+// NFC/trim/lowercase pipeline, which is an identity on such input.
+func containsDangerousSchemeFast(uri string) bool {
+	if asciiFoldHasPrefix(uri, "javascript:") ||
+		asciiFoldHasPrefix(uri, "vbscript:") ||
+		asciiFoldHasPrefix(uri, "file:") {
+		return true
+	}
+	// Protocol-relative dangerous forms, mirroring the slow path's TrimLeft of
+	// ASCII whitespace after the "//". A printable-ASCII uri cannot actually
+	// contain those bytes (isPlainPrintableASCII rejects them), so the trim is
+	// a provable no-op kept for structural parallelism with the slow path.
+	if strings.HasPrefix(uri, "//") {
+		rest := strings.TrimLeft(uri[2:], " \t\n\r")
+		if asciiFoldHasPrefix(rest, "javascript:") ||
+			asciiFoldHasPrefix(rest, "vbscript:") ||
+			asciiFoldHasPrefix(rest, "data:") ||
+			asciiFoldHasPrefix(rest, "file:") {
+			return true
+		}
+	}
+	return false
+}
+
 // containsDangerousScheme reports whether uri begins with a scheme — or a
 // protocol-relative form — that a browser may execute or that reaches the local
 // filesystem: javascript:, vbscript:, file: (and //data:, //javascript:, …).
@@ -431,6 +599,16 @@ func normalizeFullwidthToASCII(s string) string {
 func containsDangerousScheme(uri string) bool {
 	if uri == "" {
 		return false
+	}
+
+	// Fast path: printable-ASCII URLs need none of the normalization below,
+	// and isValidURL calls this once per candidate URL on the media and link
+	// extraction paths (the profiler showed the NFC/trim/lowercase pipeline as
+	// most of IsValidURL's cost). Falls through to the full pipeline for any
+	// URL with whitespace, controls, or non-ASCII bytes, where the disguises
+	// this function defends against actually live.
+	if isPlainPrintableASCII(uri) {
+		return containsDangerousSchemeFast(uri)
 	}
 
 	normalized := normalizeURIForSecurity(uri)
@@ -467,7 +645,7 @@ func isValidDataURLWithAudit(url string, audit AuditRecorder) bool {
 
 	commaIdx := strings.Index(url, ",")
 	if commaIdx == -1 || commaIdx == 5 {
-		audit.RecordBlockedURL(truncateAuditURL(url), "malformed data URL")
+		audit.RecordBlockedURL(TruncateAuditURL(url), "malformed data URL")
 		return false
 	}
 
@@ -477,42 +655,30 @@ func isValidDataURLWithAudit(url string, audit AuditRecorder) bool {
 	// Enforce maximum data URL size to prevent memory exhaustion
 	// Uses the same limit as IsValidURL for consistency
 	if len(url) > MaxDataURILength {
-		audit.RecordBlockedURL(truncateAuditURL(url), "data URL exceeds size limit")
+		audit.RecordBlockedURL(TruncateAuditURL(url), "data URL exceeds size limit")
 		return false
 	}
 
-	if mediaPart != "" {
-		var mediaType string
-		if strings.HasSuffix(mediaPart, ";base64") {
-			mediaType = strings.TrimSuffix(mediaPart, ";base64")
-		} else if strings.Contains(mediaPart, ";") {
-			semicolonIdx := strings.Index(mediaPart, ";")
-			if semicolonIdx > 0 {
-				mediaType = mediaPart[:semicolonIdx]
-			}
-			// semicolonIdx == 0 leaves mediaType empty; handled by the empty-MIME
-			// rejection below.
-		} else {
-			mediaType = mediaPart
-		}
-
-		// A data URL must declare an explicit, whitelisted media type. An empty
-		// mediaType — e.g. "data:;base64,<payload>" or "data:;...,..." — used to
-		// skip both checks below and bypass the safeMediaTypes whitelist entirely,
-		// letting arbitrary base64-encoded content through. Reject it outright.
-		if mediaType == "" {
-			audit.RecordBlockedURL(truncateAuditURL(url), "missing media type in data URL")
-			return false
-		}
-		// Validate media type and check against whitelist of safe types
-		if !isValidMediaType(mediaType) {
-			audit.RecordBlockedURL(truncateAuditURL(url), "invalid media type in data URL")
-			return false
-		}
-		if !isSafeMediaType(mediaType) {
-			audit.RecordBlockedURL(truncateAuditURL(url), "unsafe media type in data URL: "+mediaType)
-			return false
-		}
+	// A data URL must declare an explicit, whitelisted media type. An empty
+	// mediaType — e.g. "data:;base64,<payload>" or "data:;...,..." — used to
+	// skip both checks below and bypass the safeMediaTypes whitelist entirely,
+	// letting arbitrary base64-encoded content through. Reject it outright.
+	// The extraction lives in dataURLMediaType so IsValidURL (the non-audit
+	// gate used by the paths that bypass the DOM sanitizer) enforces the
+	// identical policy and the two can never drift apart again.
+	mediaType, hasMediaType := dataURLMediaType(mediaPart)
+	if !hasMediaType {
+		audit.RecordBlockedURL(TruncateAuditURL(url), "missing media type in data URL")
+		return false
+	}
+	// Validate media type and check against whitelist of safe types
+	if !isValidMediaType(mediaType) {
+		audit.RecordBlockedURL(TruncateAuditURL(url), "invalid media type in data URL")
+		return false
+	}
+	if !isSafeMediaType(mediaType) {
+		audit.RecordBlockedURL(TruncateAuditURL(url), "unsafe media type in data URL: "+mediaType)
+		return false
 	}
 
 	isBase64 := strings.Contains(mediaPart, ";base64")
@@ -520,18 +686,43 @@ func isValidDataURLWithAudit(url string, audit AuditRecorder) bool {
 		b := dataPart[i]
 		if isBase64 {
 			if !isBase64Char(b) && b != '=' && b != '\r' && b != '\n' {
-				audit.RecordBlockedURL(truncateAuditURL(url), "invalid base64 in data URL")
+				audit.RecordBlockedURL(TruncateAuditURL(url), "invalid base64 in data URL")
 				return false
 			}
 		} else {
 			if b < 9 || (b >= 11 && b <= 12) || (b >= 14 && b < 32) || b == 127 {
-				audit.RecordBlockedURL(truncateAuditURL(url), "invalid character in data URL")
+				audit.RecordBlockedURL(TruncateAuditURL(url), "invalid character in data URL")
 				return false
 			}
 		}
 	}
 
 	return true
+}
+
+// dataURLMediaType extracts the declared media type from the part of a data:
+// URL between "data:" and the first comma: a trailing ";base64" and any other
+// ";parameter" suffix are stripped. ok is false when no explicit media type is
+// declared ("data:,…" or "data:;base64,…") — the sanitizer rejects those, and
+// so must every path sharing its policy. It is the single source of truth for
+// both isValidDataURLWithAudit and IsValidURL so the two gates cannot diverge.
+func dataURLMediaType(mediaPart string) (mediaType string, ok bool) {
+	if mediaPart == "" {
+		return "", false
+	}
+	if rest, isBase64 := strings.CutSuffix(mediaPart, ";base64"); isBase64 {
+		mediaType = rest
+	} else if semicolonIdx := strings.IndexByte(mediaPart, ';'); semicolonIdx >= 0 {
+		// semicolonIdx == 0 yields an empty mediaType, rejected by the ok=false
+		// return below (mirrors the sanitizer's empty-MIME rejection).
+		mediaType = mediaPart[:semicolonIdx]
+	} else {
+		mediaType = mediaPart
+	}
+	if mediaType == "" {
+		return "", false
+	}
+	return mediaType, true
 }
 
 // safeMediaTypes is the whitelist of safe media types for data URLs.

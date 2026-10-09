@@ -27,7 +27,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
+
+	// All fetches go through one shared client with an explicit timeout.
+	// Never use the default client behind http.Get in production: it has no
+	// timeout, so a stalled server stalls the caller forever.
+	httpClient := createHTTPClient(10 * time.Second)
 
 	// ============================================================
 	// 1. Fetch and Extract
@@ -36,7 +41,7 @@ func main() {
 	fmt.Println("-------------------")
 
 	url := server.URL + "/article"
-	content, err := fetchURL(url)
+	content, err := fetchURL(httpClient, url)
 	if err != nil {
 		log.Fatalf("Fetch error: %v", err)
 	}
@@ -63,7 +68,7 @@ func main() {
 	}
 
 	start := time.Now()
-	results := processURLsConcurrently(processor, urls)
+	results := processURLsConcurrently(httpClient, processor, urls)
 	duration := time.Since(start)
 
 	fmt.Printf("Processed %d URLs in %v\n", len(results), duration)
@@ -81,16 +86,18 @@ func main() {
 	fmt.Println("\n3. Configure HTTP Client")
 	fmt.Println("-------------------------")
 
-	httpClient := createHTTPClient(10 * time.Second)
-	fmt.Println("HTTP Client Configuration:")
+	// This is the client sections 1-2 already used; its transport tuning
+	// (idle-connection reuse) pays off when fetching many URLs from one host.
+	fmt.Println("HTTP Client Configuration (used throughout):")
 	fmt.Println("  Timeout: 10 seconds")
-	fmt.Println("  Max Idle Conns: 10")
+	fmt.Println("  Max Idle Conns: 10 (per host: 10)")
+	fmt.Println("  Idle Conn Timeout: 90 seconds")
 
 	resp, err := httpClient.Get(server.URL + "/article")
 	if err != nil {
 		log.Printf("Request failed: %v", err)
 	} else {
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		fmt.Printf("\nResponse Status: %s\n", resp.Status)
 		body, _ := io.ReadAll(resp.Body) // best-effort: mock server always returns valid body
 		result, _ := html.Extract(body)  // best-effort: demo context
@@ -105,7 +112,7 @@ func main() {
 
 	pages := make([][]byte, 3)
 	for i, path := range []string{"/article", "/blog", "/docs"} {
-		content, _ := fetchURL(server.URL + path) // best-effort: mock server always returns valid bodies
+		content, _ := fetchURL(httpClient, server.URL+path) // best-effort: mock server always returns valid bodies
 		pages[i] = content
 	}
 
@@ -127,13 +134,14 @@ func main() {
 	fmt.Println("• Validate responses before processing")
 }
 
-// fetchURL fetches content from a URL
-func fetchURL(url string) ([]byte, error) {
-	resp, err := http.Get(url)
+// fetchURL fetches content from a URL using the given client (which should
+// carry a timeout — see createHTTPClient).
+func fetchURL(client *http.Client, url string) ([]byte, error) {
+	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
@@ -142,8 +150,9 @@ func fetchURL(url string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// processURLsConcurrently processes multiple URLs concurrently
-func processURLsConcurrently(processor *html.Processor, urls []string) []URLResult {
+// processURLsConcurrently processes multiple URLs concurrently, sharing one
+// processor and one HTTP client across all worker goroutines.
+func processURLsConcurrently(client *http.Client, processor *html.Processor, urls []string) []URLResult {
 	var wg sync.WaitGroup
 	results := make([]URLResult, len(urls))
 
@@ -152,7 +161,7 @@ func processURLsConcurrently(processor *html.Processor, urls []string) []URLResu
 		go func(idx int, u string) {
 			defer wg.Done()
 
-			content, err := fetchURL(u)
+			content, err := fetchURL(client, u)
 			if err != nil {
 				results[idx] = URLResult{URL: u, Error: err}
 				return
