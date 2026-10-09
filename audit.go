@@ -132,6 +132,16 @@ type AuditConfig struct {
 
 	// MaxRawValueLength limits the length of raw values logged.
 	MaxRawValueLength int `json:"max_raw_value_length"`
+
+	// MaxEntries caps how many audit entries GetAuditLog retains in memory.
+	// When the cap is reached, the oldest half of the retained entries are
+	// dropped so the log always keeps the most recent events. A hostile
+	// document can generate thousands of blocked-tag/attr/URL events; without
+	// a cap these accumulated without bound on a long-lived processor.
+	// 0 uses DefaultMaxAuditEntries. Negative values and values above 100000
+	// are rejected by Config.Validate. Retention is always bounded — feed an
+	// AuditSink instead for unbounded external logging.
+	MaxEntries int `json:"max_entries"`
 }
 
 // DefaultAuditConfig returns the default audit configuration.
@@ -149,6 +159,7 @@ func DefaultAuditConfig() AuditConfig {
 		LogPathTraversal:   true,
 		IncludeRawValues:   false,
 		MaxRawValueLength:  200,
+		MaxEntries:         DefaultMaxAuditEntries,
 	}
 }
 
@@ -167,16 +178,18 @@ func HighSecurityAuditConfig() AuditConfig {
 		LogPathTraversal:   true,
 		IncludeRawValues:   true,
 		MaxRawValueLength:  500,
+		MaxEntries:         DefaultMaxAuditEntries,
 	}
 }
 
 // auditCollector collects audit entries during processing.
 // It is designed to be thread-safe for concurrent use.
 type auditCollector struct {
-	mu      sync.Mutex
-	entries []AuditEntry
-	config  AuditConfig
-	sink    AuditSink
+	mu         sync.Mutex
+	entries    []AuditEntry
+	config     AuditConfig
+	sink       AuditSink
+	maxEntries int // clamped (>= 0) copy of config.MaxEntries used for eviction
 }
 
 // newAuditCollector creates a new audit collector with the given configuration.
@@ -185,10 +198,19 @@ func newAuditCollector(config AuditConfig) *auditCollector {
 	if sink == nil && config.Enabled {
 		sink = NewLoggerAuditSink()
 	}
+	// A zero MaxEntries (hand-built AuditConfig literals, the zero Config)
+	// falls back to the default cap rather than disabling retention: silent
+	// retention loss on upgrade would be worse than the cap.
+	maxEntries := config.MaxEntries
+	if maxEntries == 0 {
+		maxEntries = DefaultMaxAuditEntries
+	}
+	// entries is allocated lazily on the first Record: a disabled or quiet
+	// collector (the common case) never appends and carries no slice at all.
 	return &auditCollector{
-		entries: make([]AuditEntry, 0),
-		config:  config,
-		sink:    sink,
+		config:     config,
+		sink:       sink,
+		maxEntries: maxEntries,
 	}
 }
 
@@ -200,25 +222,57 @@ func (c *auditCollector) Record(entry AuditEntry) {
 
 	entry.Timestamp = time.Now().UTC()
 
-	// Truncate raw values if needed
-	if c.config.MaxRawValueLength > 0 {
-		if len(entry.RawValue) > c.config.MaxRawValueLength {
-			entry.RawValue = entry.RawValue[:c.config.MaxRawValueLength] + "..."
-		}
-	}
+	// SECURITY: entry.URL is attacker-controlled (blocked href/src values) and
+	// can be arbitrarily large — data URLs are exempt from MaxURLLength
+	// upstream, and a recording site that forgets internal.TruncateAuditURL
+	// would otherwise flood the in-memory log and every sink with up to
+	// MaxInputSize bytes per entry. Truncate here as the last line of defense,
+	// using the same policy as the sanitizer call sites.
+	entry.URL = internal.TruncateAuditURL(entry.URL)
 
 	// Remove raw values if not configured to include them
 	if !c.config.IncludeRawValues {
 		entry.RawValue = ""
-	}
-
-	// Sanitize raw values to prevent log injection in downstream HTML renderers
-	if entry.RawValue != "" {
+	} else if entry.RawValue != "" {
+		// Sanitize before truncating so the length cap applies to the final
+		// logged bytes, then back the cut point off so it neither splits a
+		// multi-byte UTF-8 rune nor lands inside an HTML escape sequence
+		// sanitizeRawValue introduced (a cut inside "&amp;" would persist a
+		// broken entity).
 		entry.RawValue = sanitizeRawValue(entry.RawValue)
+		if maxLen := c.config.MaxRawValueLength; maxLen > 0 && len(entry.RawValue) > maxLen {
+			cut := maxLen
+			// A cut at index cut is rune-safe when the byte there starts a
+			// rune rather than a UTF-8 continuation byte (0b10xxxxxx).
+			for cut > 0 && entry.RawValue[cut]&0xC0 == 0x80 {
+				cut--
+			}
+			// Post-sanitize, every '&' starts one of the known &...; escapes;
+			// when the last one before cut has not yet seen its ';', cutting
+			// there would split it — cut in front of the '&' instead.
+			if a := strings.LastIndexByte(entry.RawValue[:cut], '&'); a >= 0 &&
+				strings.IndexByte(entry.RawValue[a:cut], ';') < 0 {
+				cut = a
+			}
+			entry.RawValue = entry.RawValue[:cut] + "..."
+		}
 	}
 
 	c.mu.Lock()
-	c.entries = append(c.entries, entry)
+	// Retention is capped so a hostile document (thousands of blocked
+	// attributes/URLs) cannot grow the in-memory log without bound on a
+	// long-lived processor. When full, drop the oldest half in one move —
+	// evicting one per append would make every post-cap Record an O(n) copy,
+	// exactly the workload an attacker controls. maxEntries == 0 disables
+	// retention entirely (entries still go to the sink).
+	if c.maxEntries > 0 {
+		if len(c.entries) >= c.maxEntries {
+			keep := c.maxEntries / 2
+			copy(c.entries, c.entries[len(c.entries)-keep:])
+			c.entries = c.entries[:keep]
+		}
+		c.entries = append(c.entries, entry)
+	}
 	c.mu.Unlock()
 
 	// Write to the sink synchronously. AuditSink.Write is contractually
@@ -383,7 +437,7 @@ func (c *auditCollector) Clear() {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries = make([]AuditEntry, 0)
+	c.entries = nil // drop the backing array entirely, not just its length
 }
 
 // Close closes the audit collector and its sink.
@@ -423,8 +477,15 @@ func NewLoggerAuditSink() *LoggerAuditSink {
 	}
 }
 
-// NewLoggerAuditSinkWithWriter creates a new sink that writes to the specified writer.
+// NewLoggerAuditSinkWithWriter creates a new sink that writes to the specified
+// writer. A nil w falls back to the default stderr logger (the
+// NewLoggerAuditSink destination): log.Logger would otherwise dereference the
+// nil writer on every Write, and this constructor is public API, which must not
+// hand back an object that panics on use.
 func NewLoggerAuditSinkWithWriter(w io.Writer) *LoggerAuditSink {
+	if w == nil {
+		w = os.Stderr
+	}
 	return &LoggerAuditSink{
 		logger: log.New(w, "[AUDIT] ", log.LstdFlags),
 	}
@@ -460,7 +521,14 @@ type ChannelAuditSink struct {
 
 // NewChannelAuditSink creates a new sink that sends entries to a channel.
 // The channel must be consumed by the caller to prevent blocking.
+//
+// A negative bufferSize is clamped to 0 (an unbuffered channel): make would
+// panic on a negative size, and this constructor is public API, which must not
+// panic on caller input.
 func NewChannelAuditSink(bufferSize int) *ChannelAuditSink {
+	if bufferSize < 0 {
+		bufferSize = 0
+	}
 	return &ChannelAuditSink{
 		ch: make(chan AuditEntry, bufferSize),
 	}
@@ -484,8 +552,12 @@ func (s *ChannelAuditSink) Write(entry AuditEntry) {
 	}
 }
 
-// Channel returns the channel for receiving audit entries.
+// Channel returns the channel for receiving audit entries. It returns nil for
+// a nil sink, matching the nil-safety of Write, Close, and DroppedCount.
 func (s *ChannelAuditSink) Channel() <-chan AuditEntry {
+	if s == nil {
+		return nil
+	}
 	return s.ch
 }
 

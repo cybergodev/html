@@ -21,9 +21,9 @@ func TestConcurrentProcessorExtraction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create processor: %v", err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
-	html := []byte(`<html><body><p>Test content</p></body></html>`)
+	html := []byte(`<html><body><article><h1>Concurrent Title</h1><p>Test content</p></article></body></html>`)
 	numGoroutines := 100
 	numOperations := 50
 
@@ -35,8 +35,13 @@ func TestConcurrentProcessorExtraction(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
-				_, err := processor.Extract(html)
+				result, err := processor.Extract(html)
 				if err != nil {
+					errorCount.Add(1)
+					continue
+				}
+				// Cache hits must return the same content the miss path built.
+				if result.Title != "Concurrent Title" {
 					errorCount.Add(1)
 				}
 			}
@@ -183,9 +188,12 @@ func TestConcurrentAuditCollector(t *testing.T) {
 		LogBlockedURLs:    true,
 		IncludeRawValues:  true,
 		MaxRawValueLength: 100,
+		// Room for every recorded entry: this test asserts that all concurrent
+		// writes are retained; the eviction cap itself has its own tests.
+		MaxEntries: 50*100*3 + 1000,
 	}
 	collector := newAuditCollector(config)
-	defer collector.Close()
+	defer func() { _ = collector.Close() }()
 
 	numGoroutines := 50
 	numOperations := 100
@@ -228,7 +236,7 @@ func TestConcurrentAuditCollector(t *testing.T) {
 func TestConcurrentAuditCollectorClear(t *testing.T) {
 	config := AuditConfig{Enabled: true}
 	collector := newAuditCollector(config)
-	defer collector.Close()
+	defer func() { _ = collector.Close() }()
 
 	numGoroutines := 20
 	numOperations := 200
@@ -258,6 +266,13 @@ func TestConcurrentAuditCollectorClear(t *testing.T) {
 	}
 
 	wg.Wait()
+
+	// Invariant: whatever entries survived the interleaved clears, the count
+	// can never exceed the total number of records written.
+	maxEntries := (numGoroutines / 2) * numOperations
+	if got := len(collector.GetEntries()); got > maxEntries {
+		t.Errorf("entries = %d, want <= %d", got, maxEntries)
+	}
 }
 
 // TestConcurrentProcessorStatistics tests concurrent statistics access.
@@ -269,7 +284,7 @@ func TestConcurrentProcessorStatistics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create processor: %v", err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	html := []byte(`<html><body><p>Test</p></body></html>`)
 	numGoroutines := 50
@@ -319,17 +334,19 @@ func TestConcurrentProcessorStatistics(t *testing.T) {
 // TestConcurrentChannelAuditSink tests concurrent writes to ChannelAuditSink.
 func TestConcurrentChannelAuditSink(t *testing.T) {
 	sink := NewChannelAuditSink(1000)
-	defer sink.Close()
 
 	numGoroutines := 50
 	numOperations := 100
 
 	var wg sync.WaitGroup
 
-	// Start consumer
+	// Start a counting consumer; it exits when Close() closes the channel.
+	var received atomic.Int64
+	consumerDone := make(chan struct{})
 	go func() {
+		defer close(consumerDone)
 		for range sink.Channel() {
-			// Drain channel
+			received.Add(1)
 		}
 	}()
 
@@ -347,13 +364,26 @@ func TestConcurrentChannelAuditSink(t *testing.T) {
 	}
 
 	wg.Wait()
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	<-consumerDone
+
+	// Invariant: every entry was either delivered or counted as dropped —
+	// none may vanish.
+	total := int64(numGoroutines * numOperations)
+	if got := received.Load() + sink.DroppedCount(); got != total {
+		t.Errorf("received+dropped = %d, want %d", got, total)
+	}
 }
 
 // TestConcurrentWriterAuditSink tests concurrent writes to WriterAuditSink.
 func TestConcurrentWriterAuditSink(t *testing.T) {
-	// Use a discard writer for testing
-	sink := NewWriterAuditSink(discardWriter{})
-	defer sink.Close()
+	// A counting discard writer: no-op output, but it records how many bytes
+	// were actually handed to the underlying writer.
+	counter := &countingDiscardWriter{}
+	sink := NewWriterAuditSink(counter)
+	defer func() { _ = sink.Close() }()
 
 	numGoroutines := 50
 	numOperations := 100
@@ -374,12 +404,23 @@ func TestConcurrentWriterAuditSink(t *testing.T) {
 	}
 
 	wg.Wait()
+
+	// Invariant: serialized writes must reach the underlying writer, and no
+	// bytes may be lost or torn between concurrent Write calls.
+	if got := counter.bytes.Load(); got == 0 {
+		t.Error("no bytes reached the underlying writer")
+	}
 }
 
-// discardWriter is a no-op writer for testing.
-type discardWriter struct{}
+// countingDiscardWriter discards output but counts the bytes written.
+type countingDiscardWriter struct {
+	bytes atomic.Int64
+}
 
-func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *countingDiscardWriter) Write(p []byte) (int, error) {
+	w.bytes.Add(int64(len(p)))
+	return len(p), nil
+}
 
 // TestConcurrentProcessorClose tests concurrent Close calls.
 func TestConcurrentProcessorClose(t *testing.T) {
@@ -400,6 +441,16 @@ func TestConcurrentProcessorClose(t *testing.T) {
 	}
 
 	wg.Wait()
+
+	// Invariant: after the racing Closes, the processor is definitively
+	// closed — Close stays idempotent (nil, never an error) and Extract
+	// refuses to run.
+	if err := processor.Close(); err != nil {
+		t.Errorf("Close() after concurrent closes = %v, want nil (idempotent)", err)
+	}
+	if _, err := processor.Extract([]byte("<p>x</p>")); err != ErrProcessorClosed {
+		t.Errorf("Extract() after close = %v, want ErrProcessorClosed", err)
+	}
 }
 
 // TestConcurrentPoolAccess tests concurrent sync.Pool usage.
@@ -446,7 +497,7 @@ func TestConcurrentLinkExtraction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create processor: %v", err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	html := []byte(`<html><body>
 		<a href="https://example.com/1">Link 1</a>
@@ -513,6 +564,16 @@ func TestConcurrentCacheWithTTL(t *testing.T) {
 	}
 
 	wg.Wait()
+
+	// Invariant: once the TTL has fully elapsed, every key must read as
+	// expired — a Get that returns a value after the deadline would mean TTL
+	// enforcement is broken under concurrent writes.
+	time.Sleep(60 * time.Millisecond)
+	for i := 0; i < numGoroutines; i++ {
+		if got := cache.Get(fmt.Sprintf("key-%d", i)); got != nil {
+			t.Fatalf("key-%d returned %v after TTL expiry, want nil", i, got)
+		}
+	}
 }
 
 // TestConcurrentMultiSink tests concurrent writes to MultiSink.
@@ -520,15 +581,21 @@ func TestConcurrentMultiSink(t *testing.T) {
 	sink1 := NewChannelAuditSink(100)
 	sink2 := NewChannelAuditSink(100)
 	multiSink := NewMultiSink(sink1, sink2)
-	defer multiSink.Close()
 
-	// Start consumers
+	// Counting consumers; they exit when Close() closes the channels.
+	var received1, received2 atomic.Int64
+	done1 := make(chan struct{})
+	done2 := make(chan struct{})
 	go func() {
+		defer close(done1)
 		for range sink1.Channel() {
+			received1.Add(1)
 		}
 	}()
 	go func() {
+		defer close(done2)
 		for range sink2.Channel() {
+			received2.Add(1)
 		}
 	}()
 
@@ -551,6 +618,21 @@ func TestConcurrentMultiSink(t *testing.T) {
 	}
 
 	wg.Wait()
+	if err := multiSink.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	<-done1
+	<-done2
+
+	// Invariant: a MultiSink must fan out to EVERY child sink — each child
+	// sees all entries (delivered or counted dropped), not just some.
+	total := int64(numGoroutines * numOperations)
+	if got := received1.Load() + sink1.DroppedCount(); got != total {
+		t.Errorf("sink1 received+dropped = %d, want %d", got, total)
+	}
+	if got := received2.Load() + sink2.DroppedCount(); got != total {
+		t.Errorf("sink2 received+dropped = %d, want %d", got, total)
+	}
 }
 
 // BenchmarkConcurrentCache benchmarks concurrent cache operations.
@@ -576,7 +658,7 @@ func BenchmarkConcurrentCache(b *testing.B) {
 func BenchmarkConcurrentAuditCollector(b *testing.B) {
 	config := AuditConfig{Enabled: true}
 	collector := newAuditCollector(config)
-	defer collector.Close()
+	defer func() { _ = collector.Close() }()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -591,7 +673,7 @@ func BenchmarkConcurrentAuditCollector(b *testing.B) {
 // BenchmarkConcurrentProcessorExtraction benchmarks concurrent extraction.
 func BenchmarkConcurrentProcessorExtraction(b *testing.B) {
 	processor, _ := New()
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	html := []byte(`<html><body><p>Test content for benchmarking</p></body></html>`)
 
@@ -622,7 +704,7 @@ func TestConcurrentProcessorCreation(t *testing.T) {
 				errorCount.Add(1)
 				return
 			}
-			defer p.Close()
+			defer func() { _ = p.Close() }()
 
 			// Use the processor
 			result, err := p.Extract([]byte("<html><body>Test</body></html>"))
@@ -654,12 +736,12 @@ func TestConcurrentBatchProcessing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Prepare multiple HTML documents
 	docs := make([][]byte, 50)
 	for i := range docs {
-		docs[i] = []byte(fmt.Sprintf("<html><body><h1>Doc %d</h1><p>Content</p></body></html>", i))
+		docs[i] = fmt.Appendf(nil, "<html><body><h1>Doc %d</h1><p>Content</p></body></html>", i)
 	}
 
 	// Run multiple batch operations concurrently
@@ -705,7 +787,7 @@ func TestMemoryPressure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Create large HTML documents (100KB each)
 	const docSize = 100 * 1024
@@ -753,13 +835,13 @@ func TestCacheEvictionUnderLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Create unique HTML content to fill the cache
 	const uniqueDocs = 50
 	docs := make([][]byte, uniqueDocs)
 	for i := range docs {
-		docs[i] = []byte(fmt.Sprintf("<html><body><h1>Doc %d</h1><p>Unique content %d</p></body></html>", i, i))
+		docs[i] = fmt.Appendf(nil, "<html><body><h1>Doc %d</h1><p>Unique content %d</p></body></html>", i, i)
 	}
 
 	const numGoroutines = 20
@@ -789,6 +871,13 @@ func TestCacheEvictionUnderLoad(t *testing.T) {
 
 	if errorCount.Load() > 0 {
 		t.Errorf("Cache eviction test had %d errors", errorCount.Load())
+	}
+
+	// The point of MaxCacheEntries=10 with many distinct documents is that
+	// cache churn prevents hit accumulation: with more documents than
+	// entries, most extractions must be misses.
+	if stats := p.GetStatistics(); stats.CacheMisses == 0 {
+		t.Error("expected CacheMisses > 0 under load with MaxCacheEntries=10")
 	}
 }
 

@@ -71,6 +71,12 @@ var (
 	// per-byte case-fold branch. The match itself (asciiFoldHasPrefix) is still
 	// case-insensitive over the whole signature.
 	mediaPatterns [256][]string
+
+	// mediaFirstByte mirrors mediaPatterns as a compact presence bitmap. The
+	// HasMediaReference scan consults it first so bytes that start no signature
+	// — the overwhelming majority — cost one byte load from this 256-byte table
+	// instead of a slice-header load from the 4 KiB mediaPatterns table.
+	mediaFirstByte [256]bool
 )
 
 func init() {
@@ -100,6 +106,9 @@ func init() {
 	}
 	for _, pattern := range embedPatterns {
 		addSignature(pattern)
+	}
+	for b, bucket := range mediaPatterns {
+		mediaFirstByte[b] = len(bucket) > 0
 	}
 }
 
@@ -198,12 +207,13 @@ func hasEmbedPattern(url string) bool {
 func HasMediaReference(content string) bool {
 	n := len(content)
 	for i := 0; i < n; i++ {
-		// mediaPatterns is pre-indexed under both ASCII cases of each signature's
-		// first byte, so this lookup needs no per-byte case fold.
-		bucket := mediaPatterns[content[i]]
-		if len(bucket) == 0 {
+		// mediaFirstByte (pre-indexed under both ASCII cases of each signature's
+		// first byte, like mediaPatterns) rejects non-candidate bytes with a
+		// single bool load before the slice-header lookup below.
+		if !mediaFirstByte[content[i]] {
 			continue
 		}
+		bucket := mediaPatterns[content[i]]
 		for _, sig := range bucket {
 			if asciiFoldHasPrefix(content[i:], sig) {
 				return true
@@ -229,4 +239,160 @@ func asciiFoldHasPrefix(s, prefix string) bool {
 		}
 	}
 	return true
+}
+
+// mediaURLRunDisallowed lists the bytes excluded by the media-URL run class
+// [^\s<>"',;)}\]]: Go's regexp \s is [\t\n\f\r ], plus the eight delimiters
+// that terminate a URL in running HTML text ('\' is written escaped in the
+// class only to close it — a backslash IS an allowed run byte).
+const mediaURLRunDisallowed = "\t\n\f\r <>\"',;)}]"
+
+// mediaURLRunAllowed is the complement of mediaURLRunDisallowed, precomputed
+// for the per-byte scan loop in matchMediaURLAt.
+var mediaURLRunAllowed = func() [256]bool {
+	var allowed [256]bool
+	for i := range allowed {
+		allowed[i] = true
+	}
+	for _, b := range []byte(mediaURLRunDisallowed) {
+		allowed[b] = false
+	}
+	return allowed
+}()
+
+// indexURLExtensions builds a first-byte index over the extensions (without the
+// leading '.') of an extension→MIME map, registering each under both ASCII
+// cases of its first byte so the scanner dispatches without a case-fold branch.
+func indexURLExtensions(exts map[string]string) [256][]string {
+	var idx [256][]string
+	for ext := range exts {
+		e := strings.TrimPrefix(ext, ".")
+		if e == "" {
+			continue
+		}
+		first := e[0]
+		idx[first] = append(idx[first], e)
+		var other byte
+		if first >= 'a' && first <= 'z' {
+			other = first - 32
+		} else if first >= 'A' && first <= 'Z' {
+			other = first + 32
+		}
+		if other != 0 {
+			idx[other] = append(idx[other], e)
+		}
+	}
+	return idx
+}
+
+// videoURLExtIndex / audioURLExtIndex index the extension alternations of the
+// media-URL pattern, derived from the same maps DetectVideoType/DetectAudioType
+// consult so the scanner and the classifier cannot drift apart.
+var (
+	videoURLExtIndex = indexURLExtensions(videoExtensions)
+	audioURLExtIndex = indexURLExtensions(audioExtensions)
+)
+
+// mediaURLMaxRun bounds the URL run length, mirroring the {1,500} quantifier of
+// the pattern ScanMediaURLs replaces.
+const mediaURLMaxRun = 500
+
+// nextHTTPCandidate returns the position of the first 'h' or 'H' at or after
+// from, using two vectorized IndexByte searches.
+func nextHTTPCandidate(s string, from int) (int, bool) {
+	lo := strings.IndexByte(s[from:], 'h')
+	hi := strings.IndexByte(s[from:], 'H')
+	switch {
+	case lo < 0:
+		if hi < 0 {
+			return 0, false
+		}
+		return from + hi, true
+	case hi < 0 || lo < hi:
+		return from + lo, true
+	default:
+		return from + hi, true
+	}
+}
+
+// matchMediaURLAt reports the media-URL match starting at candidate position p
+// ('h' or 'H'), or "" when the pattern does not match there. It reproduces the
+// leftmost-first semantics of
+// (?i)https?://[^\s<>"',;)}\]]{1,500}\.(?:ext|...): a fold-case "https?://"
+// prefix, a greedy run of allowed bytes capped at mediaURLMaxRun, then a
+// greedy one-byte-at-a-time backoff to the rightmost '.' + extension that fits.
+func matchMediaURLAt(s string, p int, exts [256][]string) string {
+	n := len(s)
+	if !asciiFoldHasPrefix(s[p:], "http") {
+		return ""
+	}
+	q := p + 4
+	if q < n && (s[q] == 's' || s[q] == 'S') {
+		q++
+	}
+	if !asciiFoldHasPrefix(s[q:], "://") {
+		return ""
+	}
+	q += 3
+
+	// Greedy run of allowed bytes. runEnd lands on the first disallowed byte,
+	// the end of input, or the {1,500} cap.
+	runEnd := q
+	for runEnd < n && runEnd-q < mediaURLMaxRun && mediaURLRunAllowed[s[runEnd]] {
+		runEnd++
+	}
+	if runEnd == q {
+		return "" // {1,500} requires at least one byte
+	}
+
+	// Back off from the longest run: the match ends after the first (rightmost)
+	// '.' that a known extension follows.
+	for e := runEnd; e > q; e-- {
+		if e >= n || s[e] != '.' || e+1 >= n {
+			continue
+		}
+		for _, ext := range exts[s[e+1]] {
+			end := e + 1 + len(ext)
+			if end <= n && asciiFoldHasPrefix(s[e+1:end], ext) {
+				return s[p:end]
+			}
+		}
+	}
+	return ""
+}
+
+// ScanMediaURLs reports every substring of html matching the media-URL pattern
+// for the chosen extension set (video: mp4/webm/…, audio: mp3/wav/…), in
+// document order, invoking onURL for each until maxMatches URLs have been
+// reported or onURL returns false. It is a hand-rolled equivalent of the two
+// regexes the library previously compiled for this purpose: the profiler
+// attributed roughly half of media-path CPU to the regexp engine stepping over
+// every document byte, while the pattern's shape — a fold-case literal prefix,
+// a bounded run over an explicit byte set, and a fixed-length suffix — admits a
+// direct scan that touches only candidate bytes.
+func ScanMediaURLs(html string, video bool, maxMatches int, onURL func(string) bool) {
+	if maxMatches <= 0 || onURL == nil {
+		return
+	}
+	exts := audioURLExtIndex
+	if video {
+		exts = videoURLExtIndex
+	}
+	matches := 0
+	i := 0
+	for matches < maxMatches {
+		p, ok := nextHTTPCandidate(html, i)
+		if !ok {
+			return
+		}
+		if match := matchMediaURLAt(html, p, exts); match != "" {
+			matches++
+			if !onURL(match) {
+				return
+			}
+			i = p + len(match)
+		} else {
+			i = p + 1
+		}
+	}
 }

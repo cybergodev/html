@@ -43,9 +43,15 @@ type contentMetrics struct {
 // metadata (head, title) whose internal text never appears in extracted output.
 // Skipping them keeps scoring consistent with extraction and decouples the
 // score from whether SanitizeDOM has already removed them.
-var metricsSkipTags = map[string]bool{
-	"svg": true, "math": true, "template": true,
-	"head": true, "title": true,
+//
+// Switch-based for the same hot-path reason as the element classifications in
+// elements.go: this test runs per element on every scoring walk.
+func metricsSkipTags(tag string) bool {
+	switch tag {
+	case "svg", "math", "template", "head", "title":
+		return true
+	}
+	return false
 }
 
 // collectContentMetrics collects all scoring metrics in a single DOM traversal.
@@ -71,7 +77,7 @@ func collectContentMetrics(node *html.Node) contentMetrics {
 			// div around a mega-menu can outscore the real article body; when
 			// CleanContentNode then strips the wrapper's children, the
 			// extraction yields empty output.
-			if IsNonContentElement(n.Data) || metricsSkipTags[n.Data] || ShouldRemoveElement(n) {
+			if IsNonContentElement(n.Data) || metricsSkipTags(n.Data) || ShouldRemoveElement(n) {
 				return false
 			}
 			metrics.tagCount++
@@ -82,24 +88,11 @@ func collectContentMetrics(node *html.Node) contentMetrics {
 				metrics.headingCount++
 			}
 		} else if n.Type == html.TextNode {
-			// Inline NBSP normalization - avoid function call overhead
-			data := n.Data
-			dataLen := len(data)
-
-			// Fast path: check if any NBSP present (UTF-8: 0xC2 0xA0).
-			// The i+1 < dataLen boundary (rather than i < dataLen-1) reads more
-			// naturally as "there is a pair starting at i" and sidesteps the
-			// dataLen == 0 edge case without a separate guard.
-			hasNBSP := false
-			for i := 0; i+1 < dataLen; i++ {
-				if data[i] == 0xC2 && data[i+1] == 0xA0 {
-					hasNBSP = true
-					break
-				}
-			}
-
+			// Inline NBSP normalization: Contains is the vectorized equivalent
+			// of the byte-pair scan it replaces, and the conditional ReplaceAll
+			// avoids the copy bytes.Replace would make on NBSP-free text.
 			var textData string
-			if hasNBSP {
+			if data := n.Data; strings.Contains(data, "\u00a0") {
 				textData = strings.ReplaceAll(data, "\u00a0", " ")
 			} else {
 				textData = data

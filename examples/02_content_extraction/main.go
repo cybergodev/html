@@ -51,7 +51,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer textOnlyProcessor.Close()
+	defer func() { _ = textOnlyProcessor.Close() }()
 	result, _ := textOnlyProcessor.Extract([]byte(sampleHTML))
 	fmt.Printf("TextOnlyConfig(): %d chars, %d images\n\n", len(result.Text), len(result.Images))
 
@@ -60,7 +60,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer mdProcessor.Close()
+	defer func() { _ = mdProcessor.Close() }()
 	mdResult, _ := mdProcessor.Extract([]byte(sampleHTML))
 	fmt.Printf("MarkdownConfig(): %d chars, images inline as markdown\n\n", len(mdResult.Text))
 
@@ -82,7 +82,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer customProcessor.Close()
+	defer func() { _ = customProcessor.Close() }()
 	result, _ = customProcessor.Extract([]byte(sampleHTML))
 	fmt.Printf("Images: %d, Links: %d\n\n", len(result.Images), len(result.Links))
 
@@ -138,7 +138,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	jsonBytes, err := processor.ExtractToJSON([]byte(sampleHTML))
 	if err != nil {
@@ -180,6 +180,7 @@ func main() {
 	fmt.Println("  processor.ExtractFromFile(\"article.html\")")
 	fmt.Println("  processor.ExtractToJSONFromFile(\"article.html\")")
 	fmt.Println("  processor.ExtractToMarkdownFromFile(\"article.html\")")
+	fmt.Println("  See 10_secure_file_processing for sandboxed file access.")
 
 	// ============================================================
 	// 8. Encoding Support
@@ -190,6 +191,7 @@ func main() {
 	fmt.Println("  Specify explicitly:")
 	fmt.Println("    cfg := html.DefaultConfig()")
 	fmt.Println("    cfg.Encoding = \"windows-1252\"")
+	fmt.Println("  See 11_encoding for runnable encoding demos.")
 
 	// ============================================================
 	// Summary

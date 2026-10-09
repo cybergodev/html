@@ -31,8 +31,8 @@ func main() {
 	start := time.Now()
 	for i := 0; i < 2000; i++ {
 		p, _ := html.New()
-		p.Extract([]byte(benchDoc))
-		p.Close()
+		_, _ = p.Extract([]byte(benchDoc))
+		_ = p.Close()
 	}
 	fmt.Printf("  2000 extractions: %v\n", time.Since(start))
 
@@ -42,11 +42,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	start = time.Now()
 	for i := 0; i < 2000; i++ {
-		processor.Extract([]byte(benchDoc))
+		_, _ = processor.Extract([]byte(benchDoc))
 	}
 	fmt.Printf("  2000 extractions: %v\n\n", time.Since(start))
 
@@ -67,16 +67,16 @@ func main() {
 	start = time.Now()
 	for i := 0; i < cacheIters; i++ {
 		doc := []byte(fmt.Sprintf(`<html><body><article><h1>Cache Test %d</h1>%s</article></body></html>`, i, cacheBody))
-		processor.Extract(doc)
+		_, _ = processor.Extract(doc)
 	}
 	missTime := time.Since(start)
 
 	// Warm cache: the same document repeated (all cache hits).
 	warmDoc := []byte("<html><body><article><h1>Cache Warm</h1>" + cacheBody + "</article></body></html>")
-	processor.Extract(warmDoc) // populate the cache
+	_, _ = processor.Extract(warmDoc) // populate the cache
 	start = time.Now()
 	for i := 0; i < cacheIters; i++ {
-		processor.Extract(warmDoc)
+		_, _ = processor.Extract(warmDoc)
 	}
 	hitTime := time.Since(start)
 
@@ -111,7 +111,7 @@ func main() {
 	fmt.Println("Sequential (single goroutine):")
 	start = time.Now()
 	for _, doc := range docs {
-		processor.Extract(doc)
+		_, _ = processor.Extract(doc)
 	}
 	seqTime := time.Since(start)
 	fmt.Printf("  %d docs: %v (%.2f docs/sec)\n", numDocs, seqTime, docsPerSec(numDocs, seqTime))
@@ -124,7 +124,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer batchProcessor.Close()
+	defer func() { _ = batchProcessor.Close() }()
 
 	start = time.Now()
 	batchResult := batchProcessor.ExtractBatch(docs)
@@ -171,7 +171,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer processor2.Close()
+	defer func() { _ = processor2.Close() }()
 
 	const numGoroutines = 5
 	const docsPerGoroutine = 20
@@ -185,7 +185,7 @@ func main() {
 			defer wg.Done()
 			for j := 0; j < docsPerGoroutine; j++ {
 				doc := []byte(fmt.Sprintf(`<article><h1>Goroutine %d-%d</h1><p>Content</p></article>`, id, j))
-				processor2.Extract(doc)
+				_, _ = processor2.Extract(doc)
 			}
 		}(i)
 	}
@@ -214,7 +214,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer perfProcessor.Close()
+	defer func() { _ = perfProcessor.Close() }()
 
 	fmt.Println("Performance-optimized config:")
 	fmt.Printf("  MaxCacheEntries: %d\n", perfCfg.MaxCacheEntries)
@@ -231,9 +231,9 @@ func main() {
 	// Process some documents
 	for i := 0; i < 20; i++ {
 		doc := []byte(fmt.Sprintf(`<article><h1>Doc %d</h1><p>Content</p></article>`, i))
-		processor2.Extract(doc)
+		_, _ = processor2.Extract(doc)
 		// Same document again (cache hit)
-		processor2.Extract(doc)
+		_, _ = processor2.Extract(doc)
 	}
 
 	stats := processor2.GetStatistics()

@@ -182,3 +182,46 @@ func TestEscapeMarkdownText(t *testing.T) {
 		})
 	}
 }
+
+// TestEscapeMarkdownURLDest pins both branches of the Markdown destination
+// escaper: destinations without parentheses pass through untouched, and any
+// '(' / ')' is percent-encoded so it cannot terminate the destination early.
+func TestEscapeMarkdownURLDest(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no parentheses passes through", "https://example.com/a/b.html", "https://example.com/a/b.html"},
+		{"empty destination", "", ""},
+		{"open paren encoded", "https://example.com/(a", "https://example.com/%28a"},
+		{"close paren encoded", "https://example.com/a)", "https://example.com/a%29"},
+		{"wikipedia-style parens", "https://en.wikipedia.org/wiki/Foo_(bar)", "https://en.wikipedia.org/wiki/Foo_%28bar%29"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := escapeMarkdownURLDest(tt.in); got != tt.want {
+				t.Errorf("escapeMarkdownURLDest(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestProcessorNilGuardMethods pins the nil-receiver guards of the Processor
+// convenience methods (processor.go): a nil Processor must be a silent no-op /
+// nil return, never a panic.
+func TestProcessorNilGuardMethods(t *testing.T) {
+	t.Parallel()
+
+	var p *Processor
+	if got := p.GetAuditLog(); got != nil {
+		t.Errorf("GetAuditLog() on nil = %v, want nil", got)
+	}
+	p.ClearAuditLog()   // must not panic
+	p.ClearCache()      // must not panic
+	p.ResetStatistics() // must not panic
+}

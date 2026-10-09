@@ -230,7 +230,7 @@ defer processor.Close()
 
 ### Package-Level Convenience Functions
 
-All `Processor` methods have package-level convenience functions that use a pooled processor. They accept an optional `cfg ...Config` parameter:
+All `Processor` methods have package-level convenience functions. Without a Config they reuse a pooled default-config processor (caching disabled — pooled processors are reset between uses); with a Config, a fresh one-shot processor is created and closed for that call. They accept an optional `cfg ...Config` parameter:
 
 ```go
 // Content extraction
@@ -324,7 +324,7 @@ type LinkInfo struct {
     URL        string // Link URL
     Text       string // Anchor text
     Title      string // Title attribute
-    IsExternal bool   // True if external domain
+    IsExternal bool   // True if the URL is absolute (http/https or protocol-relative), regardless of domain — same-domain absolute links also report true; relative URLs report false
     IsNoFollow bool   // True if rel="nofollow"
     Position   int    // Position in text (for inline formatting)
 }
@@ -433,7 +433,7 @@ func (s MyScorer) Score(node html.ContentNode) int {
 }
 
 func (s MyScorer) ShouldRemove(node html.ContentNode) bool {
-    // Return true to remove the node from content
+    // Part of the Scorer interface; see the note below
     return false
 }
 
@@ -441,6 +441,11 @@ cfg := html.DefaultConfig()
 cfg.Scorer = MyScorer{}
 processor, err := html.New(cfg)
 ```
+
+> **Note:** Only `Score` is currently consulted for custom scorers — it drives article-node
+> candidate selection. `ShouldRemove` is part of the `Scorer` interface but is not invoked
+> on custom scorers by the extraction pipeline; node removal always follows the built-in
+> scorer's rules regardless of what a custom scorer returns here.
 
 ## Best Practices
 
@@ -498,9 +503,10 @@ cfg.MaxInputSize = 10 * 1024 * 1024 // 10MB for blog posts
 cfg.MaxCacheEntries = 500            // Cache 500 recent pages
 cfg.WorkerPoolSize = 8               // 8 workers for batch processing
 
-// Bad: Using unlimited or excessive values
-cfg.MaxInputSize = 1024 * 1024 * 1024 // 1GB - too large
-cfg.MaxCacheEntries = 1000000          // 1M entries - excessive memory
+// Bad: Values that exceed validation limits — New() rejects these with
+// ErrInvalidConfig (MaxInputSize is hard-capped at 50MB, MaxCacheEntries at 100,000)
+cfg.MaxInputSize = 1024 * 1024 * 1024 // 1GB - exceeds the 50MB hard cap
+cfg.MaxCacheEntries = 1000000          // 1M entries - exceeds the 100,000 hard cap
 ```
 
 ### 5. Use Package-Level Functions for One-Off Extractions
@@ -529,7 +535,7 @@ text, err := html.ExtractText(htmlBytes, cfg)
 
 ### Caching
 
-Content-addressable caching using xxHash-style hashing. Cache entries expire based on TTL and are evicted using LRU when full.
+Content-addressable caching keyed by a 128-bit `hash/maphash` digest (AES-NI accelerated, seeded randomly per process) — the 64-bit maphash sum plus a splitmix64-derived second half. Cache entries expire based on TTL and are evicted using LRU when full.
 
 ```go
 processor, err := html.New()
@@ -590,7 +596,7 @@ Run any one directly, e.g. `go run ./examples/01_quick_start/`, or build all at 
 **A:** Two dependencies: `golang.org/x/net/html` (HTML parsing) and `golang.org/x/text` (encoding detection).
 
 ### Q: How does caching work?
-**A:** Content-addressable caching using xxHash-style hashing. Cache entries expire based on TTL (default: 1 hour) and are evicted using LRU when the cache is full (default: 2000 entries).
+**A:** Content-addressable caching keyed by a 128-bit `hash/maphash` digest (AES-NI accelerated, seeded randomly per process). Cache entries expire based on TTL (default: 1 hour) and are evicted using LRU when the cache is full (default: 2000 entries).
 
 ## License
 

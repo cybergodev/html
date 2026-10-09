@@ -429,7 +429,7 @@ func BenchmarkExtractTextWithStructure(b *testing.B) {
 	doc, _ := html.Parse(strings.NewReader(htmlContent))
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		tb := table.NewTrackedBuilder()
 		ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
 	}
@@ -512,6 +512,468 @@ func TestWriteInt(t *testing.T) {
 			writeInt(tb, tt.n)
 			if got := tb.String(); got != tt.want {
 				t.Errorf("writeInt(%d) = %q, want %q", tt.n, got, tt.want)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// Custom / namespace / whitespace tag extraction (merged from
+// extraction_custom_tags_test.go, extraction_namespace_test.go and
+// extraction_whitespace_test.go)
+// ============================================================================
+
+// TestSECDocumentStructure tests that SEC documents with custom tags
+// are properly formatted with appropriate paragraph spacing.
+func TestSECDocumentStructure(t *testing.T) {
+	// Simplified SEC document structure
+	htmlContent := `<SEC-DOCUMENT>0002022111-26-000002.txt : 20260130
+<SEC-HEADER>0002022111-26-000002.hdr.sgml : 20260130
+<ACCEPTANCE-DATETIME>20260130180232
+ACCESSION NUMBER:		0002022111-26-000002
+CONFORMED SUBMISSION TYPE:	4
+PUBLIC DOCUMENT COUNT:		1
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>4
+<SEQUENCE>1
+<FILENAME>wk-form4_1769814146.xml
+<DESCRIPTION>FORM 4
+<TEXT>
+<ownershipDocument>
+    <schemaVersion>X0508</schemaVersion>
+    <documentType>4</documentType>
+    <periodOfReport>2026-01-29</periodOfReport>
+    <issuer>
+        <issuerCik>0001463101</issuerCik>
+        <issuerName>Enphase Energy, Inc.</issuerName>
+        <issuerTradingSymbol>ENPH</issuerTradingSymbol>
+    </issuer>
+</ownershipDocument>
+</TEXT>
+</DOCUMENT>
+</SEC-DOCUMENT>`
+
+	doc, err := html.Parse(strings.NewReader(htmlContent))
+	if err != nil {
+		t.Fatalf("Failed to parse HTML: %v", err)
+	}
+
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	result := tb.String()
+
+	// Verify that custom SEC tags result in proper spacing
+	lines := strings.Split(result, "\n")
+
+	// Count consecutive newlines (paragraph spacing)
+	paragraphCount := 0
+	for i := 0; i < len(lines)-1; i++ {
+		if strings.TrimSpace(lines[i]) == "" && strings.TrimSpace(lines[i+1]) == "" {
+			paragraphCount++
+		}
+	}
+
+	// We expect multiple paragraphs due to block-level custom tags
+	// Each major SEC tag should create paragraph separation
+	if paragraphCount < 3 {
+		t.Logf("Result:\n%s", result)
+		t.Errorf("Expected at least 3 paragraph separations, got %d", paragraphCount)
+		t.Logf("This suggests custom tags are not being treated as block elements")
+	}
+
+	// Verify that key content is preserved
+	expectedContent := []string{
+		"0002022111-26-000002",
+		"4",
+		"2026-01-29",
+		"Enphase Energy, Inc.",
+	}
+
+	for _, content := range expectedContent {
+		if !strings.Contains(result, content) {
+			t.Errorf("Expected to find content %q in result", content)
+		}
+	}
+}
+
+// TestCustomTagFormatting tests that various custom tag patterns
+// result in proper paragraph formatting.
+func TestCustomTagFormatting(t *testing.T) {
+	tests := []struct {
+		name               string
+		html               string
+		minParagraphs      int // Minimum expected paragraph separations
+		contentShouldExist []string
+	}{
+		{
+			name:               "SEC-DOCUMENT root element",
+			html:               `<SEC-DOCUMENT>content here</SEC-DOCUMENT>`,
+			minParagraphs:      1,
+			contentShouldExist: []string{"content here"},
+		},
+		{
+			name:               "SEC-HEADER with children",
+			html:               `<SEC-HEADER><TYPE>4</TYPE><SEQUENCE>1</SEQUENCE></SEC-HEADER>`,
+			minParagraphs:      1,
+			contentShouldExist: []string{"4", "1"},
+		},
+		{
+			name:               "Container with multiple children",
+			html:               `<CUSTOM-TAG><child1>text1</child1><child2>text2</child2></CUSTOM-TAG>`,
+			minParagraphs:      1,
+			contentShouldExist: []string{"text1", "text2"},
+		},
+		{
+			name:               "Tag with long text content",
+			html:               `<DESCRIPTION>This is a very long description that should cause the tag to be treated as a block element because it contains substantial text content</DESCRIPTION>`,
+			minParagraphs:      1,
+			contentShouldExist: []string{"long description"},
+		},
+		{
+			name:               "Tag with multiline text",
+			html:               "<ADDRESS>\nLine 1\nLine 2\nLine 3\n</ADDRESS>",
+			minParagraphs:      1,
+			contentShouldExist: []string{"Line 1", "Line 2", "Line 3"},
+		},
+		{
+			name:               "Uppercase tag with hyphens",
+			html:               `<ACCEPTANCE-DATETIME>20260130180232</ACCEPTANCE-DATETIME>`,
+			minParagraphs:      1,
+			contentShouldExist: []string{"20260130180232"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, err := html.Parse(strings.NewReader(tt.html))
+			if err != nil {
+				t.Fatalf("Failed to parse HTML: %v", err)
+			}
+
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			result := tb.String()
+
+			// Count paragraph separations (double newlines)
+			lines := strings.Split(result, "\n")
+			paragraphCount := 0
+			for i := 0; i < len(lines)-1; i++ {
+				if strings.TrimSpace(lines[i]) == "" && strings.TrimSpace(lines[i+1]) == "" {
+					paragraphCount++
+				}
+			}
+
+			if paragraphCount < tt.minParagraphs {
+				t.Logf("Result:\n%s", result)
+				t.Errorf("Expected at least %d paragraph separations, got %d", tt.minParagraphs, paragraphCount)
+				t.Logf("This suggests custom tags are not being treated as block elements")
+			}
+
+			// Verify expected content exists
+			for _, content := range tt.contentShouldExist {
+				if !strings.Contains(result, content) {
+					t.Errorf("Expected to find content %q in result", content)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkSECDocumentExtraction benchmarks extraction of SEC documents.
+func BenchmarkSECDocumentExtraction(b *testing.B) {
+	htmlContent := `<SEC-DOCUMENT>0002022111-26-000002.txt : 20260130
+<SEC-HEADER>0002022111-26-000002.hdr.sgml : 20260130
+<ACCEPTANCE-DATETIME>20260130180232
+ACCESSION NUMBER:		0002022111-26-000002
+CONFORMED SUBMISSION TYPE:	4
+PUBLIC DOCUMENT COUNT:		1
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>4
+<SEQUENCE>1
+<FILENAME>wk-form4_1769814146.xml
+<DESCRIPTION>FORM 4
+<TEXT>
+<ownershipDocument>
+    <schemaVersion>X0508</schemaVersion>
+    <documentType>4</documentType>
+    <periodOfReport>2026-01-29</periodOfReport>
+    <issuer>
+        <issuerCik>0001463101</issuerCik>
+        <issuerName>Enphase Energy, Inc.</issuerName>
+        <issuerTradingSymbol>ENPH</issuerTradingSymbol>
+    </issuer>
+</ownershipDocument>
+</TEXT>
+</DOCUMENT>
+</SEC-DOCUMENT>`
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		doc, err := html.Parse(strings.NewReader(htmlContent))
+		if err != nil {
+			b.Fatalf("Failed to parse HTML: %v", err)
+		}
+
+		tb := table.NewTrackedBuilder()
+		ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	}
+}
+
+// TestNamespaceTagInlineHandling tests that namespaced tags (e.g., ix:nonnumeric)
+// are correctly identified as inline elements when appropriate.
+func TestNamespaceTagInlineHandling(t *testing.T) {
+	// Note: the "(<ix:nonnumeric>707</ix:nonnumeric>) 774-7000" whitespace
+	// scenario is pinned exactly by TestWhitespacePreservation, so it is not
+	// repeated here as a weaker substring check.
+	tests := []struct {
+		name     string
+		html     string
+		expected string // expected output pattern
+	}{
+		{
+			name: "xbrl:value in paragraph",
+			html: `<p>
+				Net income: <xbrl:value unit="USD">1000000</xbrl:value>
+			</p>`,
+			expected: "Net income: 1000000",
+		},
+		{
+			name: "dei namespace tag",
+			html: `<div>
+				City: <dei:CityAreaCode>707</dei:CityAreaCode>
+			</div>`,
+			expected: "City: 707",
+		},
+		{
+			name: "multiple inline namespace tags",
+			html: `<span>
+				<ix:nonnumeric>A</ix:nonnumeric>
+				<ix:nonnumeric>B</ix:nonnumeric>
+				<ix:nonnumeric>C</ix:nonnumeric>
+			</span>`,
+			expected: "A B C", // Should all be on same line
+		},
+		{
+			name: "unknown namespace in inline context",
+			html: `<span>
+				Text <custom:value>123</custom:value> more text
+			</span>`,
+			expected: "Text123 more text", // Current behavior: text nodes adjacent to inline elements don't get spacing
+		},
+		{
+			name: "namespace tag in block context with long content",
+			html: `<div>
+				<ix:nonnumeric>This is a very long text content that exceeds fifty characters and should be treated as a block element because it has substantial content</ix:nonnumeric>
+			</div>`,
+			expected: "This is a very long text content that exceeds fifty characters",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, err := parseHTML(tt.html)
+			if err != nil {
+				t.Fatalf("Failed to parse HTML: %v", err)
+			}
+
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			result := tb.String()
+
+			// Remove extra whitespace for comparison
+			result = strings.Join(strings.Fields(result), " ")
+
+			if !strings.Contains(result, tt.expected) {
+				t.Errorf("Expected output to contain %q, got:\n%s", tt.expected, result)
+			}
+		})
+	}
+}
+
+// TestNamespaceTagStructure tests the helper functions for namespace tag detection.
+func TestNamespaceTagStructure(t *testing.T) {
+	tests := []struct {
+		tag           string
+		isNamespace   bool
+		prefix        string
+		isKnownInline bool
+	}{
+		{"ix:nonnumeric", true, "ix", true},
+		{"xbrl:value", true, "xbrl", true},
+		{"dei:CityAreaCode", true, "dei", true},
+		{"us-gaap:Revenue", true, "us-gaap", true},
+		{"ifrs:Assets", true, "ifrs", true},
+		{"link:something", true, "link", true},
+		{"custom:tag", true, "custom", false},
+		{"div", false, "", false},
+		{"span", false, "", false},
+		{"p", false, "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.tag, func(t *testing.T) {
+			if got := IsNamespaceTag(tt.tag); got != tt.isNamespace {
+				t.Errorf("IsNamespaceTag(%q) = %v, want %v", tt.tag, got, tt.isNamespace)
+			}
+
+			if got := GetNamespacePrefix(tt.tag); got != tt.prefix {
+				t.Errorf("GetNamespacePrefix(%q) = %q, want %q", tt.tag, got, tt.prefix)
+			}
+
+			if tt.isNamespace {
+				if got := IsKnownInlineNamespacePrefix(tt.prefix); got != tt.isKnownInline {
+					t.Errorf("IsKnownInlineNamespacePrefix(%q) = %v, want %v", tt.prefix, got, tt.isKnownInline)
+				}
+			}
+		})
+	}
+}
+
+// TestShouldTreatNamespaceTagAsInline tests the shouldTreatNamespaceTagAsInline function.
+func TestShouldTreatNamespaceTagAsInline(t *testing.T) {
+	tests := []struct {
+		name     string
+		html     string
+		expected bool
+	}{
+		{
+			name:     "ix:nonnumeric in span is inline",
+			html:     `<span><ix:nonnumeric>707</ix:nonnumeric></span>`,
+			expected: true,
+		},
+		{
+			name:     "ix:nonnumeric in div with short text is inline",
+			html:     `<div><ix:nonnumeric>707</ix:nonnumeric></div>`,
+			expected: true,
+		},
+		{
+			name:     "ix:nonnumeric with long text is not inline",
+			html:     `<div><ix:nonnumeric>This is a very long text content that exceeds fifty characters limit</ix:nonnumeric></div>`,
+			expected: false,
+		},
+		{
+			name:     "unknown namespace in span is inline",
+			html:     `<span><custom:value>123</custom:value></span>`,
+			expected: true,
+		},
+		{
+			name:     "namespace tag with element children is not inline",
+			html:     `<div><ix:nonnumeric><span>707</span></ix:nonnumeric></div>`,
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, err := parseHTML(tt.html)
+			if err != nil {
+				t.Fatalf("Failed to parse HTML: %v", err)
+			}
+
+			// Find the namespace tag node
+			var namespaceTag *html.Node
+			var findFunc func(*html.Node)
+			findFunc = func(n *html.Node) {
+				if n.Type == html.ElementNode && IsNamespaceTag(n.Data) {
+					namespaceTag = n
+					return
+				}
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					findFunc(c)
+				}
+			}
+			findFunc(doc)
+
+			if namespaceTag == nil {
+				t.Fatal("Failed to find namespace tag in parsed HTML")
+			}
+
+			got := ShouldTreatNamespaceTagAsInline(namespaceTag)
+			if got != tt.expected {
+				t.Errorf("ShouldTreatNamespaceTagAsInline() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+// parseHTML is a helper function to parse HTML string.
+func parseHTML(htmlStr string) (*html.Node, error) {
+	return html.Parse(strings.NewReader(htmlStr))
+}
+
+// TestWhitespacePreservation tests that whitespace is correctly preserved
+// when extracting text with inline namespace tags.
+//
+// Current logic: inline elements add spacing after themselves if there's a next sibling.
+// This creates readable output for adjacent text/inline segments.
+func TestWhitespacePreservation(t *testing.T) {
+	tests := []struct {
+		name     string
+		html     string
+		expected string // exact expected output
+	}{
+		{
+			name: "parentheses with namespace tag - original case",
+			html: `(<ix:nonnumeric>707</ix:nonnumeric>) <ix:nonnumeric>774-7000</ix:nonnumeric>`,
+			// HTML parser: "(" + ix:nonnumeric("707") + ") " + ix:nonnumeric("774-7000")
+			// Trailing space in ") " is preserved
+			expected: "(707 ) 774-7000",
+		},
+		{
+			name: "no space after closing parenthesis",
+			html: `(<ix:nonnumeric>707</ix:nonnumeric>)<ix:nonnumeric>774-7000</ix:nonnumeric>`,
+			// HTML parser: "(" + ix:nonnumeric("707") + ")" + ix:nonnumeric("774-7000")
+			// No trailing space in ")"
+			expected: "(707 )774-7000",
+		},
+		{
+			name: "colon with space before namespace tag",
+			html: `<p>Net income: <xbrl:value unit="USD">1000000</xbrl:value></p>`,
+			// HTML parser: "Net income: " + xbrl:value("1000000")
+			// The trailing space in "Net income: " is preserved
+			expected: "Net income: 1000000",
+		},
+		{
+			name: "namespace tag between words",
+			html: `<span>Text<custom:value>123</custom:value>more</span>`,
+			// HTML parser: "Text" + custom:value("123") + "more"
+			// No spaces in source, but inline element adds spacing
+			expected: "Text123 more",
+		},
+		{
+			name: "namespace tag with spaces in source",
+			html: `<span>Text <custom:value>123</custom:value> more</span>`,
+			// HTML parser: "Text " + custom:value("123") + " more"
+			// The trailing space from "Text " is preserved
+			// The span element adds spacing after itself
+			// Then " more" is processed with leading space trimmed
+			expected: "Text123 more",
+		},
+		{
+			// The original SEC-document case: same "(707) 774-7000" scenario
+			// as above but with style attributes on every element (merged from
+			// the former TestOriginalSECCase).
+			name:     "SEC document with styles",
+			html:     `<div style="text-align:center"><span style="color:#000000;font-family:'Arial',sans-serif;font-size:9pt;font-weight:700;line-height:120%">(<ix:nonnumeric contextref="c-1" name="dei:CityAreaCode" id="f-13">707</ix:nonnumeric>) <ix:nonnumeric contextref="c-1" name="dei:LocalPhoneNumber" id="f-14">774-7000</ix:nonnumeric></span></div>`,
+			expected: "(707 )774-7000",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, err := html.Parse(strings.NewReader(tt.html))
+			if err != nil {
+				t.Fatalf("Failed to parse HTML: %v", err)
+			}
+
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			result := strings.TrimSpace(tb.String())
+
+			if result != tt.expected {
+				t.Errorf("Expected %q, got %q", tt.expected, result)
 			}
 		})
 	}

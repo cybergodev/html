@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Security](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
 [![Thread Safe](https://img.shields.io/badge/thread%20safe-yes-brightgreen.svg)](#-thread-safety)
+[![CI](https://github.com/cybergodev/html/actions/workflows/ci.yaml/badge.svg)](https://github.com/cybergodev/html/actions/workflows/ci.yaml)
 
 **A high-performance Go library for intelligent HTML content extraction**, built on `golang.org/x/net/html`.
 
@@ -616,7 +617,7 @@ type Config struct {
 ### HTML Sanitization
 - **Dangerous Tag Removal**: `<script>`, `<style>`, `<noscript>`, `<iframe>`, `<embed>`, `<object>`, `<input>`, `<button>`, `<svg>`, `<math>` (the `<form>` container is intentionally preserved — only its controls are stripped)
 - **Event Handler Removal**: All `on*` attributes (onclick, onerror, onload, etc.)
-- **Dangerous Protocol Blocking**: `javascript:`, `vbscript:`, `data:` (except safe media types)
+- **Dangerous Protocol Blocking**: `javascript:`, `vbscript:`, `file:`, `data:` (data: URLs allowed only for whitelisted safe media types)
 - **XSS Protection**: Comprehensive sanitization
 
 ### Input Validation
@@ -833,6 +834,10 @@ type ContentNode interface {
 ```
 
 `Processor` implements `Extractor` and `StatsProvider` at compile time.
+
+> **Note:** For custom `Scorer` implementations, only `Score` is currently consulted
+> (article-node candidate selection). `ShouldRemove` is part of the interface but is
+> not invoked on custom scorers — node removal always follows the built-in scorer's rules.
 
 ---
 

@@ -24,7 +24,7 @@ func TestCacheMissResultNotAliasedWithCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	htmlBytes := []byte("<html><body><p>hello world</p></body></html>")
 
@@ -60,7 +60,7 @@ func TestConcurrentExtractResultOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	htmlBytes := []byte("<html><body><p>concurrent ownership</p></body></html>")
 

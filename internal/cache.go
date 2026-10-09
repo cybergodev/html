@@ -5,7 +5,6 @@ package internal
 
 import (
 	"context"
-	"runtime"
 	"sync"
 	"time"
 )
@@ -206,14 +205,29 @@ func (c *Cache[K]) removeNode(entry *cacheEntry[K]) {
 	entry.next = nil
 }
 
+// maxEvictProbe bounds how many entries evictOne inspects for expiry before
+// falling back to plain LRU eviction. Probing a bounded sample of the map
+// (iteration order is unspecified, so the sample is effectively random)
+// keeps a capacity-exceeding Set cheap even when the cache is full of fresh
+// entries — the steady state — where the previous unbounded scan visited
+// every entry on every Set. Expired entries the probe misses are still
+// removed by the background sweeper (when configured), by lazy expiry in
+// Get, or by a later probe.
+const maxEvictProbe = 32
+
 func (c *Cache[K]) evictOne(nowNano int64) {
-	// First, try to remove an expired entry. This scan only makes sense when
-	// entries can expire: with ttl == 0 every entry is created with
-	// expiresAt == 0, so isExpired always returns false and the full O(n) map
-	// scan would run on every capacity-exceeding Set without ever matching.
-	// Skipping it avoids serializing that scan against concurrent Gets.
+	// First, try to remove an expired entry from a bounded sample. This only
+	// makes sense when entries can expire: with ttl == 0 every entry is
+	// created with expiresAt == 0, so isExpired always returns false and the
+	// scan would never match. Skipping it entirely avoids serializing the
+	// probe against concurrent Gets.
 	if c.ttl > 0 {
+		probed := 0
 		for key, entry := range c.entries {
+			if probed >= maxEvictProbe {
+				break
+			}
+			probed++
 			if entry.isExpired(nowNano) {
 				c.removeNode(entry)
 				delete(c.entries, key)
@@ -251,14 +265,17 @@ func (c *Cache[K]) Clear() {
 // This is useful when TTL is enabled and the cache receives many one-time accesses,
 // as expired entries would otherwise only be cleaned when accessed or during eviction.
 //
-// The cleanup goroutine runs at the specified interval until StopCleanup is called
-// or the cache is garbage collected. If interval is 0, DefaultCacheCleanupInterval is used.
+// The cleanup goroutine runs at the specified interval until StopCleanup is
+// called. If interval is 0, DefaultCacheCleanupInterval is used.
 //
 // This method is idempotent - calling it multiple times has no additional effect.
 //
-// IMPORTANT: While runtime.SetFinalizer ensures cleanup when the Cache is garbage collected,
-// it is still recommended to call StopCleanup() explicitly for deterministic resource release,
-// especially in long-running applications.
+// IMPORTANT: The cleanup goroutine holds a reference to the Cache, so the
+// Cache can never be garbage-collected (and no finalizer could ever run)
+// while the goroutine is alive. Call StopCleanup() to release the goroutine
+// deterministically; the owning Processor does this in Close(). A
+// runtime.SetFinalizer-based safety net previously documented here could not
+// fire under that reference and has been removed.
 //
 // Usage:
 //
@@ -276,12 +293,6 @@ func (c *Cache[K]) StartCleanup(interval time.Duration) context.CancelFunc {
 		c.cleanupMu.Lock()
 		c.cleanupCancel = cancelFunc
 		c.cleanupMu.Unlock()
-
-		// Set finalizer to ensure cleanup goroutine cleanup when Cache is garbage collected.
-		// This prevents goroutine leaks if StopCleanup() is not called explicitly.
-		runtime.SetFinalizer(c, func(cache *Cache[K]) {
-			cache.StopCleanup()
-		})
 
 		go func() {
 			ticker := time.NewTicker(interval)
@@ -318,7 +329,6 @@ func (c *Cache[K]) StartCleanup(interval time.Duration) context.CancelFunc {
 
 // StopCleanup stops the background cleanup goroutine if it was started.
 // It is safe to call this method multiple times.
-// This method also clears the finalizer to prevent double cleanup.
 func (c *Cache[K]) StopCleanup() {
 	c.cleanupMu.Lock()
 	cancel := c.cleanupCancel
@@ -327,7 +337,6 @@ func (c *Cache[K]) StopCleanup() {
 
 	if cancel != nil {
 		cancel()
-		runtime.SetFinalizer(c, nil)
 	}
 }
 

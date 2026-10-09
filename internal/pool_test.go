@@ -311,10 +311,12 @@ func BenchmarkBufferWithWork(b *testing.B) {
 // TestGetBuilderPoolCorruption tests that GetBuilder handles corrupted pool gracefully.
 // This simulates a scenario where something external puts a wrong type in the pool.
 func TestGetBuilderPoolCorruption(t *testing.T) {
-	t.Parallel()
+	// Not parallel: the corruption fallback is only deterministic when no
+	// other test interleaves sync.Pool Get/Put calls on the same P.
 
 	// Put a wrong type in the pool to simulate corruption
-	BuilderPool.Put("not a builder") //lint:ignore SA6002 intentionally using non-pointer to test pool corruption handling
+	var wrongBuilder any = "not a builder" // deliberately non-pointer: tests pool corruption fallback
+	BuilderPool.Put(wrongBuilder)
 
 	// GetBuilder should still return a valid builder (fallback to new)
 	sb := GetBuilder()
@@ -340,7 +342,8 @@ func TestGetBufferPoolCorruption(t *testing.T) {
 	t.Parallel()
 
 	// Put a wrong type in the pool to simulate corruption
-	BufferPool.Put("not a buffer") //lint:ignore SA6002 intentionally using non-pointer to test pool corruption handling
+	var wrongBuffer any = "not a buffer" // deliberately non-pointer: tests pool corruption fallback
+	BufferPool.Put(wrongBuffer)
 
 	// GetBuffer should still return a valid buffer (fallback to new)
 	buf := GetBuffer()
@@ -366,7 +369,8 @@ func TestGetTransformBufferPoolCorruption(t *testing.T) {
 	t.Parallel()
 
 	// Put a wrong type in the pool to simulate corruption
-	TransformBufferPool.Put("not a buffer") //lint:ignore SA6002 intentionally using non-pointer to test pool corruption handling
+	var wrongTransform any = "not a buffer" // deliberately non-pointer: tests pool corruption fallback
+	TransformBufferPool.Put(wrongTransform)
 
 	// GetTransformBuffer should still return a valid buffer (fallback to new)
 	bufPtr := GetTransformBuffer()
@@ -518,7 +522,7 @@ func TestSetPoolDebug(t *testing.T) {
 	const maxCorruptAttempts = 100
 	wasCalled := false
 	for i := 0; i < maxCorruptAttempts; i++ {
-		BufferPool.Put("not a buffer") //lint:ignore SA6002 intentionally using non-pointer to test pool corruption handling
+		BufferPool.Put("not a buffer") //nolint:SA6002 // intentionally using non-pointer to test pool corruption handling
 		_ = GetBuffer()                // type-assertion fallback invokes logPoolCorruption
 		mu.Lock()
 		if called {
@@ -543,7 +547,7 @@ func TestSetPoolDebug(t *testing.T) {
 	mu.Unlock()
 
 	for i := 0; i < maxCorruptAttempts; i++ {
-		BufferPool.Put("not a buffer") //lint:ignore SA6002 intentionally using non-pointer to test pool corruption handling
+		BufferPool.Put("not a buffer") //nolint:SA6002 // intentionally using non-pointer to test pool corruption handling
 		_ = GetBuffer()
 	}
 	mu.Lock()
@@ -667,7 +671,7 @@ func TestGetTrackedBuilder(t *testing.T) {
 	}
 
 	// Verify it is usable.
-	tb.WriteString("hello")
+	_, _ = tb.WriteString("hello")
 	if tb.String() != "hello" {
 		t.Errorf("String() = %q, want 'hello'", tb.String())
 	}
@@ -681,8 +685,8 @@ func TestPutTrackedBuilder(t *testing.T) {
 	t.Parallel()
 
 	tb := GetTrackedBuilder()
-	tb.WriteString("content to be cleared")
-	tb.WriteByte('!')
+	_, _ = tb.WriteString("content to be cleared")
+	_ = tb.WriteByte('!')
 
 	PutTrackedBuilder(tb)
 
@@ -717,7 +721,7 @@ func TestTrackedBuilderPoolConcurrent(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
 				tb := GetTrackedBuilder()
-				tb.WriteString("test string")
+				_, _ = tb.WriteString("test string")
 				_ = tb.String()
 				PutTrackedBuilder(tb)
 			}
@@ -725,4 +729,31 @@ func TestTrackedBuilderPoolConcurrent(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// TestGetNodeSlicePoolCorruption mirrors the other corruption tests: a wrong
+// type in NodeSlicePool must not crash GetNodeSlice, which falls back to a
+// fresh slice (the previously uncovered 57% branch).
+func TestGetNodeSlicePoolCorruption(t *testing.T) {
+	t.Parallel()
+
+	// Put a wrong type in the pool to simulate corruption
+	var wrongType any = "not a node slice"
+	NodeSlicePool.Put(wrongType)
+
+	s := GetNodeSlice()
+	if s == nil {
+		t.Fatal("GetNodeSlice() returned nil even with pool corruption")
+	}
+	if cap(*s) == 0 {
+		t.Error("fallback slice should have retained capacity")
+	}
+
+	PutNodeSlice(s)
+}
+
+// TestPutNodeSliceNil pins the documented nil no-op contract.
+func TestPutNodeSliceNil(t *testing.T) {
+	t.Parallel()
+	PutNodeSlice(nil) // must not panic
 }

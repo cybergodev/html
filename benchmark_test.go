@@ -10,7 +10,7 @@ import (
 
 func BenchmarkExtract(b *testing.B) {
 	p, _ := html.New()
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	htmlContent := `
 		<html>
@@ -38,12 +38,12 @@ func BenchmarkExtract(b *testing.B) {
 
 func BenchmarkExtractWithCache(b *testing.B) {
 	p, _ := html.New()
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	htmlContent := `<html><body><p>Cached content</p></body></html>`
 
 	// Prime the cache
-	p.Extract([]byte(htmlContent))
+	_, _ = p.Extract([]byte(htmlContent))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -56,15 +56,15 @@ func BenchmarkExtractWithCache(b *testing.B) {
 
 func BenchmarkExtractLargeDocument(b *testing.B) {
 	p, _ := html.New()
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Create a large HTML document
 	var sb strings.Builder
 	sb.WriteString("<html><body><article>")
 	for i := 0; i < 100; i++ {
-		sb.WriteString(fmt.Sprintf("<h2>Section %d</h2>", i))
+		fmt.Fprintf(&sb, "<h2>Section %d</h2>", i)
 		for j := 0; j < 10; j++ {
-			sb.WriteString(fmt.Sprintf("<p>Paragraph %d in section %d with some content.</p>", j, i))
+			fmt.Fprintf(&sb, "<p>Paragraph %d in section %d with some content.</p>", j, i)
 		}
 	}
 	sb.WriteString("</article></body></html>")
@@ -81,12 +81,12 @@ func BenchmarkExtractLargeDocument(b *testing.B) {
 
 func BenchmarkExtractWithImages(b *testing.B) {
 	p, _ := html.New()
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var sb strings.Builder
 	sb.WriteString("<html><body>")
 	for i := 0; i < 50; i++ {
-		sb.WriteString(fmt.Sprintf(`<img src="image%d.jpg" alt="Image %d">`, i, i))
+		fmt.Fprintf(&sb, `<img src="image%d.jpg" alt="Image %d">`, i, i)
 	}
 	sb.WriteString("</body></html>")
 	htmlContent := sb.String()
@@ -102,12 +102,12 @@ func BenchmarkExtractWithImages(b *testing.B) {
 
 func BenchmarkExtractWithLinks(b *testing.B) {
 	p, _ := html.New()
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	var sb strings.Builder
 	sb.WriteString("<html><body>")
 	for i := 0; i < 50; i++ {
-		sb.WriteString(fmt.Sprintf(`<a href="link%d.html">Link %d</a>`, i, i))
+		fmt.Fprintf(&sb, `<a href="link%d.html">Link %d</a>`, i, i)
 	}
 	sb.WriteString("</body></html>")
 	htmlContent := sb.String()
@@ -123,7 +123,7 @@ func BenchmarkExtractWithLinks(b *testing.B) {
 
 func BenchmarkExtractBatch(b *testing.B) {
 	p, _ := html.New()
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	htmlContents := make([][]byte, 10)
 	for i := range htmlContents {
@@ -148,13 +148,13 @@ func BenchmarkNew(b *testing.B) {
 		if err != nil {
 			b.Fatalf("New() failed: %v", err)
 		}
-		p.Close()
+		_ = p.Close()
 	}
 }
 
 func BenchmarkConcurrentExtract(b *testing.B) {
 	p, _ := html.New()
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	htmlContent := `<html><body><p>Concurrent test</p></body></html>`
 
@@ -170,7 +170,7 @@ func BenchmarkConcurrentExtract(b *testing.B) {
 
 func BenchmarkArticleExtraction(b *testing.B) {
 	p, _ := html.New()
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	htmlContent := `
 		<html>
@@ -199,7 +199,7 @@ func BenchmarkArticleExtraction(b *testing.B) {
 
 func BenchmarkInlineImageFormatting(b *testing.B) {
 	p, _ := html.New()
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	htmlContent := `
 		<html>
@@ -238,7 +238,7 @@ func BenchmarkInlineImageFormatting(b *testing.B) {
 
 func BenchmarkMediaExtraction(b *testing.B) {
 	p, _ := html.New()
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	htmlContent := `
 		<html>

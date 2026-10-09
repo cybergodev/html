@@ -94,12 +94,17 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 	// Typical tables have several rows; pre-size to avoid the first outer-slice
 	// doublings (16 → 32 → …). Grows naturally for larger tables.
 	tableData := make([][]CellData, 0, 8)
-	// scratch is reused across rows: extractRowCells resets it to [:0] and appends
-	// into it each row, replacing a per-row make([]CellData, 0, 4). The Markdown
-	// path consumes the row via expandColspanCells (a fresh slice), leaving the
-	// scratch free to reuse; the HTML path copies the row out of scratch before
-	// storing it, because the next row overwrites the same backing array.
+	// scratch is reused across rows: extractRowCells resets it to [:0] and
+	// appends into it each row, replacing a per-row make([]CellData, 0, 4).
 	var scratch []CellData
+	// arena holds every stored row of this table in one backing array, replacing
+	// the per-row slices the HTML path (make + copy) and the Markdown path
+	// (expandColspanCells) previously allocated. Each stored row is resliced
+	// with a full slice expression arena[start:end:end] so its capacity equals
+	// its length: a later append onto that row (padTableColumns) allocates a
+	// fresh backing instead of overwriting the next row's arena region. Skipped
+	// Markdown structure rows return before appending, so they leave no residue.
+	var arena []CellData
 
 	p.nodeWalker.Walk(table, func(node *html.Node) bool {
 		if node.Type != html.ElementNode || node.Data != "tr" {
@@ -112,41 +117,60 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 			return false
 		}
 
-		// Determine if this is a structure row (width definitions only, no real content)
-		isStructureRow := isStructureRow(rawCells)
+		rowStart := len(arena)
 
-		// HTML keeps colspan as an attribute (no expansion). The row is stored
-		// into tableData, so it must own its backing — copy it out of scratch,
-		// which the next row resets with [:0]. (Structure rows are a Markdown
-		// concept and are always kept for HTML, matching the prior behavior.)
 		if tableFormat == "html" {
-			cells := make([]CellData, len(rawCells))
-			copy(cells, rawCells)
-			tableData = append(tableData, cells)
-			return false
+			// HTML keeps colspan as an attribute (no expansion). (Structure rows
+			// are a Markdown concept and are always kept for HTML, matching the
+			// prior behavior.)
+			arena = append(arena, rawCells...)
+		} else {
+			// Markdown: skip structure rows (width definitions only), decided on
+			// the raw cells BEFORE colspan expansion — expanded placeholder cells
+			// carry no width and would defeat the check.
+			if isStructureRow(rawCells) {
+				return false
+			}
+			// Expand colspans into placeholder cells inline as the row is
+			// appended, replacing expandColspanCells' per-row slice allocation.
+			for i := range rawCells {
+				arena = append(arena, rawCells[i])
+				for k := 1; k < rawCells[i].Colspan; k++ {
+					arena = append(arena, expandedPlaceholder(rawCells[i]))
+				}
+			}
 		}
 
-		// Markdown: expand colspans into separate cells. expandColspanCells
-		// allocates a fresh slice, so scratch is dead here and reused next row.
-		// Skip structure rows (width definitions only).
-		cells := expandColspanCells(rawCells)
-		if !isStructureRow {
-			tableData = append(tableData, cells)
-		}
-
+		tableData = append(tableData, arena[rowStart:len(arena):len(arena)])
 		return false
 	})
 
 	return tableData
 }
 
+// expandedPlaceholder builds the placeholder cell that colspan expansion
+// appends after its originating cell, mirroring the CellData shape
+// expandColspanCells produced: one column wide, same alignment/header/rowspan
+// as the origin, empty width, marked IsExpanded.
+func expandedPlaceholder(origin CellData) CellData {
+	return CellData{
+		Text:            " ",
+		Align:           origin.Align,
+		Colspan:         1,
+		Rowspan:         origin.Rowspan,
+		IsHeader:        origin.IsHeader,
+		Width:           "",
+		IsExpanded:      true,
+		OriginalColspan: 1,
+	}
+}
+
 // extractRowCells extracts all cell data from a single table row (tr element).
 // It appends into the caller-provided scratch buffer (reset to [:0] first) and
-// returns a slice that shares that backing array. Because the next row reuses the
-// same scratch, a caller that retains the returned slice across rows — e.g. by
-// storing it in tableData — must copy it first. extractTableData does this for
-// the HTML path; the Markdown path consumes the row via expandColspanCells,
-// which allocates a fresh slice and leaves scratch free to reuse.
+// returns a slice that shares that backing array. Because the next row reuses
+// the same scratch, a caller that retains the returned slice across rows must
+// copy it first; extractTableData immediately copies each row into its arena,
+// so scratch is free to reuse.
 func (p *Processor) extractRowCells(rowNode *html.Node, scratch *[]CellData) []CellData {
 	cells := (*scratch)[:0]
 

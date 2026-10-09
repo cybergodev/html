@@ -4,6 +4,54 @@ All notable changes to the cybergodev/html library will be documented in this fi
 
 ---
 
+## v1.4.8 - Security Audit Fixes, Performance & Production Readiness (2026-10-10)
+
+### Security
+- `IsValidURL` now enforces the sanitizer's data-URL media-type whitelist — percent-encoded script-executing URLs (`data:image/svg+xml,…onload…`, `data:text/html,…`) no longer reach `ExtractAllLinks` results or the raw-HTML media scan
+- In-memory audit retention is capped (`AuditConfig.MaxEntries`, default 10,000, hard max 100,000) — entries previously grew without bound on a long-lived processor
+- Audit entries are centrally truncated (`AuditEntry.URL` plus boundary-aware `RawValue` capping) — one oversized attribute can no longer flood the audit log, and a truncated value never ends mid-rune or mid-entity
+- File reads are hard-capped at `MaxInputSize+1` bytes — FIFOs, character devices (`/dev/zero`), or files growing between `Stat` and read can no longer stream unbounded bytes into memory
+- The string-based `SanitizeHTML` sanitize walk is now iterative (explicit stack), eliminating the unbounded-recursion / stack-overflow hazard on pathologically deep input
+- `normalizeCharset` no longer caches names longer than 40 bytes from untrusted `<meta charset>` input — closes a slow unbounded-memory-growth vector under hostile traffic
+- Windows: `AllowedBaseDir` containment compares paths ASCII case-insensitively, matching case-insensitive filesystems (NTFS/FAT/ReFS)
+- `golang.org/x/text` upgraded v0.40.0 → v0.41.0, clearing GO-2026-6629/CVE-2026-56851 while keeping the declared Go 1.25 minimum
+- govulncheck reports zero findings and is now a blocking CI job; `docs/SECURITY.md` gained a real vulnerability-reporting channel (GitHub Private Vulnerability Reporting)
+
+### Fixed
+- Quadratic inline-link formatting: a crafted 1MB document dense with unmatched `[LINK:n]` placeholders dropped from ~31s CPU to milliseconds (8k-token case 128ms → 1.6ms); output is byte-identical
+- Markdown link/image destinations percent-encode parentheses, so a `)` inside a URL no longer terminates the destination early and spills into rendered text
+- CJK input now counts each ideograph/kana/Hangul syllable as one word — `WordCount` previously reported 1 for an entire CJK paragraph
+- `ExtractAllLinks*` on a closed processor with empty input returns `ErrProcessorClosed` (matching `Extract`) instead of a successful empty result
+- Depth-violation audit entries record the actual offending depth, the links path records them too, and its oversize errors report Op `"ExtractAllLinks"` instead of the hardcoded `"Extract"`
+- `InputError.Unwrap` returns both the wrapped cause and `ErrInputTooLarge`, so `errors.Is(err, ErrInputTooLarge)` holds for every `*InputError`
+
+### Performance
+- Element classification (`IsInlineElement`/`IsBlockElement`/`IsNonContentElement`) converted from map lookups to string switches — 2.3× per lookup; ~8% of `Extract` CPU was map access
+- Combined pass: `BenchmarkRealisticNoCache` −6.2%…−20.8% sec/op (p ≤ 0.002) and −3.4% allocs/op; small-document benchmarks unchanged
+- `ReplaceHTMLEntities` gains an allocation-free guard skipping the entity pre-pass when no `&` begins a decodable reference — lone-ampersand text no longer pays a full document copy
+- Table extraction builds rows in a single per-table cell arena, replacing per-row `make`+copy and the colspan-expansion allocation
+- Pure-ASCII input skips the whole-document NFC scan; TTL cache eviction probes at most 32 entries for an expired candidate before plain LRU fallback (was a full map scan per capacity-exceeding `Set`)
+- Format processors share package-level no-op cache/audit/adapter instances, and audit entries allocate lazily on first `Record`
+
+### Added
+- `AuditConfig.MaxEntries` field and `DefaultMaxAuditEntries` constant (10,000)
+- CI: `.github/workflows/ci.yaml` (goimports, vet, race tests, coverage, golangci-lint, blocking govulncheck; ubuntu + windows matrix with a min-Go guard) and tag-driven `.github/workflows/release.yaml`; README CI badge
+- `example_test.go` godoc examples committed to the repo — the v1.4.7 entry described them, but the file was missing from that release's tree
+
+### Changed
+- Data URLs with non-whitelisted media types (`text/plain`, `text/css`, `image/svg+xml`, `text/html`, …) are now rejected by `IsValidURL`, aligning the links path with what the sanitizer already blocked (intentional tightening; `ExtractAllLinks` results and media scans no longer include them)
+- ~280 errcheck violations fixed across tests, examples and internal code — `golangci-lint` now passes with zero issues
+- Test suite deduplicated and consolidated by topic: cross-package coverage 92.5% → 93.7% (root 90.1% → 92.1%) with −614 net test lines; vacuous tests replaced with real assertions
+- `ExtractAllLinks`/`ExtractAllLinksWithContext` share one `extractAllLinksCore`; new `withConfig`/`withConfigBatch` helpers replace the preamble duplicated across all 24 package-level convenience wrappers
+- Cache cleanup finalizer removed — `StopCleanup` is the documented deterministic contract (honored by `Processor.Close`)
+- Examples: `05_http_integration` shares one HTTP client with a 10s timeout (previously `http.Get` with none), `06_advanced_usage` demonstrates the `Extractor` interface, `10_secure_file_processing` exercises the `*FromFile` entry points under its sandbox
+- Modernized idioms: range-over-int loops, `slices.Contains`, `strings.CutSuffix`, `fmt.Appendf`/`fmt.Fprintf`
+
+### Removed
+- Unused `initialTextSize` constant and the unreachable `runtime.SetFinalizer` safety net in the cache cleanup
+
+---
+
 ## v1.4.7 - Extraction Fixes, Performance & Code Quality (2026-08-11)
 
 ### Fixed

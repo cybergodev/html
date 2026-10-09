@@ -109,7 +109,7 @@ func TestPackageLevelBatchWithContext(t *testing.T) {
 		paths := make([]string, 2)
 		for i := range paths {
 			paths[i] = filepath.Join(tmpDir, filepath.Join("file"+string(rune('A'+i))+".html"))
-			os.WriteFile(paths[i], []byte(boundaryTestHTML), 0644)
+			_ = os.WriteFile(paths[i], []byte(boundaryTestHTML), 0644)
 		}
 
 		br := html.ExtractBatchFilesWithContext(context.Background(), paths)
@@ -222,7 +222,7 @@ func TestContentNodeAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Use a custom scorer to exercise ContentNode adapter methods
 	var capturedNode html.ContentNode
@@ -238,7 +238,7 @@ func TestContentNodeAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p2.Close()
+	defer func() { _ = p2.Close() }()
 
 	htmlContent := `<html><body><article><p class="intro" data-id="42">Hello</p></article></body></html>`
 	_, _ = p2.Extract([]byte(htmlContent))
@@ -360,7 +360,7 @@ func TestProcessorDetectEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Valid UTF-8 should work fine
 	result, err := p.Extract([]byte(`<html><body><p>UTF-8 content</p></body></html>`))
@@ -389,7 +389,7 @@ func TestProcessorMethodsNilSafety(t *testing.T) {
 
 	t.Run("GetAuditLog on no-audit processor", func(t *testing.T) {
 		p, _ := html.New()
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		entries := p.GetAuditLog()
 		if len(entries) != 0 {
@@ -399,21 +399,21 @@ func TestProcessorMethodsNilSafety(t *testing.T) {
 
 	t.Run("ClearAuditLog on no-audit processor", func(t *testing.T) {
 		p, _ := html.New()
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		p.ClearAuditLog() // should not panic
 	})
 
 	t.Run("ClearCache on valid processor", func(t *testing.T) {
 		p, _ := html.New()
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		p.ClearCache() // should not panic
 	})
 
 	t.Run("ResetStatistics on valid processor", func(t *testing.T) {
 		p, _ := html.New()
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		p.ResetStatistics()
 		stats := p.GetStatistics()
@@ -476,7 +476,7 @@ func TestPackageLevelBatchFiles_HappyPath(t *testing.T) {
 	for i := range paths {
 		paths[i] = filepath.Join(tmpDir, fmt.Sprintf("file%d.html", i))
 		content := fmt.Sprintf(`<html><body><h1>File %d</h1></body></html>`, i)
-		os.WriteFile(paths[i], []byte(content), 0644)
+		_ = os.WriteFile(paths[i], []byte(content), 0644)
 	}
 
 	br := html.ExtractBatchFiles(paths)
@@ -541,7 +541,7 @@ func TestExtractTextFromFileWithContext_Coverage(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		tmpFile := writeTempHTML(t, boundaryTestHTML)
 		text, err := p.ExtractTextFromFileWithContext(context.Background(), tmpFile)
@@ -559,11 +559,52 @@ func TestExtractTextFromFileWithContext_Coverage(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 
 		_, err = p.ExtractTextFromFileWithContext(context.Background(), "nonexistent.html")
 		if err == nil {
 			t.Error("expected error for non-existent file")
 		}
 	})
+}
+
+// TestBatchMultipleConfigsRejected covers the resolveConfig error branch of
+// withConfigBatch (processor_pool.go): two variadic configs must fail every
+// batch wrapper uniformly, marking all items failed with ErrMultipleConfigs.
+func TestBatchMultipleConfigsRejected(t *testing.T) {
+	t.Parallel()
+
+	cfg1 := html.DefaultConfig()
+	cfg2 := html.DefaultConfig()
+
+	tests := []struct {
+		name string
+		run  func() *html.BatchResult
+	}{
+		{"ExtractBatch", func() *html.BatchResult {
+			return html.ExtractBatch([][]byte{[]byte(`<p>x</p>`)}, cfg1, cfg2)
+		}},
+		{"ExtractBatchWithContext", func() *html.BatchResult {
+			return html.ExtractBatchWithContext(context.Background(), [][]byte{[]byte(`<p>x</p>`)}, cfg1, cfg2)
+		}},
+		{"ExtractBatchFiles", func() *html.BatchResult {
+			return html.ExtractBatchFiles([]string{"a.html"}, cfg1, cfg2)
+		}},
+		{"ExtractBatchFilesWithContext", func() *html.BatchResult {
+			return html.ExtractBatchFilesWithContext(context.Background(), []string{"a.html"}, cfg1, cfg2)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			br := tt.run()
+			if br.Failed != 1 {
+				t.Fatalf("Failed = %d, want 1", br.Failed)
+			}
+			if !errors.Is(br.Errors[0], html.ErrMultipleConfigs) {
+				t.Errorf("error = %v, want ErrMultipleConfigs", br.Errors[0])
+			}
+		})
+	}
 }

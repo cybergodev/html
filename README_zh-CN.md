@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Security](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
 [![Thread Safe](https://img.shields.io/badge/thread%20safe-yes-brightgreen.svg)](#-线程安全)
+[![CI](https://github.com/cybergodev/html/actions/workflows/ci.yaml/badge.svg)](https://github.com/cybergodev/html/actions/workflows/ci.yaml)
 
 **一个高性能的 Go 库，用于智能 HTML 内容提取**，基于 `golang.org/x/net/html` 构建。
 
@@ -111,7 +112,7 @@ func main() {
     // 提取所有内容（含元数据）
     result, _ := html.Extract(htmlBytes)
     fmt.Println(result.Title)     // "标题"
-    fmt.Println(result.WordCount) // 2
+    fmt.Println(result.WordCount) // 8（CJK 文本逐字计数："标题"2 字 + "内容在这里"5 字 + "..."计 1 词）
 
     // 提取所有资源链接（包括 <script>、<iframe>、<link> 标签）
     links, _ := html.ExtractAllLinks(htmlBytes)
@@ -616,7 +617,7 @@ type Config struct {
 ### HTML 净化
 - **危险标签移除**：`<script>`、`<style>`、`<noscript>`、`<iframe>`、`<embed>`、`<object>`、`<input>`、`<button>`、`<svg>`、`<math>`（`<form>` 容器会特意保留 —— 仅移除其中的表单控件）
 - **事件处理器移除**：所有 `on*` 属性（onclick、onerror、onload 等）
-- **危险协议阻止**：`javascript:`、`vbscript:`、`data:`（安全媒体类型除外）
+- **危险协议阻止**：`javascript:`、`vbscript:`、`file:`、`data:`（data: 仅允许白名单中的安全媒体类型）
 - **XSS 防护**：全面的净化以防止跨站脚本攻击
 
 ### 输入验证
@@ -833,6 +834,9 @@ type ContentNode interface {
 ```
 
 `Processor` 在编译时实现了 `Extractor` 和 `StatsProvider` 接口。
+
+> **注意**：对于自定义 `Scorer` 实现，当前只有 `Score` 会被调用（用于文章节点候选评分）。
+> `ShouldRemove` 是接口的一部分，但提取管线不会对自定义评分器调用它 —— 节点移除始终遵循内置评分器的规则。
 
 ---
 

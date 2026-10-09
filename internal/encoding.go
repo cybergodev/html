@@ -565,9 +565,20 @@ func (ed *EncodingDetector) DetectAndConvert(data []byte) ([]byte, string, error
 	return converted, charset, err
 }
 
+// maxCachedCharsetLen bounds which charset names may enter charsetNormCache.
+// Cache keys can originate from an untrusted <meta charset> declaration in the
+// first 1KB of arbitrary input, and an unbounded sync.Map keyed by
+// attacker-controlled strings grows without limit under sustained hostile
+// traffic. Real charset names are far shorter than this bound; longer inputs
+// bypass the cache and pay only the cheap slow-path normalization.
+const maxCachedCharsetLen = 40
+
 // normalizeCharset normalizes charset names to a standard form.
 // Uses a sync.Map cache to avoid repeated string operations for common charset names.
 func normalizeCharset(charset string) string {
+	if len(charset) > maxCachedCharsetLen {
+		return normalizeCharsetSlow(charset)
+	}
 	// Check cache first
 	if v, ok := charsetNormCache.Load(charset); ok {
 		if s, ok := v.(string); ok {
@@ -686,6 +697,11 @@ func detectAndConvertToUTF8StringCore(data []byte, forcedEncoding string, safeCo
 	// Fast path: if no forced encoding, try quick ASCII/UTF-8 detection
 	if forcedEncoding == "" {
 		if isPureASCII(data) {
+			// ASCII needs no NFC pass: it contains no combining characters or
+			// multi-codepoint composites, so it is trivially in Normalization
+			// Form C. Returning here skips the norm.NFC quickSpan scan of the
+			// whole document that would otherwise run (and allocate nothing but
+			// still cost a full pass) on this hottest of paths.
 			if safeCopy {
 				return string(data), "utf-8", nil
 			}

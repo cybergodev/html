@@ -6,90 +6,13 @@ import (
 	"golang.org/x/net/html"
 )
 
-// HTML5 inline elements - elements that should NOT add newlines or paragraph spacing.
-// These elements flow with text on the same line.
-var inlineElements = map[string]bool{
-	// Text formatting (presentational)
-	"font": true, "b": true, "i": true, "u": true, "s": true, "strike": true,
-	"del": true, "ins": true, "strong": true, "em": true,
-	"mark": true, "small": true, "sub": true, "sup": true,
-	"big": true, "tt": true,
-
-	// Semantic inline
-	"span": true, "a": true, "code": true, "kbd": true, "samp": true,
-	"var": true, "abbr": true, "cite": true, "q": true, "dfn": true,
-	"time": true, "data": true, "ruby": true, "rt": true, "rp": true,
-	"bdi": true, "wbr": true,
-
-	// Media and embedded. canvas is intentionally NOT here: it is a block-level
-	// element (see blockElements / IsParagraphLevelBlockElement) and surviving
-	// sanitization, so classifying it inline too made IsInlineElement and
-	// IsBlockElement both return true and caused the article scorer to skip
-	// <canvas> subtrees (extract.go extractArticleNode) while extraction treated
-	// them as blocks.
-	"img": true, "svg": true, "picture": true,
-	"video": true, "audio": true,
-	"object": true, "embed": true, "iframe": true,
-	"map": true,
-
-	// Form controls
-	"input": true, "button": true, "select": true,
-	"textarea": true, "label": true, "output": true,
-
-	// Line break (special inline)
-	"br": true,
-
-	// Metadata (should not affect layout)
-	"script": true, "style": true, "link": true, "meta": true, "title": true,
-}
-
-// HTML5 block elements - elements that should add newlines and paragraph spacing.
-// Organized by category for better maintainability.
-var blockElements = map[string]bool{
-	// Text containers
-	"p": true, "div": true, "pre": true, "blockquote": true,
-
-	// Headings
-	"h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true,
-
-	// Semantic HTML5 sections (high priority)
-	"article": true, "section": true, "main": true, "nav": true, "aside": true,
-	"header": true, "footer": true, "figure": true, "figcaption": true,
-
-	// Lists
-	"ul": true, "ol": true, "li": true, "dl": true, "dt": true, "dd": true,
-
-	// Tables
-	"table": true, "thead": true, "tbody": true, "tfoot": true, "tr": true, "td": true, "th": true,
-
-	// Forms
-	"form": true, "fieldset": true,
-
-	// Interactive elements
-	"details": true, "summary": true, "dialog": true,
-
-	// Other block elements
-	"hr": true, "address": true,
-
-	// Structural elements (low priority, rarely appear in content extraction)
-	"body": true, "html": true, "head": true,
-
-	// Deprecated elements
-	"center": true,
-
-	// Media/Interactive elements
-	"canvas": true,
-}
-
-// nonContentTags contains tags that are typically not part of the main content.
-// Note: <form> is intentionally excluded. Server-side frameworks (ASP.NET
-// WebForms, JSF, JSP) wrap the entire page body in a single <form>; marking it
-// non-content would cause ShouldRemove/CleanContentNode and the text extractor
-// to drop the whole page body.
-var nonContentTags = map[string]bool{
-	"script": true, "style": true, "noscript": true, "nav": true,
-	"aside": true, "footer": true, "header": true,
-}
+// The element classifications below are switch-based rather than map-based.
+// These predicates run once or more per node on every tree walk (extraction,
+// scoring, sanitization, cleaning — ~7 walks per Extract), and the profiler
+// showed string-map hashing (mapaccess1_faststr) at ~8% of Extract CPU, with
+// IsNonContentElement alone responsible for ~45% of those lookups. A string
+// switch compiles to length + byte comparisons with no hashing, and reads the
+// same as the map literal it replaces.
 
 // knownInlineNamespacePrefixes contains namespace prefixes that are typically
 // used for inline data markers in structured documents like XBRL/SEC filings.
@@ -109,19 +32,75 @@ func IsKnownInlineNamespacePrefix(prefix string) bool {
 }
 
 // IsBlockElement returns true if the tag is a known block-level element.
+// Block elements add newlines and paragraph spacing.
 func IsBlockElement(tag string) bool {
-	return blockElements[tag]
+	switch tag {
+	// Text containers; headings; semantic HTML5 sections; lists; tables; forms;
+	// interactive elements; other block elements; structural elements (low
+	// priority, rarely appear in content extraction); deprecated elements;
+	// media/interactive elements.
+	case "p", "div", "pre", "blockquote",
+		"h1", "h2", "h3", "h4", "h5", "h6",
+		"article", "section", "main", "nav", "aside",
+		"header", "footer", "figure", "figcaption",
+		"ul", "ol", "li", "dl", "dt", "dd",
+		"table", "thead", "tbody", "tfoot", "tr", "td", "th",
+		"form", "fieldset",
+		"details", "summary", "dialog",
+		"hr", "address",
+		"body", "html", "head",
+		"center",
+		"canvas":
+		return true
+	}
+	return false
 }
 
 // IsInlineElement returns true if the tag is a known inline element.
 // Inline elements should not add newlines or paragraph spacing.
+// These elements flow with text on the same line.
 func IsInlineElement(tag string) bool {
-	return inlineElements[tag]
+	switch tag {
+	// Text formatting (presentational); semantic inline; media and embedded;
+	// form controls; line break (special inline); metadata (no layout effect).
+	//
+	// canvas is intentionally NOT here: it is a block-level element (see
+	// IsBlockElement / IsParagraphLevelBlockElement) and survives sanitization,
+	// so classifying it inline too made IsInlineElement and IsBlockElement both
+	// return true and caused the article scorer to skip <canvas> subtrees
+	// (extract.go extractArticleNode) while extraction treated them as blocks.
+	case "font", "b", "i", "u", "s", "strike",
+		"del", "ins", "strong", "em",
+		"mark", "small", "sub", "sup",
+		"big", "tt",
+		"span", "a", "code", "kbd", "samp",
+		"var", "abbr", "cite", "q", "dfn",
+		"time", "data", "ruby", "rt", "rp",
+		"bdi", "wbr",
+		"img", "svg", "picture",
+		"video", "audio",
+		"object", "embed", "iframe",
+		"map",
+		"input", "button", "select",
+		"textarea", "label", "output",
+		"br",
+		"script", "style", "link", "meta", "title":
+		return true
+	}
+	return false
 }
 
 // IsNonContentElement returns true if the tag is typically not part of main content.
+// Note: <form> is intentionally excluded. Server-side frameworks (ASP.NET
+// WebForms, JSF, JSP) wrap the entire page body in a single <form>; marking it
+// non-content would cause ShouldRemove/CleanContentNode and the text extractor
+// to drop the whole page body.
 func IsNonContentElement(tag string) bool {
-	return nonContentTags[tag]
+	switch tag {
+	case "script", "style", "noscript", "nav", "aside", "footer", "header":
+		return true
+	}
+	return false
 }
 
 // IsParagraphLevelBlockElement returns true if the element is a block element that should

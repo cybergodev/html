@@ -46,7 +46,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer processor.Close()
+	defer func() { _ = processor.Close() }()
 
 	// ============================================================
 	// PART 1: Link extraction with URL resolution
@@ -92,7 +92,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer filterProcessor.Close()
+	defer func() { _ = filterProcessor.Close() }()
 
 	filteredLinks, _ := filterProcessor.ExtractAllLinks([]byte(htmlContent))
 	fmt.Printf("Content links only (CSS/JS excluded): %d\n", len(filteredLinks))
@@ -106,7 +106,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer internalProcessor.Close()
+	defer func() { _ = internalProcessor.Close() }()
 
 	internalLinks, _ := internalProcessor.ExtractAllLinks([]byte(htmlContent))
 	hasExternal := false
@@ -184,7 +184,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer imageProcessor.Close()
+	defer func() { _ = imageProcessor.Close() }()
 
 	imgResult, _ := imageProcessor.Extract([]byte(htmlContent))
 	fmt.Printf("Images only: %d images, %d videos, %d audio\n",
@@ -197,7 +197,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer mediaProcessor.Close()
+	defer func() { _ = mediaProcessor.Close() }()
 
 	mediaResult, _ := mediaProcessor.Extract([]byte(htmlContent))
 	fmt.Printf("Media only: %d images, %d videos, %d audio\n",

@@ -2,7 +2,7 @@ package html
 
 import (
 	"fmt"
-	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -19,6 +19,9 @@ const (
 	DefaultCacheTTL = time.Hour
 	// DefaultCacheCleanup is the default interval between background sweeps of expired cache entries.
 	DefaultCacheCleanup = 5 * time.Minute
+	// DefaultMaxAuditEntries is the default cap on audit entries retained in
+	// memory by GetAuditLog (see AuditConfig.MaxEntries).
+	DefaultMaxAuditEntries = 10000
 	// DefaultMaxDepth is the default maximum HTML nesting depth, guarding against stack overflow.
 	DefaultMaxDepth = 500
 	// DefaultProcessingTimeout is the default per-document processing timeout.
@@ -44,6 +47,12 @@ const (
 	// Value 100,000 entries ≈ 100MB assuming 1KB average entry size.
 	maxConfigCacheEntries = 100000
 
+	// maxConfigAuditEntries limits the number of audit entries retained in
+	// memory by GetAuditLog. Audit entries carry URLs and raw values (up to a
+	// few hundred bytes each once truncated), so 100,000 bounds retention to
+	// tens of MB while leaving ample forensic headroom over the 10,000 default.
+	maxConfigAuditEntries = 100000
+
 	// Processing limits
 	// maxHTMLForRegex limits HTML size for regex-based media URL detection.
 	// Above 1MB, regex operations become slow and could cause ReDoS.
@@ -61,8 +70,7 @@ const (
 	cacheKeySample = 4096
 
 	// Buffer size estimates for pre-allocation
-	initialTextSize = 4096 // Initial capacity for text builder
-	initialSliceCap = 16   // Initial capacity for result slices
+	initialSliceCap = 16 // Initial capacity for result slices
 	// linksInitialCap is the initial capacity for the links result slice. Links are
 	// the most numerous per-element extraction target on typical pages (nav bars,
 	// in-content links, footers), and a link-dense page exceeds initialSliceCap
@@ -77,12 +85,6 @@ const (
 
 	// Processing thresholds
 	wordsPerMinute = 200 // Average reading speed for reading time estimation
-)
-
-// Pre-compiled regex patterns for media URL detection.
-var (
-	videoRegex = regexp.MustCompile(`(?i)https?://[^\s<>"',;)}\]]{1,500}\.(?:mp4|webm|ogg|mov|avi|wmv|flv|mkv|m4v|3gp)`)
-	audioRegex = regexp.MustCompile(`(?i)https?://[^\s<>"',;)}\]]{1,500}\.(?:mp3|wav|ogg|m4a|aac|flac|wma|opus|oga)`)
 )
 
 // ============================================================================
@@ -210,6 +212,10 @@ func (c Config) Validate() error {
 		return newConfigError("MaxDepth", c.MaxDepth, fmt.Sprintf("exceeds maximum %d", maxConfigDepth))
 	case c.ProcessingTimeout < 0:
 		return newConfigError("ProcessingTimeout", c.ProcessingTimeout, "cannot be negative")
+	case c.Audit.MaxEntries < 0:
+		return newConfigError("Audit.MaxEntries", c.Audit.MaxEntries, "cannot be negative")
+	case c.Audit.MaxEntries > maxConfigAuditEntries:
+		return newConfigError("Audit.MaxEntries", c.Audit.MaxEntries, fmt.Sprintf("exceeds maximum %d", maxConfigAuditEntries))
 	}
 
 	// Validate format strings
@@ -233,10 +239,8 @@ func validateFormat(field, value string, allowed []string) error {
 		return nil // Empty means use default
 	}
 	lowerValue := strings.ToLower(value)
-	for _, a := range allowed {
-		if lowerValue == a {
-			return nil
-		}
+	if slices.Contains(allowed, lowerValue) {
+		return nil
 	}
 	return newConfigError(field, value, fmt.Sprintf("valid values: %s", strings.Join(allowed, ", ")))
 }

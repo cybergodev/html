@@ -58,10 +58,11 @@ func TestInputError(t *testing.T) {
 }
 
 // TestErrorUnwrap consolidates the errors.Is unwrap contracts for all three
-// error types (previously TestInputErrorUnwrap, TestConfigErrorUnwrap and
-// TestFileErrorUnwrap, which were three copies of the same errors.Is check).
-// The message-format and field-value tests stay per-type because the three error
-// types have structurally different fields and constructors.
+// error types (previously TestInputErrorUnwrap, TestConfigErrorUnwrap,
+// TestFileErrorUnwrap and TestErrorIsUsage, which were four overlapping copies
+// of the same errors.Is check). The message-format and field-value tests stay
+// per-type because the three error types have structurally different fields
+// and constructors.
 func TestErrorUnwrap(t *testing.T) {
 	t.Parallel()
 
@@ -71,19 +72,23 @@ func TestErrorUnwrap(t *testing.T) {
 		name     string
 		err      error
 		sentinel error
+		wantIs   bool
 	}{
-		{"InputError unwraps to ErrInputTooLarge", newInputError("Extract", 10000, 5000, nil), ErrInputTooLarge},
-		{"InputError unwraps to underlying error", newInputError("Extract", 10000, 5000, underlying), underlying},
-		{"ConfigError unwraps to ErrInvalidConfig", newConfigError("MaxDepth", 0, "must be positive"), ErrInvalidConfig},
-		{"FileError unwraps to underlying error", newFileError("ExtractFromFile", "../traversal", underlying), underlying},
-		{"FileError with nil underlying unwraps to ErrInvalidFilePath", newFileError("ExtractFromFile", "../traversal", nil), ErrInvalidFilePath},
-		{"FileError unwraps to ErrFileNotFound", newFileError("ExtractFromFile", "missing.html", ErrFileNotFound), ErrFileNotFound},
+		{"InputError unwraps to ErrInputTooLarge", newInputError("Extract", 10000, 5000, nil), ErrInputTooLarge, true},
+		{"InputError unwraps to underlying error", newInputError("Extract", 10000, 5000, underlying), underlying, true},
+		{"ConfigError unwraps to ErrInvalidConfig", newConfigError("MaxDepth", 0, "must be positive"), ErrInvalidConfig, true},
+		{"FileError unwraps to underlying error", newFileError("ExtractFromFile", "../traversal", underlying), underlying, true},
+		{"FileError with nil underlying unwraps to ErrInvalidFilePath", newFileError("ExtractFromFile", "../traversal", nil), ErrInvalidFilePath, true},
+		{"FileError unwraps to ErrFileNotFound", newFileError("ExtractFromFile", "missing.html", ErrFileNotFound), ErrFileNotFound, true},
+		// Negative cases: an error type must not match an unrelated sentinel.
+		{"ConfigError does not match ErrInputTooLarge", newConfigError("Field", "value", "message"), ErrInputTooLarge, false},
+		{"InputError does not match ErrInvalidConfig", newInputError("Extract", 10000, 5000, nil), ErrInvalidConfig, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if !errors.Is(tt.err, tt.sentinel) {
-				t.Errorf("errors.Is(err, %v) = false, want true", tt.sentinel)
+			if got := errors.Is(tt.err, tt.sentinel); got != tt.wantIs {
+				t.Errorf("errors.Is(err, %v) = %v, want %v", tt.sentinel, got, tt.wantIs)
 			}
 		})
 	}
@@ -207,31 +212,30 @@ func TestFileError(t *testing.T) {
 			t.Errorf("SafePath() = %q, want 'file.html'", err.SafePath())
 		}
 	})
-}
 
-func TestNewFileErrorPathVariants(t *testing.T) {
-	t.Parallel()
-
-	paths := []struct {
-		name string
-		path string
-	}{
-		{"empty path", ""},
-		{"relative path", "relative/path.html"},
-		{"absolute path", "/absolute/path.html"},
-		{"path with spaces", "/path with spaces/file.html"},
-		{"windows path", `C:\Users\test\file.html`},
-		{"traversal attempt", "../../../etc/passwd"},
-	}
-
-	for _, tt := range paths {
-		t.Run(tt.name, func(t *testing.T) {
-			err := newFileError("Test", tt.path, errors.New("test"))
-			if err.Path != tt.path {
-				t.Errorf("Path = %q, want %q", err.Path, tt.path)
-			}
-		})
-	}
+	// Path variants: the constructor must carry the path verbatim in the Path
+	// field (full path retained for internal use; only Error()/JSON redact it).
+	t.Run("path field carries variants verbatim", func(t *testing.T) {
+		paths := []struct {
+			name string
+			path string
+		}{
+			{"empty path", ""},
+			{"relative path", "relative/path.html"},
+			{"absolute path", "/absolute/path.html"},
+			{"path with spaces", "/path with spaces/file.html"},
+			{"windows path", `C:\Users\test\file.html`},
+			{"traversal attempt", "../../../etc/passwd"},
+		}
+		for _, tt := range paths {
+			t.Run(tt.name, func(t *testing.T) {
+				err := newFileError("Test", tt.path, errors.New("test"))
+				if err.Path != tt.path {
+					t.Errorf("Path = %q, want %q", err.Path, tt.path)
+				}
+			})
+		}
+	})
 }
 
 // TestSentinelErrors verifies all sentinel errors exist and have meaningful messages
@@ -267,7 +271,6 @@ func TestSentinelErrors(t *testing.T) {
 		})
 	}
 }
-
 func TestErrorIsUsage(t *testing.T) {
 	t.Parallel()
 
@@ -400,4 +403,17 @@ func TestFileErrorMarshalJSON(t *testing.T) {
 			t.Errorf("path = %q, want empty", got.Path)
 		}
 	})
+}
+
+// TestFileErrorEmptyPathPlaceholder covers the SafePath fallback in
+// FileError.Error(): an empty path renders as "[file]" rather than empty
+// quotes.
+func TestFileErrorEmptyPathPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	err := newFileError("ExtractFromFile", "", errors.New("boom"))
+	msg := err.Error()
+	if !strings.Contains(msg, `"[file]"`) {
+		t.Errorf("Error() = %q, want placeholder [file] for empty path", msg)
+	}
 }

@@ -10,13 +10,19 @@ import (
 // appendUniqueVideoURLs appends each url that is a valid, not-yet-seen video URL
 // to videos, recording it in seen. It centralizes the validate-and-deduplicate
 // logic shared by the iframe, embed, and object raw-HTML extraction paths.
+// DetectVideoType is called once per url: a non-empty result is exactly
+// IsVideoURL's condition (extension or embed-host match), so classifying and
+// re-checking would re-lowercase and re-scan the same URL twice.
 func appendUniqueVideoURLs(urls []string, seen map[string]bool, videos []VideoInfo) []VideoInfo {
 	for _, url := range urls {
-		if internal.IsValidURL(url) && internal.IsVideoURL(url) && !seen[url] {
+		if !internal.IsValidURL(url) || seen[url] {
+			continue
+		}
+		if mediaType := internal.DetectVideoType(url); mediaType != "" {
 			seen[url] = true
 			videos = append(videos, VideoInfo{
 				URL:  url,
-				Type: internal.DetectVideoType(url),
+				Type: mediaType,
 			})
 		}
 	}
@@ -187,10 +193,13 @@ func (p *Processor) extractAllMedia(node *stdxhtml.Node, htmlContent string, can
 		return true
 	})
 
-	// Regex scans for video and audio URLs in raw HTML (only when canContainMedia).
+	// Regex-equivalent scans for video and audio URLs in raw HTML (only when
+	// canContainMedia). internal.ScanMediaURLs reproduces the matches of the two
+	// media-URL regexes this path previously compiled, at a fraction of the CPU
+	// (the regexp engine stepped over every document byte; see its doc comment).
 	if canContainMedia {
 		ensureVideoDedup()
-		for _, url := range videoRegex.FindAllString(htmlContent, maxRegexMatches) {
+		internal.ScanMediaURLs(htmlContent, true, maxRegexMatches, func(url string) bool {
 			if internal.IsValidURL(url) && !videoSeen[url] {
 				videoSeen[url] = true
 				videos = append(videos, VideoInfo{
@@ -198,9 +207,10 @@ func (p *Processor) extractAllMedia(node *stdxhtml.Node, htmlContent string, can
 					Type: internal.DetectVideoType(url),
 				})
 			}
-		}
+			return true
+		})
 		ensureAudioDedup()
-		for _, url := range audioRegex.FindAllString(htmlContent, maxRegexMatches) {
+		internal.ScanMediaURLs(htmlContent, false, maxRegexMatches, func(url string) bool {
 			if internal.IsValidURL(url) && !audioSeen[url] {
 				audioSeen[url] = true
 				audios = append(audios, AudioInfo{
@@ -208,7 +218,8 @@ func (p *Processor) extractAllMedia(node *stdxhtml.Node, htmlContent string, can
 					Type: internal.DetectAudioType(url),
 				})
 			}
-		}
+			return true
+		})
 	}
 
 	// Normalize to non-nil empty slices (see extractVideos/extractAudios rationale).

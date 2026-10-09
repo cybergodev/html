@@ -283,35 +283,6 @@ func TestMediaInfoJSONSerialization(t *testing.T) {
 	}
 }
 
-// TestOutputWithProcessor tests output methods on Processor.
-func TestOutputWithProcessor(t *testing.T) {
-	t.Parallel()
-
-	htmlContent := `<html><body><h1>Title</h1><p>Content</p></body></html>`
-
-	t.Run("processor ExtractToMarkdown", func(t *testing.T) {
-		p := testutil.NewTestProcessor(t)
-		markdown, err := p.ExtractToMarkdown([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("ExtractToMarkdown() failed: %v", err)
-		}
-		if markdown == "" {
-			t.Error("Markdown should not be empty")
-		}
-	})
-
-	t.Run("processor ExtractToJSON", func(t *testing.T) {
-		p := testutil.NewTestProcessor(t)
-		jsonData, err := p.ExtractToJSON([]byte(htmlContent))
-		if err != nil {
-			t.Fatalf("ExtractToJSON() failed: %v", err)
-		}
-		if len(jsonData) == 0 {
-			t.Error("JSON should not be empty")
-		}
-	})
-}
-
 // TestOutputWrappers_ConfigErrors drives the two shared error branches that all
 // package-level ExtractToMarkdown*/ExtractToJSON* convenience wrappers funnel
 // through:
@@ -428,17 +399,34 @@ func TestProcessorOutputMethod_ContextError(t *testing.T) {
 
 	htmlBytes := []byte("<html><body><p>content</p></body></html>")
 
-	// ExtractToJSONWithContext: wraps p.ExtractWithContext(ctx, htmlBytes).
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately so the early ctx.Done() check in extractCore fires
+	// Each method must propagate the context error and return a zero result.
+	t.Run("ExtractToMarkdownWithContext", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
 
-	jsonData, err := p.ExtractToJSONWithContext(ctx, htmlBytes)
-	if err == nil {
-		t.Fatal("ExtractToJSONWithContext: expected context error, got nil")
-	}
-	if jsonData != nil {
-		t.Errorf("ExtractToJSONWithContext: expected nil JSON on error, got %d bytes", len(jsonData))
-	}
+		md, err := p.ExtractToMarkdownWithContext(ctx, htmlBytes)
+		if err == nil {
+			t.Fatal("expected context error, got nil")
+		}
+		if md != "" {
+			t.Errorf("expected empty markdown on error, got %q", md)
+		}
+	})
+
+	t.Run("ExtractToJSONWithContext", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		jsonData, err := p.ExtractToJSONWithContext(ctx, htmlBytes)
+		if err == nil {
+			t.Fatal("expected context error, got nil")
+		}
+		if jsonData != nil {
+			t.Errorf("expected nil JSON on error, got %d bytes", len(jsonData))
+		}
+	})
 }
 
 // TestProcessorOutputWithContext_HappyPath covers the non-error branches of
@@ -501,4 +489,64 @@ func TestProcessorOutputWithContext_HappyPath(t *testing.T) {
 			t.Error("expected non-empty JSON")
 		}
 	})
+}
+
+// TestProcessorOutputMethodsAfterClose pins the closed-processor guard of the
+// context-aware output methods and their FromFile variants (output.go
+// extractWithFormatsWithContext / extractFromFileWithFormatsWithContext): every
+// one must return ErrProcessorClosed, never panic or do I/O.
+func TestProcessorOutputMethodsAfterClose(t *testing.T) {
+	t.Parallel()
+
+	p := testutil.NewTestProcessor(t)
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+
+	htmlBytes := []byte("<html><body><p>content</p></body></html>")
+	tmpFile := testutil.CreateTempHTML(t, "<html><body><p>file</p></body></html>")
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{"ExtractToMarkdownWithContext", func() error {
+			md, err := p.ExtractToMarkdownWithContext(ctx, htmlBytes)
+			if md != "" {
+				t.Errorf("markdown = %q, want empty", md)
+			}
+			return err
+		}},
+		{"ExtractToJSONWithContext", func() error {
+			data, err := p.ExtractToJSONWithContext(ctx, htmlBytes)
+			if data != nil {
+				t.Errorf("json = %d bytes, want nil", len(data))
+			}
+			return err
+		}},
+		{"ExtractToMarkdownFromFileWithContext", func() error {
+			md, err := p.ExtractToMarkdownFromFileWithContext(ctx, tmpFile)
+			if md != "" {
+				t.Errorf("markdown = %q, want empty", md)
+			}
+			return err
+		}},
+		{"ExtractToJSONFromFileWithContext", func() error {
+			data, err := p.ExtractToJSONFromFileWithContext(ctx, tmpFile)
+			if data != nil {
+				t.Errorf("json = %d bytes, want nil", len(data))
+			}
+			return err
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if err := tt.call(); !errors.Is(err, html.ErrProcessorClosed) {
+				t.Errorf("expected ErrProcessorClosed, got %v", err)
+			}
+		})
+	}
 }

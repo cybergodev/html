@@ -28,7 +28,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer scorerProcessor.Close()
+	defer func() { _ = scorerProcessor.Close() }()
 
 	sampleHTML := "<html><body><nav>Navigation links</nav><article><h1>Article Title</h1><p>This is a substantial paragraph with meaningful content that meets the minimum length requirement.</p></article><aside>Sidebar content</aside></body></html>"
 
@@ -50,14 +50,14 @@ func main() {
 	// Sink is set to io.Discard so audit stays enabled (GetAuditLog() works)
 	// without the default LoggerAuditSink dumping JSON to stderr.
 	auditCfg := html.DefaultConfig()
+	// HighSecurityAuditConfig enables audit (and every Log* category) already.
 	auditCfg.Audit = html.HighSecurityAuditConfig()
-	auditCfg.Audit.Enabled = true
 	auditCfg.Audit.Sink = html.NewWriterAuditSink(io.Discard)
 	auditProcessor, err := html.New(auditCfg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer auditProcessor.Close()
+	defer func() { _ = auditProcessor.Close() }()
 
 	// Process potentially dangerous HTML
 	dangerousHTML := `
@@ -70,7 +70,7 @@ func main() {
 		</html>
 	`
 
-	auditProcessor.Extract([]byte(dangerousHTML))
+	_, _ = auditProcessor.Extract([]byte(dangerousHTML))
 
 	// Read audit entries (GetAuditLog reads from internal storage, no wait needed)
 	auditLog := auditProcessor.GetAuditLog()
@@ -100,8 +100,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	sinkProcessor.Extract([]byte(dangerousHTML))
-	sinkProcessor.Close() // flush pending audit writes to sink
+	_, _ = sinkProcessor.Extract([]byte(dangerousHTML))
+	// Sink writes are synchronous: once Extract returns, auditBuf already
+	// holds the entries. Close only releases the processor and its sink.
+	_ = sinkProcessor.Close()
 	fmt.Printf("WriterAuditSink captured %d bytes of JSON audit logs\n", auditBuf.Len())
 
 	// ChannelAuditSink routes entries to a Go channel for async consumption
@@ -117,8 +119,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	chProcessor.Extract([]byte(dangerousHTML))
-	chProcessor.Close()
+	_, _ = chProcessor.Extract([]byte(dangerousHTML))
+	_ = chProcessor.Close()
 
 	var critical, warning, info int
 drain:
@@ -140,7 +142,7 @@ drain:
 			break drain
 		}
 	}
-	channelSink.Close()
+	_ = channelSink.Close()
 	fmt.Printf("ChannelAuditSink drained: %d critical, %d warning, %d info\n", critical, warning, info)
 
 	fmt.Println("\nOther built-in sinks (set via AuditConfig.Sink):")
@@ -176,10 +178,10 @@ drain:
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer secureProcessor.Close()
+	defer func() { _ = secureProcessor.Close() }()
 
 	// This will have stricter limits
-	secureProcessor.Extract([]byte(dangerousHTML))
+	_, _ = secureProcessor.Extract([]byte(dangerousHTML))
 	fmt.Printf("  Audit events captured (audit enabled by default): %d\n", len(secureProcessor.GetAuditLog()))
 
 	// ============================================================
@@ -200,9 +202,32 @@ drain:
 	fmt.Println("  result := processor.ExtractBatchFilesWithContext(ctx, paths)")
 
 	// ============================================================
-	// 6. Type Aliases for HTML Processing
+	// 6. Extractor Interface (Decoupling & Testability)
 	// ============================================================
-	fmt.Println("\n6. Types for Custom Scorers")
+	fmt.Println("\n6. Extractor Interface")
+	fmt.Println("---------------------")
+
+	// html.Extractor bundles every extraction method; *Processor implements
+	// it. Having your helpers accept the interface (rather than *Processor)
+	// decouples them from the implementation and lets unit tests pass a stub.
+	titles := collectTitles(scorerProcessor, []string{
+		"<html><head><title>First</title></head><body><p>one</p></body></html>",
+		"<html><head><title>Second</title></head><body><p>two</p></body></html>",
+	})
+	fmt.Printf("Real processor: %v\n", titles)
+
+	// A stub stands in during tests — no HTML parsing involved. Embedding the
+	// interface satisfies every method; calling one the stub does not
+	// override panics, keeping the double honest about what is exercised.
+	stub := &stubExtractor{title: "Stubbed"}
+	titles = collectTitles(stub, []string{"<ignored>", "<ignored>"})
+	fmt.Printf("Stub extractor: %v\n", titles)
+	fmt.Println("Related: html.StatsProvider (GetStatistics, ClearCache, ResetStatistics)")
+
+	// ============================================================
+	// 7. Types for Custom Scorers
+	// ============================================================
+	fmt.Println("\n7. Types for Custom Scorers")
 	fmt.Println("---------------------------")
 	fmt.Println("The package provides types for implementing custom Scorers:")
 	fmt.Println("  • html.ContentNode - Interface for node access (Type, Data, AttrValue, etc.)")
@@ -219,7 +244,8 @@ drain:
 	fmt.Println("3. Audit Sinks: Multiple output destinations for audit logs")
 	fmt.Println("4. Security Configs: Use HighSecurityConfig() for sensitive data processing")
 	fmt.Println("5. File Operations: Single file, batch, and context-aware processing")
-	fmt.Println("6. Types for Scorers: ContentNode and NodeAttr for custom implementations")
+	fmt.Println("6. Extractor Interface: Depend on html.Extractor, test with stubs")
+	fmt.Println("7. Types for Scorers: ContentNode and NodeAttr for custom implementations")
 }
 
 // ArticleScorer is a custom scorer that prioritizes article content.
@@ -299,9 +325,38 @@ func getTextContent(n html.ContentNode) string {
 	if n.Type() == "text" {
 		return n.Data()
 	}
-	var result string
+	var sb strings.Builder
 	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
-		result += getTextContent(c)
+		sb.WriteString(getTextContent(c))
 	}
-	return result
+	return sb.String()
+}
+
+// collectTitles returns the title of each document, extracted via any
+// html.Extractor. Depending on the interface keeps the helper testable with
+// a stub instead of a real *Processor.
+func collectTitles(x html.Extractor, docs []string) []string {
+	titles := make([]string, 0, len(docs))
+	for _, doc := range docs {
+		r, err := x.Extract([]byte(doc))
+		if err != nil {
+			titles = append(titles, "error: "+err.Error())
+			continue
+		}
+		titles = append(titles, r.Title)
+	}
+	return titles
+}
+
+// stubExtractor is a minimal html.Extractor test double. Embedding the
+// interface satisfies all its methods; the ones this stub does not override
+// panic if called, so the double cannot silently pretend to work.
+type stubExtractor struct {
+	html.Extractor
+	title string
+}
+
+// Extract returns a canned Result, ignoring the input entirely.
+func (s *stubExtractor) Extract([]byte) (*html.Result, error) {
+	return &html.Result{Title: s.title}, nil
 }

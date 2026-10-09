@@ -142,11 +142,7 @@ func (p *Processor) ExtractToJSONFromFileWithContext(ctx context.Context, filePa
 //
 // Returns the same errors as [Extract].
 func ExtractToMarkdown(htmlBytes []byte, cfg ...Config) (string, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return "", err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (string, error) {
+	return withConfig(cfg, func(p *Processor) (string, error) {
 		return p.ExtractToMarkdown(htmlBytes)
 	})
 }
@@ -162,11 +158,7 @@ func ExtractToMarkdown(htmlBytes []byte, cfg ...Config) (string, error) {
 //
 // Returns the same errors as [ExtractFromFile].
 func ExtractToMarkdownFromFile(filePath string, cfg ...Config) (string, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return "", err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (string, error) {
+	return withConfig(cfg, func(p *Processor) (string, error) {
 		return p.ExtractToMarkdownFromFile(filePath)
 	})
 }
@@ -182,11 +174,7 @@ func ExtractToMarkdownFromFile(filePath string, cfg ...Config) (string, error) {
 //
 // Returns the same errors as [Extract].
 func ExtractToJSON(htmlBytes []byte, cfg ...Config) ([]byte, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return nil, err
-	}
-	return withProcessor(pooled, c, func(p *Processor) ([]byte, error) {
+	return withConfig(cfg, func(p *Processor) ([]byte, error) {
 		return p.ExtractToJSON(htmlBytes)
 	})
 }
@@ -202,11 +190,7 @@ func ExtractToJSON(htmlBytes []byte, cfg ...Config) ([]byte, error) {
 //
 // Returns the same errors as [ExtractFromFile].
 func ExtractToJSONFromFile(filePath string, cfg ...Config) ([]byte, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return nil, err
-	}
-	return withProcessor(pooled, c, func(p *Processor) ([]byte, error) {
+	return withConfig(cfg, func(p *Processor) ([]byte, error) {
 		return p.ExtractToJSONFromFile(filePath)
 	})
 }
@@ -222,11 +206,7 @@ func ExtractToJSONFromFile(filePath string, cfg ...Config) ([]byte, error) {
 //
 // Returns the same errors as [ExtractWithContext].
 func ExtractToMarkdownWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return "", err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (string, error) {
+	return withConfig(cfg, func(p *Processor) (string, error) {
 		return p.ExtractToMarkdownWithContext(ctx, htmlBytes)
 	})
 }
@@ -242,11 +222,7 @@ func ExtractToMarkdownWithContext(ctx context.Context, htmlBytes []byte, cfg ...
 //
 // Returns the same errors as [ExtractFromFileWithContext].
 func ExtractToMarkdownFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return "", err
-	}
-	return withProcessor(pooled, c, func(p *Processor) (string, error) {
+	return withConfig(cfg, func(p *Processor) (string, error) {
 		return p.ExtractToMarkdownFromFileWithContext(ctx, filePath)
 	})
 }
@@ -262,11 +238,7 @@ func ExtractToMarkdownFromFileWithContext(ctx context.Context, filePath string, 
 //
 // Returns the same errors as [ExtractWithContext].
 func ExtractToJSONWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) ([]byte, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return nil, err
-	}
-	return withProcessor(pooled, c, func(p *Processor) ([]byte, error) {
+	return withConfig(cfg, func(p *Processor) ([]byte, error) {
 		return p.ExtractToJSONWithContext(ctx, htmlBytes)
 	})
 }
@@ -282,11 +254,7 @@ func ExtractToJSONWithContext(ctx context.Context, htmlBytes []byte, cfg ...Conf
 //
 // Returns the same errors as [ExtractFromFileWithContext].
 func ExtractToJSONFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) ([]byte, error) {
-	c, pooled, err := resolveConfig(cfg...)
-	if err != nil {
-		return nil, err
-	}
-	return withProcessor(pooled, c, func(p *Processor) ([]byte, error) {
+	return withConfig(cfg, func(p *Processor) ([]byte, error) {
 		return p.ExtractToJSONFromFileWithContext(ctx, filePath)
 	})
 }
@@ -325,6 +293,17 @@ func (r *Result) MarshalJSON() ([]byte, error) {
 	return json.Marshal(jr)
 }
 
+// Shared no-op resources for transient format processors. The disabled cache
+// (maxEntries == 0) makes Set a no-op and Get an empty-map miss, and the
+// disabled audit collector drops every record before touching any state, so
+// both are safe to share across concurrently created transients while
+// sparing each ExtractToMarkdown* call three small allocations.
+var (
+	disabledFormatCache   = internal.NewCache[[16]byte](0, 0)
+	disabledFormatAudit   = newAuditCollector(AuditConfig{Enabled: false})
+	disabledFormatAdapter = &auditRecorderAdapter{}
+)
+
 // buildFormatProcessor returns a transient processor that reuses p's scorer but
 // applies the given inline image/link formats. It copies p's immutable config
 // (never mutated after New, so no lock is needed) and overrides only the format
@@ -337,18 +316,19 @@ func (p *Processor) buildFormatProcessor(imageFormat, linkFormat string) *Proces
 
 	cfg.InlineImageFormat = imageFormat
 	cfg.InlineLinkFormat = linkFormat
-	// The transient processor uses a disabled cache (NewCache[[16]byte](0, 0) below), so
-	// zero the entry budget too: this short-circuits the cache-key generation
-	// and Get/Set calls in Extract, which would otherwise run as no-ops while
-	// still paying the cost of hashing the input on every format conversion.
+	// The transient processor uses a disabled cache (see disabledFormatCache),
+	// so zero the entry budget too: this short-circuits the cache-key
+	// generation and Get/Set calls in Extract, which would otherwise run as
+	// no-ops while still paying the cost of hashing the input on every format
+	// conversion.
 	cfg.MaxCacheEntries = 0
 
 	return &Processor{
 		config:       &cfg,
-		cache:        internal.NewCache[[16]byte](0, 0),
+		cache:        disabledFormatCache,
 		scorer:       p.scorer,
-		audit:        newAuditCollector(AuditConfig{Enabled: false}),
-		auditAdapter: &auditRecorderAdapter{collector: nil},
+		audit:        disabledFormatAudit,
+		auditAdapter: disabledFormatAdapter,
 		stats:        &processorStats{},
 		imageFormat:  normalizeInlineFormat(imageFormat),
 		linkFormat:   normalizeInlineFormat(linkFormat),

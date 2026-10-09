@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -657,7 +659,7 @@ func BenchmarkScoreContentNode(b *testing.B) {
 	})
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		ScoreContentNode(articleNode)
 	}
 }
@@ -667,7 +669,7 @@ func BenchmarkCalculateContentDensity(b *testing.B) {
 	doc, _ := html.Parse(strings.NewReader(htmlContent))
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		CalculateContentDensity(doc)
 	}
 }
@@ -1115,5 +1117,338 @@ func TestIsHiddenByStyle(t *testing.T) {
 				t.Errorf("isHiddenByStyle(%q) = %v, want %v", tt.style, got, tt.want)
 			}
 		})
+	}
+}
+
+// ============================================================================
+// Scoring regressions, naive-loop equivalence oracle and benchmarks (merged
+// from scoring_regression_test.go, scoring_metrics_equivalence_test.go and
+// scoring_bench_test.go)
+// ============================================================================
+
+// findScoreElement returns the first element matching tag and (optionally) the
+// exact class attribute, walking the parsed tree in document order. An empty
+// class matches any element of tag.
+func findScoreElement(doc *html.Node, tag, class string) *html.Node {
+	var found *html.Node
+	WalkNodes(doc, func(n *html.Node) bool {
+		if found != nil {
+			return false
+		}
+		if n.Type != html.ElementNode || n.Data != tag {
+			return true
+		}
+		if class != "" {
+			for _, a := range n.Attr {
+				if a.Key == "class" && a.Val == class {
+					found = n
+					return false
+				}
+			}
+			return true
+		}
+		found = n
+		return false
+	})
+	return found
+}
+
+// TestCollectMetricsIgnoresScriptText verifies that text inside <script> is not
+// counted toward a candidate's content metrics. Without the skip, a page that
+// inlines a large script payload (e.g. VitePress SSR data) would have its
+// container's score driven by script text, not real content.
+func TestCollectMetricsIgnoresScriptText(t *testing.T) {
+	t.Parallel()
+
+	plain := `<div><p>Real article content goes here.</p></div>`
+	withScript := `<div><p>Real article content goes here.</p><script>` +
+		strings.Repeat("var data = 1; ", 1000) + `</script></div>`
+
+	plainDoc, err := parseHTML(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scriptDoc, err := parseHTML(withScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plainScore := ScoreContentNode(findScoreElement(plainDoc, "div", ""))
+	scriptScore := ScoreContentNode(findScoreElement(scriptDoc, "div", ""))
+
+	if scriptScore != plainScore {
+		t.Errorf("script text leaked into content metrics: plain=%d withScript=%d (want equal)",
+			plainScore, scriptScore)
+	}
+}
+
+// TestCollectMetricsIgnoresNavAndSvgText verifies that nav/header/svg subtrees
+// do not inflate content metrics.
+func TestCollectMetricsIgnoresNavAndSvgText(t *testing.T) {
+	t.Parallel()
+
+	plain := `<div><p>Body content here now.</p></div>`
+	withNoise := `<div><p>Body content here now.</p>` +
+		`<nav>` + strings.Repeat("menu link ", 200) + `</nav>` +
+		`<header>` + strings.Repeat("site header ", 200) + `</header>` +
+		`<svg><text>` + strings.Repeat("glyph ", 200) + `</text></svg></div>`
+
+	plainDoc, err := parseHTML(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noiseDoc, err := parseHTML(withNoise)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plainScore := ScoreContentNode(findScoreElement(plainDoc, "div", ""))
+	noiseScore := ScoreContentNode(findScoreElement(noiseDoc, "div", ""))
+
+	if noiseScore != plainScore {
+		t.Errorf("nav/header/svg text leaked into content metrics: plain=%d noisy=%d (want equal)",
+			plainScore, noiseScore)
+	}
+}
+
+// TestLinkDensityPenaltyGatedByTextLength verifies the link-density penalty
+// applies to short link-dense nodes (navigation) but is skipped for substantial
+// link-wrapped content (card/portfolio grids).
+func TestLinkDensityPenaltyGatedByTextLength(t *testing.T) {
+	t.Parallel()
+
+	scorer := NewDefaultScorer()
+
+	// Small, link-dense node: a handful of short links. Nav-like, MUST be
+	// penalized.
+	smallDoc, err := parseHTML(`<div><a href="#">Link1</a><a href="#">Link2</a>Text</div>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Large, link-wrapped content: well over the 500-char threshold, all text
+	// inside <a>, as on a project-card grid.
+	var cards strings.Builder
+	cards.WriteString(`<div>`)
+	for i := 0; i < 30; i++ {
+		cards.WriteString(`<a href="#p` + strconv.Itoa(i) + `">` +
+			`Project card description with enough prose to exceed the threshold.` +
+			`</a> `)
+	}
+	cards.WriteString(`</div>`)
+	largeDoc, err := parseHTML(cards.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	smallScore := scorer.Score(findScoreElement(smallDoc, "div", ""))
+	largeScore := scorer.Score(findScoreElement(largeDoc, "div", ""))
+
+	if smallScore >= 100 {
+		t.Errorf("small link-dense node should be penalized, got %d", smallScore)
+	}
+	// The large card grid must clear a score the x0.2 penalty would prevent.
+	if largeScore < 400 {
+		t.Errorf("large link-wrapped content should not be penalized, got %d", largeScore)
+	}
+	if largeScore <= smallScore {
+		t.Errorf("large content must out-score small nav: large=%d small=%d", largeScore, smallScore)
+	}
+}
+
+// TestScorePrefersCardContentOverHero is the end-to-end regression for the
+// reported issue: a VitePress-style landing page where a small "main" hero
+// block sits next to a larger set of link-wrapped project cards. Before the
+// fix, the cards container was crushed by the link-density penalty and the hero
+// (boosted by its "main" class) won article selection, discarding every card.
+func TestScorePrefersCardContentOverHero(t *testing.T) {
+	t.Parallel()
+
+	hero := `<div class="main"><h1>CyberGo</h1><p>tagline here</p></div>`
+
+	cardDesc := "这是一个项目卡片的描述文本，需要足够长以便在统计内容指标时超过文本阈值，" +
+		"从而验证链接密度惩罚不会误伤被锚点元素包裹的真实正文内容。"
+	var projects strings.Builder
+	projects.WriteString(`<div class="home-projects">`)
+	for i := 0; i < 6; i++ {
+		projects.WriteString(`<div class="project-card"><a class="card-main" href="#p` +
+			strconv.Itoa(i) + `">` + cardDesc + `</a></div>`)
+	}
+	projects.WriteString(`</div>`)
+
+	doc, err := parseHTML(hero + projects.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	heroNode := findScoreElement(doc, "div", "main")
+	projNode := findScoreElement(doc, "div", "home-projects")
+	if heroNode == nil || projNode == nil {
+		t.Fatalf("could not locate nodes: hero=%v projects=%v", heroNode != nil, projNode != nil)
+	}
+
+	heroScore := ScoreContentNode(heroNode)
+	projScore := ScoreContentNode(projNode)
+
+	if projScore <= heroScore {
+		t.Errorf("project cards should out-score hero after fix: hero=%d projects=%d",
+			heroScore, projScore)
+	}
+}
+
+// TestScoreArticleCandidatesMatchesNaiveLoop is the correctness guard for the
+// article-scoring fast path. It asserts that ScoreArticleCandidates (the O(N)
+// bottom-up fold) produces the identical candidate→score map as the
+// pre-optimization loop — walk every non-inline element and call Score(n), which
+// re-walks each subtree via collectContentMetrics. If this fails, the fast path
+// must not ship: article selection would silently drift.
+//
+// The cases deliberately stress the parts where a bottom-up fold could diverge
+// from a fresh per-node collectContentMetrics: skip-tag subtrees whose
+// descendants are still scored (svg/math/nav/aside/footer), a block nested inside
+// an <a> (linkTextLength), NBSP text, comma-rich prose, and deep nesting.
+func TestScoreArticleCandidatesMatchesNaiveLoop(t *testing.T) {
+	cases := []struct {
+		name   string
+		markup string
+	}{
+		{"plain article", `<html><body><article><h1>Title</h1><p>alpha, beta, gamma.</p><p>second paragraph here.</p></article></body></html>`},
+		{"link dense nav", `<html><body><nav><a href="/a">A</a><a href="/b">B</a><a href="/c">C</a></nav><article><p>real content, here.</p></article></body></html>`},
+		{"candidate inside anchor", `<html><body><a href="/x"><div><p>block inside a link</p><p>more text</p></div></a></body></html>`},
+		{"nbsp text", "<html><body><p>non breaking space</p></body></html>"},
+		{"skip tag subtrees with candidates", `<html><head><title>t</title></head><body><script>x</script><style>x</style><nav>n</nav><svg><text>s</text></svg><math><mi>m</mi></math><aside>a</aside><footer>f</footer><article><p>real, comma, content.</p></article></body></html>`},
+		{"comma rich prose", `<html><body><article><p>one, two, three, four, five, six.</p><p>` + "，" + `fullwidth` + "，" + `test。</p></article></body></html>`},
+		{"nested deep", `<html><body><div><div><div><section><p>deep, text.</p></section></div></div></div></body></html>`},
+		{"empty body", `<html><body></body></html>`},
+		{"mixed inline and block", `<html><body><article><h2>Head</h2><p>text with <a href="/l">a link</a> and <em>emphasis</em>.</p><ul><li>one</li><li>two</li></ul></article></body></html>`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := parseMetricsDoc(t, tc.markup)
+			ds := SharedDefaultScorer()
+
+			// Naive: the pre-optimization per-node loop (extractArticleNode's old shape).
+			naive := make(map[*html.Node]int)
+			WalkNodes(doc, func(n *html.Node) bool {
+				if n.Type == html.ElementNode && !IsInlineElement(n.Data) {
+					if sc := ds.Score(n); sc > 0 {
+						naive[n] = sc
+					}
+				}
+				return true
+			})
+
+			fast := ds.ScoreArticleCandidates(doc)
+
+			if len(naive) != len(fast) {
+				// Report the differing nodes to make a regression actionable.
+				missing, extra := diffCandidates(naive, fast)
+				t.Fatalf("candidate count mismatch: naive=%d fast=%d\n  only-in-naive(score>0): %s\n  only-in-fast: %s",
+					len(naive), len(fast), missing, extra)
+			}
+			for n, want := range naive {
+				if got := fast[n]; got != want {
+					t.Errorf("score mismatch for <%s>: naive=%d fast=%d", n.Data, want, got)
+				}
+			}
+		})
+	}
+}
+
+func parseMetricsDoc(t *testing.T, markup string) *html.Node {
+	t.Helper()
+	doc, err := html.Parse(strings.NewReader(markup))
+	if err != nil {
+		t.Fatalf("html.Parse: %v", err)
+	}
+	return doc
+}
+
+// diffCandidates returns human-readable summaries of nodes present in one map but
+// not the other, to help diagnose a candidate-set regression.
+func diffCandidates(naive, fast map[*html.Node]int) (missing, extra string) {
+	tags := func(n *html.Node) string { return "<" + n.Data + ">" }
+	for n, sc := range naive {
+		if _, ok := fast[n]; !ok {
+			if missing != "" {
+				missing += ", "
+			}
+			missing += tags(n) + "(" + strconv.Itoa(sc) + ")"
+		}
+	}
+	for n := range fast {
+		if _, ok := naive[n]; !ok {
+			if extra != "" {
+				extra += ", "
+			}
+			extra += tags(n)
+		}
+	}
+	return missing, extra
+}
+
+// benchArticleDoc builds a rich article document comparable to the realistic
+// extraction workload: nav, many sections (heading + paragraph + link), images,
+// and a table. This is the input shape that made extractArticleNode's per-candidate
+// collectContentMetrics re-walks O(N²).
+func benchArticleDoc(b *testing.B) *html.Node {
+	b.Helper()
+	var sb strings.Builder
+	sb.WriteString(`<html><head><title>Bench</title></head><body>`)
+	sb.WriteString(`<nav><a href="/home">Home</a><a href="/about">About</a></nav>`)
+	sb.WriteString(`<article><h1>Main Title</h1>`)
+	for i := 0; i < 80; i++ {
+		fmt.Fprintf(&sb, "<h2>Section %d</h2>", i)
+		fmt.Fprintf(&sb, `<p>Paragraph %d has <a href="/p/%d">a link</a> and prose, with commas, here.</p>`, i, i)
+		if i%5 == 0 {
+			fmt.Fprintf(&sb, `<img src="/img/%d.jpg" alt="Image %d">`, i, i)
+		}
+	}
+	sb.WriteString(`<table>`)
+	for r := 0; r < 10; r++ {
+		sb.WriteString("<tr><td>a</td><td>b</td><td>c</td></tr>")
+	}
+	sb.WriteString(`</table></article><aside>x</aside><footer>f</footer></body></html>`)
+
+	doc, err := html.Parse(strings.NewReader(sb.String()))
+	if err != nil {
+		b.Fatalf("parse: %v", err)
+	}
+	return doc
+}
+
+// BenchmarkArticleScoring_Naive reproduces the pre-optimization loop: walk the
+// tree and call Score(n) per non-inline element, where each Score re-walks n's
+// subtree via collectContentMetrics. This is the baseline for the O(N²) cost.
+func BenchmarkArticleScoring_Naive(b *testing.B) {
+	doc := benchArticleDoc(b)
+	ds := SharedDefaultScorer()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		candidates := make(map[*html.Node]int, 32)
+		WalkNodes(doc, func(n *html.Node) bool {
+			if n.Type == html.ElementNode && !IsInlineElement(n.Data) {
+				if sc := ds.Score(n); sc > 0 {
+					candidates[n] = sc
+				}
+			}
+			return true
+		})
+		_ = candidates
+	}
+}
+
+// BenchmarkArticleScoring_Fast measures ScoreArticleCandidates: a single bottom-up
+// fold that scores each candidate from its just-computed metrics, with no subtree
+// re-walk. Run alongside the naive benchmark so both share the same machine state —
+// the fast/naive ratio is the speedup, independent of absolute load.
+func BenchmarkArticleScoring_Fast(b *testing.B) {
+	doc := benchArticleDoc(b)
+	ds := SharedDefaultScorer()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_ = ds.ScoreArticleCandidates(doc)
 	}
 }

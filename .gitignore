@@ -105,9 +105,6 @@ access_token.json
 # Comate
 .comate/
 
-# Codeium
-.codeium/
-
 # ============================================================
 # AI Model Files
 # ============================================================
@@ -261,8 +258,6 @@ node_modules/
 jspm_packages/
 
 # Build output
-dist/
-build/
 out/
 .next/
 .nuxt/
@@ -314,7 +309,6 @@ pnpm-lock.yaml
 .vimrc.local
 
 # Emacs
-*~
 \#*\#
 .\#*
 .dir-locals.el
@@ -411,8 +405,6 @@ coverage
 *.lcov
 .coverage.*
 .coverage
-htmlcov/
-.pytest_cache/
 .tox/
 *.test
 *.out
