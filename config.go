@@ -22,6 +22,9 @@ const (
 	// DefaultMaxAuditEntries is the default cap on audit entries retained in
 	// memory by GetAuditLog (see AuditConfig.MaxEntries).
 	DefaultMaxAuditEntries = 10000
+	// DefaultMaxRawValueLength is the default cap on audit RawValue strings
+	// (see AuditConfig.MaxRawValueLength).
+	DefaultMaxRawValueLength = 200
 	// DefaultMaxDepth is the default maximum HTML nesting depth, guarding against stack overflow.
 	DefaultMaxDepth = 500
 	// DefaultProcessingTimeout is the default per-document processing timeout.
@@ -70,14 +73,7 @@ const (
 	cacheKeySample = 4096
 
 	// Buffer size estimates for pre-allocation
-	initialSliceCap = 16 // Initial capacity for result slices
-	// linksInitialCap is the initial capacity for the links result slice. Links are
-	// the most numerous per-element extraction target on typical pages (nav bars,
-	// in-content links, footers), and a link-dense page exceeds initialSliceCap
-	// (16) many times over — each overflow reallocates and copies the whole slice.
-	// 128 covers realistic pages in a single backing array with no growth while
-	// staying a modest, strictly-bounded over-allocation for small pages.
-	linksInitialCap   = 128
+	initialSliceCap   = 16 // Initial capacity for result slices
 	initialMapCap     = 8  // Initial capacity for result maps
 	imageHTMLBufExtra = 64 // Extra buffer for HTML image tag generation
 	extractTagCap     = 16 // Initial capacity for tag attribute extraction
@@ -105,9 +101,9 @@ const (
 type Config struct {
 	// === Resource Management ===
 	MaxInputSize      int           // Maximum HTML input size in bytes. Default: 50MB. Must be positive and <= 50MB.
-	MaxCacheEntries   int           // Maximum number of cache entries. Set to 0 to disable caching. Default: 2000.
-	CacheTTL          time.Duration // Time-to-live for cache entries. Default: 1 hour.
-	CacheCleanup      time.Duration // Interval for background cleanup of expired cache entries. Set to 0 to disable. Default: 5 minutes.
+	MaxCacheEntries   int           // Maximum number of cache entries. Set to 0 to disable caching. Default: 2000. Ignored by the package-level convenience functions, which run on one-shot processors with caching disabled — construct a Processor via New to use the cache.
+	CacheTTL          time.Duration // Time-to-live for cache entries. Default: 1 hour. Ignored by the package-level convenience functions (see MaxCacheEntries).
+	CacheCleanup      time.Duration // Interval for background cleanup of expired cache entries. Set to 0 to disable. Default: 5 minutes. Ignored by the package-level convenience functions (see MaxCacheEntries).
 	WorkerPoolSize    int           // Number of concurrent workers for batch processing. Default: 4. Must be positive and <= 256.
 	ProcessingTimeout time.Duration // Maximum time allowed for processing a single document. Default: 30 seconds. Set to 0 for no timeout.
 
@@ -121,8 +117,14 @@ type Config struct {
 	ExtractArticle bool // Enables article extraction mode. When true, identifies and extracts main content. Default: true.
 	PreserveImages bool // Controls whether images are preserved in output. Default: true.
 	PreserveLinks  bool // Controls whether links are preserved in output. Default: true.
-	PreserveVideos bool // Controls whether video elements are extracted. Default: true.
-	PreserveAudios bool // Controls whether audio elements are extracted. Default: true.
+	// PreserveVideos controls whether video elements are extracted. Default: true.
+	// Note: URLs that appear only in raw HTML outside media elements (inside
+	// script JSON, comments, etc.) are additionally scanned only for documents
+	// up to 1MB; larger documents extract media from the parsed DOM only.
+	PreserveVideos bool
+	// PreserveAudios controls whether audio elements are extracted, with the
+	// same 1MB raw-HTML scan limit as PreserveVideos. Default: true.
+	PreserveAudios bool
 
 	// === Output Formats ===
 	InlineImageFormat string // How images are formatted in text output. Options: "none", "markdown", "html", "placeholder". Default: "none".
@@ -131,7 +133,13 @@ type Config struct {
 	Encoding          string // Character encoding of input HTML. Leave empty for auto-detection. Common: "utf-8", "windows-1252", "gbk".
 
 	// === Link Extraction ===
-	ResolveRelativeURLs  bool   // Controls whether relative URLs are resolved to absolute URLs. Requires BaseURL. Default: true.
+	// ResolveRelativeURLs controls whether relative URLs are resolved to
+	// absolute URLs. Default: true. Resolution is against BaseURL when set;
+	// when BaseURL is empty, ExtractAllLinks infers a base from the document
+	// (<base>, og:url, rel=canonical, or the first absolute href/src as a
+	// last resort). Protocol-relative references ("//host/path") are passed
+	// through unchanged rather than inheriting the base's scheme.
+	ResolveRelativeURLs  bool
 	BaseURL              string // Base URL for resolving relative URLs. Example: "https://example.com"
 	IncludeImages        bool   // Controls whether image URLs are included in link extraction. Default: true.
 	IncludeVideos        bool   // Controls whether video URLs are included in link extraction. Default: true.
@@ -212,6 +220,8 @@ func (c Config) Validate() error {
 		return newConfigError("MaxDepth", c.MaxDepth, fmt.Sprintf("exceeds maximum %d", maxConfigDepth))
 	case c.ProcessingTimeout < 0:
 		return newConfigError("ProcessingTimeout", c.ProcessingTimeout, "cannot be negative")
+	case c.Audit.MaxRawValueLength < 0:
+		return newConfigError("Audit.MaxRawValueLength", c.Audit.MaxRawValueLength, "cannot be negative")
 	case c.Audit.MaxEntries < 0:
 		return newConfigError("Audit.MaxEntries", c.Audit.MaxEntries, "cannot be negative")
 	case c.Audit.MaxEntries > maxConfigAuditEntries:
@@ -233,12 +243,16 @@ func (c Config) Validate() error {
 }
 
 // validateFormat validates that a format string is one of the allowed values.
-// Empty string is allowed (will use default).
+// Empty string is allowed (will use default). The value is trimmed before the
+// case-insensitive membership check, matching the TrimSpace the same value
+// receives later in normalizeInlineFormat — validation was previously
+// stricter than the normalization applied to the accepted value, rejecting
+// " markdown" as invalid.
 func validateFormat(field, value string, allowed []string) error {
 	if value == "" {
 		return nil // Empty means use default
 	}
-	lowerValue := strings.ToLower(value)
+	lowerValue := strings.ToLower(strings.TrimSpace(value))
 	if slices.Contains(allowed, lowerValue) {
 		return nil
 	}
@@ -312,7 +326,8 @@ type Result struct {
 	// ProcessingTime is the wall-clock time spent on this extraction. It is omitted from
 	// JSON and serialized as processing_time_ms by MarshalJSON.
 	ProcessingTime time.Duration `json:"-"`
-	// WordCount is the number of whitespace-separated words in Text.
+	// WordCount is the number of whitespace-separated words in Text; each CJK
+	// ideograph, kana, or Hangul syllable additionally counts as one word.
 	WordCount int `json:"word_count"`
 	// ReadingTime is the estimated reading time based on WordCount. It is omitted from
 	// JSON and serialized as reading_time_ms by MarshalJSON.
@@ -345,7 +360,10 @@ type LinkInfo struct {
 	Text string `json:"text"`
 	// Title is the advisory title (the title attribute).
 	Title string `json:"title"`
-	// IsExternal is true when the URL targets a different host than BaseURL.
+	// IsExternal is true when the URL is absolute (http/https or
+	// protocol-relative), regardless of domain: same-domain absolute links
+	// also report true, and relative URLs report false. It does not compare
+	// the host against BaseURL.
 	IsExternal bool `json:"is_external"`
 	// IsNoFollow is true when the link's rel attribute contains "nofollow".
 	IsNoFollow bool `json:"is_nofollow"`
@@ -397,7 +415,13 @@ type Statistics struct {
 	CacheHits int64
 	// CacheMisses is the number of extractions that missed the cache and required full processing.
 	CacheMisses int64
-	// ErrorCount is the number of extractions that returned an error.
+	// ErrorCount counts extractions that failed once processing had begun:
+	// oversize input, encoding-conversion failure, and every error raised
+	// inside the processing stage (including the processing timeout and
+	// cancellation that lands there). It is not incremented when context
+	// cancellation is observed before processing starts, on calls rejected
+	// by a closed processor, or for file-read errors (missing files,
+	// traversal rejections, I/O failures).
 	ErrorCount int64
 	// AverageProcessTime is the mean wall-clock time per extraction.
 	AverageProcessTime time.Duration

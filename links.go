@@ -423,14 +423,14 @@ func (p *Processor) extractContentLinks(n *stdxhtml.Node, baseURL string, linkMa
 		return
 	}
 
-	isExternalOriginal := internal.IsExternalURL(href)
-
 	resolvedURL := p.resolveURLIfEnabled(baseURL, href)
 
-	isExternal := isExternalOriginal
-	if !isExternalOriginal && baseURL != "" {
-		isExternal = internal.IsDifferentDomain(baseURL, resolvedURL)
-	}
+	// isExternal reflects IsExternalURL(href) verbatim: a URL resolved from
+	// baseURL always shares its authority, so the former IsDifferentDomain
+	// refinement on the resolved form could never flip the result (before the
+	// authority-bounded ExtractDomain fix it could only misfire, flagging
+	// same-site "/@user" profile links as cross-domain).
+	isExternal := internal.IsExternalURL(href)
 
 	if isExternal && !p.config.IncludeExternalLinks {
 		return
@@ -556,6 +556,19 @@ func (p *Processor) extractSourceLinks(n *stdxhtml.Node, baseURL string, linkMap
 		}
 	}
 
+	// The dispatch gate in extractLinksFromDocument admits a <source> when
+	// EITHER media flag is set, because the resource's type is only known
+	// after this classification. Re-check the specific flag so a video
+	// <source> is not emitted when IncludeVideos is false (and symmetrically
+	// for audio) — every other tag checks its own flag at dispatch. An
+	// unclassified "media" resource stays admitted by the OR gate.
+	if resourceType == "video" && !p.config.IncludeVideos {
+		return
+	}
+	if resourceType == "audio" && !p.config.IncludeAudios {
+		return
+	}
+
 	title := lastPathSegment(resolvedURL)
 	if title == "" {
 		title = "Media"
@@ -592,46 +605,55 @@ func (p *Processor) extractLinkTagLinks(n *stdxhtml.Node, baseURL string, linkMa
 	resourceType := "link"
 	include := false
 
-	switch rel {
-	case "stylesheet":
-		if p.config.IncludeCSS {
-			resourceType = "css"
-			include = true
-		}
-	case "icon", "shortcut icon", "apple-touch-icon", "apple-touch-icon-precomposed":
-		if p.config.IncludeIcons {
-			resourceType = "icon"
-			include = true
-		}
-	case "preload", "prefetch", "dns-prefetch", "preconnect":
-		switch asAttr {
-		case "style":
+	// rel is a case-insensitive, whitespace-separated token list per the HTML
+	// spec. Matching individual tokens (rather than the raw attribute string)
+	// classifies "StyleSheet", "shortcut icon", and "preload stylesheet" like
+	// their canonical spellings; the former exact-value switch silently
+	// dropped any mixed-case or multi-token spelling into the type-attribute
+	// fallback below. When several tokens match, the last one wins.
+	for _, tok := range strings.Fields(strings.ToLower(rel)) {
+		switch tok {
+		case "stylesheet":
 			if p.config.IncludeCSS {
 				resourceType = "css"
 				include = true
 			}
-		case "script":
-			if p.config.IncludeJS {
-				resourceType = "js"
+		case "icon", "apple-touch-icon", "apple-touch-icon-precomposed":
+			if p.config.IncludeIcons {
+				resourceType = "icon"
 				include = true
 			}
-		case "image":
-			if p.config.IncludeImages {
-				resourceType = "image"
-				include = true
-			}
-		case "video":
-			if p.config.IncludeVideos {
-				resourceType = "video"
-				include = true
-			}
-		case "audio":
-			if p.config.IncludeAudios {
-				resourceType = "audio"
-				include = true
+		case "preload", "prefetch", "dns-prefetch", "preconnect":
+			switch asAttr {
+			case "style":
+				if p.config.IncludeCSS {
+					resourceType = "css"
+					include = true
+				}
+			case "script":
+				if p.config.IncludeJS {
+					resourceType = "js"
+					include = true
+				}
+			case "image":
+				if p.config.IncludeImages {
+					resourceType = "image"
+					include = true
+				}
+			case "video":
+				if p.config.IncludeVideos {
+					resourceType = "video"
+					include = true
+				}
+			case "audio":
+				if p.config.IncludeAudios {
+					resourceType = "audio"
+					include = true
+				}
 			}
 		}
-	default:
+	}
+	if !include {
 		if strings.Contains(linkType, "css") && p.config.IncludeCSS {
 			resourceType = "css"
 			include = true

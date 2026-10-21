@@ -2,6 +2,8 @@ package internal
 
 import (
 	"bytes"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -979,5 +981,53 @@ func TestDetectAndConvertToUTF8StringMemoryIsolation(t *testing.T) {
 	original[0] = 'X'
 	if safeResult != "Hello World" {
 		t.Errorf("Safe version should be isolated from input modifications, got '%s'", safeResult)
+	}
+}
+
+// TestNormalizeCharsetConcurrentNoOvercount pins the counter discipline of the
+// charset memoization cache: every goroutine simultaneously missing a key must
+// race to LoadOrStore it, and only the goroutine whose call performs the
+// insert counts. The previous Store+Add(1) sequence let every concurrent
+// misser of the same key Add(1), inflating the counter and permanently capping
+// the cache below maxCachedCharsetEntries.
+//
+// The counter is global and monotonic (entries are never evicted), so the
+// assertion is on the delta across the hammering: with correct counting the
+// delta is bounded by the number of DISTINCT keys regardless of interleaving —
+// a deterministic invariant — while any single duplicated count anywhere in
+// the concurrent miss storm exceeds it. (The absolute ≤ maxCachedCharsetEntries
+// bound is separately pinned by TestCharsetNormCacheCardinalityBounded.)
+func TestNormalizeCharsetConcurrentNoOvercount(t *testing.T) {
+	// Deliberately NOT t.Parallel(): the assertion measures the delta of the
+	// GLOBAL charsetNormCacheEntries counter across the hammering below, and
+	// any parallel sibling test that inserts its own novel charset names into
+	// the same process-wide cache during that window inflates the delta and
+	// fails the test spuriously (observed as "grew by 176 for 64 distinct
+	// keys" under -race). Running sequentially keeps the measured window free
+	// of unrelated inserters; the concurrency under test is the 16-goroutine
+	// hammer itself, which does not need t.Parallel to exercise the race.
+
+	const distinctKeys = 64
+	const goroutines = 16
+	before := charsetNormCacheEntries.Load()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for k := range distinctKeys {
+				_ = normalizeCharset(fmt.Sprintf("x-concurrent-key-%d", k))
+			}
+		}()
+	}
+	close(start) // release every goroutine at once to maximize miss overlap
+	wg.Wait()
+
+	after := charsetNormCacheEntries.Load()
+	if grew := after - before; grew > distinctKeys {
+		t.Errorf("charsetNormCacheEntries grew by %d for %d distinct keys; concurrent duplicate misses must not overcount (before=%d, after=%d)", grew, distinctKeys, before, after)
 	}
 }

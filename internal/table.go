@@ -142,10 +142,12 @@ func getCellAlign(n *html.Node) table.CellAlignment {
 	return table.AlignDefault
 }
 
-// maxCellSpan caps colspan/rowspan values. The HTML spec clamps both to 1000
-// (browsers ignore anything larger), and oversized values are almost always
-// malformed; capping also bounds the placeholder cells expandColspanCells
-// allocates (colspan-1 per cell), which would otherwise let a single
+// maxCellSpan caps colspan/rowspan values. Per the HTML spec, colspan clamps
+// to 1000 and rowspan to 65534; the tighter uniform 1000 bound here is a
+// library resource limit rather than a spec transcription, and oversized
+// values are almost always malformed. Capping also bounds the placeholder
+// cells the inline expansion in extractTableData (internal/table) allocates
+// (colspan-1 per cell), which would otherwise let a single
 // <td colspan="N"> exhaust memory.
 const maxCellSpan = 1000
 
@@ -204,13 +206,12 @@ func getCellWidth(n *html.Node) string {
 	// attribute takes precedence over style per the HTML/CSS cascade for
 	// presentational hints.
 	var styleAttr string
-	widthFound := false
 	for _, attr := range n.Attr {
 		switch strings.ToLower(attr.Key) {
 		case "width":
-			if widthFound {
-				continue
-			}
+			// First non-zero width attribute value wins; a duplicate
+			// attribute is dropped by the parser, and zero widths fall
+			// through to the style fallback below.
 			widthVal := strings.TrimSpace(attr.Val)
 			if !isZeroWidthValue(widthVal) {
 				return widthVal

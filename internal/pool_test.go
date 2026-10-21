@@ -9,78 +9,6 @@ import (
 	"golang.org/x/net/html"
 )
 
-// TestGetBuilder tests getting a strings.Builder from the pool.
-func TestGetBuilder(t *testing.T) {
-	t.Parallel()
-
-	sb := GetBuilder()
-	if sb == nil {
-		t.Fatal("GetBuilder() returned nil")
-	}
-
-	// Verify the builder is usable
-	_, err := sb.WriteString("test")
-	if err != nil {
-		t.Errorf("WriteString() failed: %v", err)
-	}
-
-	if sb.String() != "test" {
-		t.Errorf("Expected 'test', got '%s'", sb.String())
-	}
-}
-
-// TestPutBuilder tests returning a strings.Builder to the pool.
-func TestPutBuilder(t *testing.T) {
-	t.Parallel()
-
-	sb := GetBuilder()
-	sb.WriteString("content")
-
-	// Put the builder back
-	PutBuilder(sb)
-
-	// Get another builder - it should be reset
-	sb2 := GetBuilder()
-	if sb2.Len() != 0 {
-		t.Errorf("Builder should be reset, got length %d", sb2.Len())
-	}
-
-	PutBuilder(sb2)
-}
-
-// TestPutBuilderNil tests that PutBuilder handles nil safely.
-func TestPutBuilderNil(t *testing.T) {
-	t.Parallel()
-
-	// Should not panic
-	PutBuilder(nil)
-}
-
-// TestBuilderPoolConcurrent tests concurrent access to BuilderPool.
-func TestBuilderPoolConcurrent(t *testing.T) {
-	t.Parallel()
-
-	const numGoroutines = 100
-	const numOperations = 50
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
-				sb := GetBuilder()
-				sb.WriteString("test string")
-				_ = sb.String()
-				PutBuilder(sb)
-			}
-		}()
-	}
-
-	wg.Wait()
-}
-
 // TestGetBuffer tests getting a bytes.Buffer from the pool.
 func TestGetBuffer(t *testing.T) {
 	t.Parallel()
@@ -153,99 +81,7 @@ func TestBufferPoolConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// TestGetTransformBuffer tests getting a transform buffer from the pool.
-func TestGetTransformBuffer(t *testing.T) {
-	t.Parallel()
-
-	bufPtr := GetTransformBuffer()
-	if bufPtr == nil {
-		t.Fatal("GetTransformBuffer() returned nil")
-	}
-
-	buf := *bufPtr
-	if buf == nil {
-		t.Fatal("Transform buffer is nil")
-	}
-
-	// Verify the buffer is usable
-	buf = append(buf, []byte("test")...)
-	if len(buf) != 4 {
-		t.Errorf("Expected length 4, got %d", len(buf))
-	}
-}
-
-// TestPutTransformBuffer tests returning a transform buffer to the pool.
-func TestPutTransformBuffer(t *testing.T) {
-	t.Parallel()
-
-	bufPtr := GetTransformBuffer()
-	*bufPtr = append(*bufPtr, []byte("content")...)
-
-	// Put the buffer back
-	PutTransformBuffer(bufPtr)
-
-	// Get another buffer - it should be reset to zero length
-	bufPtr2 := GetTransformBuffer()
-	if len(*bufPtr2) != 0 {
-		t.Errorf("Transform buffer should be reset to zero length, got %d", len(*bufPtr2))
-	}
-
-	// But it should retain capacity
-	if cap(*bufPtr2) == 0 {
-		t.Error("Transform buffer should retain capacity")
-	}
-
-	PutTransformBuffer(bufPtr2)
-}
-
-// TestTransformBufferPoolConcurrent tests concurrent access to TransformBufferPool.
-func TestTransformBufferPoolConcurrent(t *testing.T) {
-	t.Parallel()
-
-	const numGoroutines = 100
-	const numOperations = 50
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
-				bufPtr := GetTransformBuffer()
-				*bufPtr = append(*bufPtr, []byte("test bytes")...)
-				_ = *bufPtr
-				PutTransformBuffer(bufPtr)
-			}
-		}()
-	}
-
-	wg.Wait()
-}
-
-// TestBuilderPoolInitialSize verifies that builders from the pool can grow efficiently.
-// Note: After Reset(), strings.Builder capacity becomes 0, but the pool's New function
 // calls Grow() to pre-allocate space for fresh builders.
-func TestBuilderPoolInitialSize(t *testing.T) {
-	t.Parallel()
-
-	// Get a fresh builder from the pool (may be newly created or reused)
-	sb := GetBuilder()
-	defer PutBuilder(sb)
-
-	// The builder may have capacity 0 after Reset(), but should be usable
-	// The important thing is that it can be written to
-	_, err := sb.WriteString("test content")
-	if err != nil {
-		t.Errorf("WriteString() failed: %v", err)
-	}
-
-	// Verify the content was written
-	if sb.String() != "test content" {
-		t.Errorf("Expected 'test content', got '%s'", sb.String())
-	}
-}
-
 // TestBufferPoolInitialCapacity verifies that pooled buffers have initial capacity.
 func TestBufferPoolInitialCapacity(t *testing.T) {
 	t.Parallel()
@@ -259,41 +95,12 @@ func TestBufferPoolInitialCapacity(t *testing.T) {
 	}
 }
 
-// BenchmarkGetBuilder benchmarks GetBuilder performance.
-func BenchmarkGetBuilder(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		sb := GetBuilder()
-		PutBuilder(sb)
-	}
-}
-
 // BenchmarkGetBuffer benchmarks GetBuffer performance.
 func BenchmarkGetBuffer(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		buf := GetBuffer()
 		PutBuffer(buf)
-	}
-}
-
-// BenchmarkGetTransformBuffer benchmarks GetTransformBuffer performance.
-func BenchmarkGetTransformBuffer(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		buf := GetTransformBuffer()
-		PutTransformBuffer(buf)
-	}
-}
-
-// BenchmarkBuilderWithWork benchmarks builder with actual work.
-func BenchmarkBuilderWithWork(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		sb := GetBuilder()
-		sb.WriteString("test string content")
-		_ = sb.String()
-		PutBuilder(sb)
 	}
 }
 
@@ -308,35 +115,7 @@ func BenchmarkBufferWithWork(b *testing.B) {
 	}
 }
 
-// TestGetBuilderPoolCorruption tests that GetBuilder handles corrupted pool gracefully.
 // This simulates a scenario where something external puts a wrong type in the pool.
-func TestGetBuilderPoolCorruption(t *testing.T) {
-	// Not parallel: the corruption fallback is only deterministic when no
-	// other test interleaves sync.Pool Get/Put calls on the same P.
-
-	// Put a wrong type in the pool to simulate corruption
-	var wrongBuilder any = "not a builder" // deliberately non-pointer: tests pool corruption fallback
-	BuilderPool.Put(wrongBuilder)
-
-	// GetBuilder should still return a valid builder (fallback to new)
-	sb := GetBuilder()
-	if sb == nil {
-		t.Fatal("GetBuilder() returned nil even with pool corruption")
-	}
-
-	// Verify the builder is usable
-	_, err := sb.WriteString("test")
-	if err != nil {
-		t.Errorf("WriteString() failed: %v", err)
-	}
-
-	if sb.String() != "test" {
-		t.Errorf("Expected 'test', got '%s'", sb.String())
-	}
-
-	PutBuilder(sb)
-}
-
 // TestGetBufferPoolCorruption tests that GetBuffer handles corrupted pool gracefully.
 func TestGetBufferPoolCorruption(t *testing.T) {
 	t.Parallel()
@@ -364,64 +143,6 @@ func TestGetBufferPoolCorruption(t *testing.T) {
 	PutBuffer(buf)
 }
 
-// TestGetTransformBufferPoolCorruption tests that GetTransformBuffer handles corrupted pool gracefully.
-func TestGetTransformBufferPoolCorruption(t *testing.T) {
-	t.Parallel()
-
-	// Put a wrong type in the pool to simulate corruption
-	var wrongTransform any = "not a buffer" // deliberately non-pointer: tests pool corruption fallback
-	TransformBufferPool.Put(wrongTransform)
-
-	// GetTransformBuffer should still return a valid buffer (fallback to new)
-	bufPtr := GetTransformBuffer()
-	if bufPtr == nil {
-		t.Fatal("GetTransformBuffer() returned nil even with pool corruption")
-	}
-
-	buf := *bufPtr
-	if buf == nil {
-		t.Fatal("Transform buffer is nil")
-	}
-
-	// Verify the buffer is usable
-	buf = append(buf, []byte("test")...)
-	if len(buf) != 4 {
-		t.Errorf("Expected length 4, got %d", len(buf))
-	}
-
-	PutTransformBuffer(bufPtr)
-}
-
-// TestPutBuilderSecureClear tests that poolSecureClear drops the builder so its
-// buffer is never reused. Unlike the other pooled types, strings.Builder has no
-// mutable buffer accessor, so in-place zeroing is not possible; secure-clear
-// mode therefore drops the builder (no repooling) rather than scrubbing it.
-func TestPutBuilderSecureClear(t *testing.T) {
-	t.Parallel()
-
-	// Enable secure clear
-	SetPoolSecureClear(true)
-	defer SetPoolSecureClear(false)
-
-	// Create a builder with sensitive content
-	sb := GetBuilder()
-	sensitiveData := "SENSITIVE_PASSWORD_12345"
-	sb.WriteString(sensitiveData)
-
-	// Verify data was written
-	if sb.String() != sensitiveData {
-		t.Fatalf("Expected '%s', got '%s'", sensitiveData, sb.String())
-	}
-
-	// Return to pool - in secure-clear mode the builder is dropped, not repooled.
-	PutBuilder(sb)
-
-	// Note: strings.Builder exposes no mutable accessor for its buffer, so the
-	// buffer cannot be zeroed in place; the guarantee is instead that the
-	// dropped builder is never handed back out by GetBuilder. This test
-	// primarily verifies the code path executes without panic.
-}
-
 // TestPutBufferSecureClear tests that poolSecureClear properly zeros buffer.
 func TestPutBufferSecureClear(t *testing.T) {
 	t.Parallel()
@@ -446,30 +167,6 @@ func TestPutBufferSecureClear(t *testing.T) {
 	// Note: We can't directly verify the buffer was zeroed since
 	// the buffer has been reset and returned to pool.
 	// This test primarily verifies the code path executes without panic.
-}
-
-// TestPutTransformBufferSecureClear tests that poolSecureClear properly zeros transform buffer.
-func TestPutTransformBufferSecureClear(t *testing.T) {
-	t.Parallel()
-
-	// Enable secure clear
-	SetPoolSecureClear(true)
-	defer SetPoolSecureClear(false)
-
-	// Create a buffer with sensitive content
-	bufPtr := GetTransformBuffer()
-	sensitiveData := []byte("SENSITIVE_TOKEN_12345")
-	*bufPtr = append(*bufPtr, sensitiveData...)
-
-	// Verify data was written
-	if !bytes.Equal(*bufPtr, sensitiveData) {
-		t.Fatalf("Expected '%s', got '%s'", *bufPtr, sensitiveData)
-	}
-
-	// Return to pool - should zero the buffer
-	PutTransformBuffer(bufPtr)
-
-	// This test primarily verifies the code path executes without panic
 }
 
 // TestPutNodeSliceSecureClear tests that poolSecureClear properly zeros node slice.
@@ -591,11 +288,6 @@ func checkByteBufPut(t *testing.T, name string, get func() *[]byte, put func(*[]
 func TestPutByteBuf_Boundaries(t *testing.T) {
 	t.Parallel()
 	checkByteBufPut(t, "PutByteBuf", GetByteBuf, PutByteBuf)
-}
-
-func TestPutTransformBuffer_Boundaries(t *testing.T) {
-	t.Parallel()
-	checkByteBufPut(t, "PutTransformBuffer", GetTransformBuffer, PutTransformBuffer)
 }
 
 func TestPutBuffer_Boundaries(t *testing.T) {

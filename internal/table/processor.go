@@ -51,6 +51,18 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 		return
 	}
 
+	// Config.Validate accepts TableFormat case-insensitively and New
+	// normalizes only the inline formats, so a mixed-case value such as
+	// "HTML" reaches this method verbatim. Normalize once here, before BOTH
+	// consumers of the value — the data path (extractTableData branches on
+	// it case-sensitively) and the renderer dispatch (getRenderer switches
+	// on the exact lowercased name) — so the two can never disagree. Empty
+	// maps to "markdown", matching getRenderer's default branch.
+	tableFormat = strings.ToLower(strings.TrimSpace(tableFormat))
+	if tableFormat == "" {
+		tableFormat = "markdown"
+	}
+
 	// Ensure blank line before table for proper Markdown parsing
 	EnsureNewline(tb)
 	if tb.LastChar == '\n' {
@@ -67,13 +79,9 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 	// Step 2: Determine maximum columns
 	maxCols := calculateMaxColumns(tableData)
 
-	// Step 3: Render in requested format using registry
-	if renderer := globalRegistry.get(tableFormat); renderer != nil {
-		renderer.Render(tableData, tb, maxCols)
-	} else {
-		// Fallback to markdown for unknown formats
-		extractTableAsMarkdown(tableData, tb, maxCols)
-	}
+	// Step 3: Render in the requested format. getRenderer falls back to
+	// Markdown for unknown formats.
+	getRenderer(tableFormat).Render(tableData, tb, maxCols)
 
 	// Ensure blank line after table for proper Markdown parsing
 	_ = tb.WriteByte('\n')
@@ -82,15 +90,22 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 	}
 }
 
+// maxExpandedCells bounds the AGGREGATE number of colspan placeholder cells a
+// single table may allocate across all rows. maxCellSpan (in the caller's
+// CellAccessor) bounds one cell and the node-walk cap bounds visited DOM
+// nodes — but placeholders are synthetic cells no walk ever sees, so without
+// an aggregate cap a ~1.5MB document of <td colspan="1000"> cells multiplies
+// ~50k real cells into tens of millions of CellData. Once the budget is
+// spent, later colspans render as one column each. 10,000 is far above any
+// legitimate table's expansion.
+const maxExpandedCells = 10000
+
 // extractTableData walks through table rows and extracts cell data.
 func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]CellData {
-	// Config.Validate accepts TableFormat case-insensitively and the renderer
-	// registry lowercases on lookup, so normalize once here to keep the
-	// colspan-expansion / structure-row branches (which compare case-sensitively
-	// below) consistent with both. Without this, "HTML" renders via the HTML
-	// renderer but takes the Markdown data path (colspans expanded into separate
-	// cells, width-definition rows dropped), silently producing wrong tables.
-	tableFormat = strings.ToLower(tableFormat)
+	// tableFormat arrives already normalized by Extract (lowercased, trimmed,
+	// empty defaulted to "markdown"), so the colspan-expansion and
+	// structure-row branches below and getRenderer's dispatch all see the
+	// same value.
 	// Typical tables have several rows; pre-size to avoid the first outer-slice
 	// doublings (16 → 32 → …). Grows naturally for larger tables.
 	tableData := make([][]CellData, 0, 8)
@@ -99,12 +114,16 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 	var scratch []CellData
 	// arena holds every stored row of this table in one backing array, replacing
 	// the per-row slices the HTML path (make + copy) and the Markdown path
-	// (expandColspanCells) previously allocated. Each stored row is resliced
+	// (expandColspanCells) previously allocated. It is pre-sized to cover a
+	// typical table in one allocation: growing from zero doubled the backing
+	// 1→2→4→…, so a 30-cell table paid ~63 slots of cumulative copies (~4% of
+	// per-Extract allocation bytes on a profiled realistic document). Larger
+	// tables still grow naturally. Each stored row is resliced
 	// with a full slice expression arena[start:end:end] so its capacity equals
 	// its length: a later append onto that row (padTableColumns) allocates a
 	// fresh backing instead of overwriting the next row's arena region. Skipped
 	// Markdown structure rows return before appending, so they leave no residue.
-	var arena []CellData
+	arena := make([]CellData, 0, 32)
 
 	p.nodeWalker.Walk(table, func(node *html.Node) bool {
 		if node.Type != html.ElementNode || node.Data != "tr" {
@@ -132,11 +151,17 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 				return false
 			}
 			// Expand colspans into placeholder cells inline as the row is
-			// appended, replacing expandColspanCells' per-row slice allocation.
+			// appended (this inline expansion replaced the historical
+			// expandColspanCells per-row allocation). expanded budgets the
+			// table-wide placeholder count against maxExpandedCells:
+			// placeholders are synthetic cells no node-walk cap can see, so
+			// without this bound the arena grows as cells x maxCellSpan.
+			expanded := 0
 			for i := range rawCells {
 				arena = append(arena, rawCells[i])
-				for k := 1; k < rawCells[i].Colspan; k++ {
+				for k := 1; k < rawCells[i].Colspan && expanded < maxExpandedCells; k++ {
 					arena = append(arena, expandedPlaceholder(rawCells[i]))
+					expanded++
 				}
 			}
 		}

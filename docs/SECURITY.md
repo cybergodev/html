@@ -449,8 +449,7 @@ If you discover a security vulnerability, please follow responsible disclosure:
 
 1. **Do Not** open a public GitHub issue
 2. **Preferred**: use [Private Vulnerability Reporting](https://github.com/cybergodev/html/security/advisories/new) — enable it in *Settings → Code security and analysis* if not yet active
-3. Alternatively, **email** security concerns to: `[security email - to be configured by maintainer]`
-4. **Include**:
+3. **Include**:
    - Description of the vulnerability
    - Steps to reproduce
    - Potential impact
@@ -585,6 +584,7 @@ func FuzzExtract(f *testing.F) {
 - Package-level entry points (`Extract*`, `ExtractAllLinks`, `ExtractBatch*`) now recover a pool-`New` panic and return `ErrInternalPanic` instead of letting it escape to callers
 - Data URLs with an empty media type (`data:;base64,...`) are now rejected — previously arbitrary base64 payload bypassed the safe-MIME whitelist
 - Table `colspan`/`rowspan` clamped to 1000 (HTML spec ceiling) to close a memory-exhaustion vector; oversized non-data URIs are now sanitized/rejected before emission
+- Table colspan expansion additionally bounded in aggregate: at most 10,000 placeholder cells per table (`maxExpandedCells`) and a rendering grid of at most 2^20 cells (`maxGridCells`), closing the amplification where a ~1.5MB document of `<td colspan="1000">` cells expanded into tens of millions of `CellData` (per-cell clamping and the 50,000-node walk cap cannot see synthetic cells)
 - Pooled `[]byte`/node-slice buffers above 64 KiB / 8192 entries are no longer retained in `sync.Pool`, eliminating the retention footgun where one multi-MB buffer was reused for every later small request
 
 ### v1.4.4 (2026-06-26)

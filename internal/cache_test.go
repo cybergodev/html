@@ -603,6 +603,53 @@ func waitCacheLen(c *Cache[string], want int, timeout time.Duration) bool {
 	return c.Len() == want
 }
 
+// TestCacheStartRestartConcurrent pins the internal serialization of the
+// cleanup lifecycle: RestartCleanup resets cleanupOnce under cleanupMu, and
+// StartCleanup's Once.Do runs under that same lock. A concurrent mix of
+// StartCleanup/StopCleanup/RestartCleanup on one Cache must not race on the
+// cleanupOnce field (run with -race; before Do() was moved inside the
+// critical section this test trips the race detector), must not panic, and
+// must leave a Cache whose StartCleanup still returns a usable CancelFunc.
+func TestCacheStartRestartConcurrent(t *testing.T) {
+	t.Parallel()
+
+	cache := NewCache[string](16, time.Minute)
+	defer cache.StopCleanup()
+
+	const goroutines = 8
+	const iterations = 50
+
+	var wg sync.WaitGroup
+	for g := range goroutines {
+		wg.Add(1)
+		go func(mode int) {
+			defer wg.Done()
+			for i := range iterations {
+				// Rotate operations within each goroutine so StartCleanup
+				// and RestartCleanup genuinely overlap across goroutines.
+				switch (mode + i) % 3 {
+				case 0:
+					cancel := cache.StartCleanup(time.Millisecond)
+					cancel() // returned CancelFunc must always be callable
+				case 1:
+					cache.StopCleanup()
+				default:
+					cache.RestartCleanup(time.Millisecond)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// The lifecycle must remain usable after the hammering.
+	cache.RestartCleanup(time.Millisecond)
+	cancel := cache.StartCleanup(time.Millisecond)
+	if cancel == nil {
+		t.Fatal("StartCleanup returned a nil CancelFunc after concurrent Start/Stop/Restart")
+	}
+	cancel()
+}
+
 // TestCacheNewClampsNegativeArgs covers the negative-argument clamping in
 // NewCache (maxEntries<0 -> 0, ttl<0 -> 0). A disabled cache must reject all
 // Sets and return nil for all Gets.

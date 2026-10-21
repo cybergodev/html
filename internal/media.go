@@ -2,6 +2,7 @@ package internal
 
 import (
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -67,16 +68,22 @@ var (
 	// position instead of scanning once per pattern.
 	//
 	// Each signature is indexed under BOTH ASCII cases of its first byte (e.g. under
-	// both 'y' and 'Y'), so the scan looks up mediaPatterns[c] directly without a
+	// both 'y' and 'Y'), so the scan looks up its bucket directly without a
 	// per-byte case-fold branch. The match itself (asciiFoldHasPrefix) is still
 	// case-insensitive over the whole signature.
 	mediaPatterns [256][]string
 
-	// mediaFirstByte mirrors mediaPatterns as a compact presence bitmap. The
-	// HasMediaReference scan consults it first so bytes that start no signature
-	// — the overwhelming majority — cost one byte load from this 256-byte table
-	// instead of a slice-header load from the 4 KiB mediaPatterns table.
-	mediaFirstByte [256]bool
+	// mediaScanClass maps each byte to a dense bucket id (1+) for the
+	// mediaPatterns buckets that begin with it, or 0 when no signature starts
+	// with that byte. The HasMediaReference scan consults this single
+	// one-byte table per input byte: the previous two-step lookup (a presence
+	// bitmap followed by a 24-byte slice-header load from the 4 KiB
+	// mediaPatterns table) cost four memory loads per byte and measured ~1GB/s;
+	// the class table keeps the common reject path to one load plus a branch.
+	mediaScanClass [256]uint8
+
+	// mediaScanBuckets[id-1] is the mediaPatterns bucket assigned class id.
+	mediaScanBuckets [][]string
 )
 
 func init() {
@@ -107,8 +114,12 @@ func init() {
 	for _, pattern := range embedPatterns {
 		addSignature(pattern)
 	}
-	for b, bucket := range mediaPatterns {
-		mediaFirstByte[b] = len(bucket) > 0
+	// Densify the non-empty buckets behind the one-byte class table.
+	for b, bucket := range &mediaPatterns {
+		if len(bucket) > 0 {
+			mediaScanClass[b] = uint8(len(mediaScanBuckets) + 1)
+			mediaScanBuckets = append(mediaScanBuckets, bucket)
+		}
 	}
 }
 
@@ -138,9 +149,11 @@ func DetectAudioType(url string) string {
 
 // detectMediaTypeByExtension returns the MIME type for url based on a trailing
 // extension in exts. Query parameters and fragments are stripped first so that
-// URLs like "song.mp3?v=2#audio" still match. The two callers pass distinct,
-// non-overlapping maps (videoExtensions / audioExtensions), so iteration order
-// does not affect the result.
+// URLs like "song.mp3?v=2#audio" still match. The two callers pass the video
+// and audio extension maps, which intentionally overlap on ".ogg" (see the
+// comment above videoExtensions); the last-dot extraction below performs a
+// single O(1) lookup per map, so the overlap cannot make iteration order
+// matter.
 //
 // Instead of iterating every extension with strings.HasSuffix (O(n) map
 // iteration), it extracts the suffix after the last '.' and does a single O(1)
@@ -176,11 +189,25 @@ func detectAudioType(url string) string {
 	return detectMediaTypeByExtension(url, audioExtensions)
 }
 
-// hasEmbedPattern checks if URL contains known embed patterns
+// hasEmbedPattern reports whether url contains a known embed-host pattern at
+// a domain boundary: the character before the match must be start-of-string,
+// '/', or '.' (the subdomain separator). A plain substring match also hit
+// lookalike hosts such as fakebilibili.com or x-youtubeknockoff embeds, which
+// contain the pattern but are unrelated domains and were misclassified as
+// embed videos.
 func hasEmbedPattern(url string) bool {
 	for _, pattern := range embedPatterns {
-		if strings.Contains(url, pattern) {
-			return true
+		start := 0
+		for {
+			idx := strings.Index(url[start:], pattern)
+			if idx < 0 {
+				break
+			}
+			idx += start
+			if idx == 0 || url[idx-1] == '/' || url[idx-1] == '.' {
+				return true
+			}
+			start = idx + 1
 		}
 	}
 	return false
@@ -207,16 +234,14 @@ func hasEmbedPattern(url string) bool {
 func HasMediaReference(content string) bool {
 	n := len(content)
 	for i := 0; i < n; i++ {
-		// mediaFirstByte (pre-indexed under both ASCII cases of each signature's
-		// first byte, like mediaPatterns) rejects non-candidate bytes with a
-		// single bool load before the slice-header lookup below.
-		if !mediaFirstByte[content[i]] {
-			continue
-		}
-		bucket := mediaPatterns[content[i]]
-		for _, sig := range bucket {
-			if asciiFoldHasPrefix(content[i:], sig) {
-				return true
+		// mediaScanClass (pre-indexed under both ASCII cases of each
+		// signature's first byte) rejects non-candidate bytes with a single
+		// one-byte table load before the bucket lookup below.
+		if class := mediaScanClass[content[i]]; class != 0 {
+			for _, sig := range mediaScanBuckets[class-1] {
+				if asciiFoldHasPrefix(content[i:], sig) {
+					return true
+				}
 			}
 		}
 	}
@@ -242,7 +267,7 @@ func asciiFoldHasPrefix(s, prefix string) bool {
 }
 
 // mediaURLRunDisallowed lists the bytes excluded by the media-URL run class
-// [^\s<>"',;)}\]]: Go's regexp \s is [\t\n\f\r ], plus the eight delimiters
+// [^\s<>"',;)}\]]: Go's regexp \s is [\t\n\f\r ], plus the nine delimiters
 // that terminate a URL in running HTML text ('\' is written escaped in the
 // class only to close it — a backslash IS an allowed run byte).
 const mediaURLRunDisallowed = "\t\n\f\r <>\"',;)}]"
@@ -336,10 +361,16 @@ func matchMediaURLAt(s string, p int, exts [256][]string) string {
 	q += 3
 
 	// Greedy run of allowed bytes. runEnd lands on the first disallowed byte,
-	// the end of input, or the {1,500} cap.
+	// the end of input, or the {1,500} cap — which counts RUNES, matching the
+	// quantifier of the regex this reproduces: Go's regexp counts repetitions
+	// in runes, and a byte-counted cap truncated multibyte URLs (a 250-CJK-
+	// character URL is 750 bytes) that the oracle pattern still matched.
 	runEnd := q
-	for runEnd < n && runEnd-q < mediaURLMaxRun && mediaURLRunAllowed[s[runEnd]] {
-		runEnd++
+	runes := 0
+	for runEnd < n && runes < mediaURLMaxRun && mediaURLRunAllowed[s[runEnd]] {
+		_, width := utf8.DecodeRuneInString(s[runEnd:])
+		runEnd += width
+		runes++
 	}
 	if runEnd == q {
 		return "" // {1,500} requires at least one byte

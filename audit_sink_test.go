@@ -358,11 +358,11 @@ func TestWriterAuditSinkWriteError(t *testing.T) {
 // AuditCollector — integration: RecordBlockedTag/Attr/URL via sanitization
 // ---------------------------------------------------------------------------
 
-// TestAuditRecorderAdapterViaExtraction exercises the auditRecorderAdapter
+// TestAuditRecorderViaExtraction exercises the *auditCollector recorder
 // methods (RecordBlockedTag/Attr/URL, all at 0%) by running extraction with
 // audit enabled on HTML containing dangerous tags, attributes, and URLs. The
 // sanitizer calls the adapter, which forwards to the collector.
-func TestAuditRecorderAdapterViaExtraction(t *testing.T) {
+func TestAuditRecorderViaExtraction(t *testing.T) {
 	t.Parallel()
 
 	cfg := DefaultConfig()
@@ -416,13 +416,16 @@ func TestAuditRecorderAdapterViaExtraction(t *testing.T) {
 
 // TestAuditRecorderAdapterNilCollector verifies the nil-collector branches of
 // auditRecorderAdapter are safe.
-func TestAuditRecorderAdapterNilCollector(t *testing.T) {
+func TestAuditRecorderNilCollector(t *testing.T) {
 	t.Parallel()
 
-	a := &auditRecorderAdapter{collector: nil}
-	a.RecordBlockedTag("script") // must not panic
-	a.RecordBlockedAttr("onclick", "evil()")
-	a.RecordBlockedURL("javascript:alert(1)", "xss")
+	// *auditCollector itself satisfies internal.AuditRecorder, and every
+	// Record method is nil-receiver safe (the former forwarding adapter's
+	// only added value).
+	var c *auditCollector
+	c.RecordBlockedTag("script") // must not panic
+	c.RecordBlockedAttr("onclick", "evil()")
+	c.RecordBlockedURL("javascript:alert(1)", "xss")
 }
 
 // TestAuditCollectorWait covers the non-nil Wait path (50% → 100%).
@@ -461,6 +464,64 @@ func TestAuditCollectorRecordPathTraversal(t *testing.T) {
 		}
 		if entries[0].EventType != AuditEventPathTraversal {
 			t.Errorf("EventType = %q, want %q", entries[0].EventType, AuditEventPathTraversal)
+		}
+		// SECURITY: Path must carry only the base filename (documented
+		// contract); the raw path must not appear unless IncludeRawValues
+		// is explicitly enabled.
+		if entries[0].Path != "passwd" {
+			t.Errorf("Path = %q, want base filename %q", entries[0].Path, "passwd")
+		}
+		if entries[0].RawValue != "" {
+			t.Errorf("RawValue = %q, want empty when IncludeRawValues=false", entries[0].RawValue)
+		}
+	})
+
+	t.Run("path sanitized to base filename", func(t *testing.T) {
+		t.Parallel()
+		cfg := AuditConfig{Enabled: true, LogPathTraversal: true}
+		c := newAuditCollector(cfg)
+		defer func() { _ = c.Close() }()
+
+		cases := []struct {
+			input, want string
+		}{
+			{"../../../etc/passwd", "passwd"},
+			{`..\..\Windows\System32\config\SAM`, "SAM"}, // Windows separators
+			{"/etc/shadow", "shadow"},                    // absolute path
+			{"passwd", "passwd"},                         // no separator
+			{"/", ""},                                    // separator only
+			{"", ""},                                     // empty
+		}
+		for _, tc := range cases {
+			c.RecordPathTraversal(tc.input)
+		}
+		entries := c.GetEntries()
+		if len(entries) != len(cases) {
+			t.Fatalf("expected %d entries, got %d", len(cases), len(entries))
+		}
+		for i, tc := range cases {
+			if entries[i].Path != tc.want {
+				t.Errorf("entry %d (%q): Path = %q, want %q", i, tc.input, entries[i].Path, tc.want)
+			}
+		}
+	})
+
+	t.Run("raw value kept when IncludeRawValues", func(t *testing.T) {
+		t.Parallel()
+		cfg := AuditConfig{Enabled: true, LogPathTraversal: true, IncludeRawValues: true}
+		c := newAuditCollector(cfg)
+		defer func() { _ = c.Close() }()
+
+		c.RecordPathTraversal("../../../etc/passwd")
+		entries := c.GetEntries()
+		if len(entries) != 1 {
+			t.Fatalf("expected 1 entry, got %d", len(entries))
+		}
+		if entries[0].Path != "passwd" {
+			t.Errorf("Path = %q, want %q", entries[0].Path, "passwd")
+		}
+		if entries[0].RawValue != "../../../etc/passwd" {
+			t.Errorf("RawValue = %q, want the full sanitized raw path", entries[0].RawValue)
 		}
 	})
 

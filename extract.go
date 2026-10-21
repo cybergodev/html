@@ -70,25 +70,38 @@ func escapeMarkdownText(s string) string {
 	return s
 }
 
-// escapeMarkdownURLDest percent-encodes the parentheses in a Markdown
-// link/image destination. An unescaped ')' would terminate the destination
-// early and spill the rest of the URL into rendered text. Percent-encoding —
-// rather than backslash-escaping — keeps the destination a valid URL that
-// survives copy-paste. Fast path: most destinations contain no parentheses.
+// markdownURLDestReplacer percent-encodes the bytes that would break a
+// Markdown link/image destination.
+var markdownURLDestReplacer = strings.NewReplacer(
+	"(", "%28",
+	")", "%29",
+	" ", "%20",
+)
+
+// escapeMarkdownURLDest percent-encodes the parentheses and spaces in a
+// Markdown link/image destination. An unescaped ')' terminates the
+// destination early and spills the rest of the URL into rendered text, and
+// per CommonMark unescaped whitespace also terminates it — so a destination
+// like "my file.png" rendered as broken text rather than a link.
+// Percent-encoding — rather than backslash-escaping — keeps the destination
+// a valid URL that survives copy-paste. Fast path: most destinations contain
+// none of these bytes.
 func escapeMarkdownURLDest(url string) string {
-	if !strings.ContainsAny(url, "()") {
+	if !strings.ContainsAny(url, "() ") {
 		return url
 	}
-	return strings.ReplaceAll(strings.ReplaceAll(url, "(", "%28"), ")", "%29")
+	return markdownURLDestReplacer.Replace(url)
 }
 
 // Timeout goroutine management constants.
 // These prevent goroutine leaks when many timeout operations occur.
 const (
 	// maxTimeoutGoroutines limits concurrent timeout goroutines to prevent
-	// resource exhaustion. Value 1000 allows ~1GB of goroutine stack overhead
-	// assuming 1MB stack per goroutine, which is a reasonable safety limit.
-	// When exceeded, new operations return ErrProcessingTimeout immediately.
+	// resource exhaustion. Goroutine stacks start at a few KB and grow on
+	// demand, so 1000 concurrent watchdog goroutines is a modest, bounded cost;
+	// the cap exists to keep a burst of timed operations from spawning them
+	// without limit. When exceeded, new operations return an error wrapping
+	// ErrProcessingTimeout immediately rather than queuing another goroutine.
 	maxTimeoutGoroutines = 1000
 )
 
@@ -329,6 +342,12 @@ func (p *Processor) extractCoreWithContext(ctx context.Context, htmlBytes []byte
 			if cachedResult, ok := cached.(*Result); ok {
 				p.stats.cacheHits.Add(1)
 				p.stats.totalProcessed.Add(1)
+				// A cache hit is an extraction too: record its (near-zero)
+				// elapsed time so AverageProcessTime is a true mean over all
+				// extractions rather than a hybrid whose numerator excluded
+				// hits while its divisor counted them, trending toward zero
+				// as the hit ratio rose.
+				p.stats.totalProcessTime.Add(int64(time.Since(startTime)))
 				return cloneResult(cachedResult), nil
 			}
 		}
@@ -430,13 +449,15 @@ func (p *Processor) processContentWithContext(ctx context.Context, htmlContent s
 	default:
 	}
 
-	// Validate DOM depth BEFORE any recursive traversal. SanitizeDOM (and other
-	// downstream passes) recurse without an internal depth cap, so a
-	// pathologically deep document could exhaust the call stack before this
-	// iterative guard rejected it. Running the O(nodes) iterative depth check
-	// first bounds every later recursive pass to MaxDepth. Depth is measured on
-	// the raw parsed tree; sanitization only removes nodes, so this is at most
-	// marginally stricter than the previous sanitize-then-validate order.
+	// Validate DOM depth BEFORE any recursive traversal. The extraction passes
+	// below (article-node folding, text extraction, media walks) recurse without
+	// an internal depth cap, so a pathologically deep document could exhaust the
+	// call stack before those passes rejected it; SanitizeDOM itself is iterative
+	// but runs here too, on the same depth-validated tree. Running the O(nodes)
+	// iterative depth check first bounds every later recursive pass to MaxDepth.
+	// Depth is measured on the raw parsed tree; sanitization only removes nodes,
+	// so this is at most marginally stricter than the previous
+	// sanitize-then-validate order.
 	if err := p.validateDepthTraversal(doc, 0); err != nil {
 		return nil, err
 	}
@@ -445,7 +466,7 @@ func (p *Processor) processContentWithContext(ctx context.Context, htmlContent s
 	// depth-validated tree, so its recursion is bounded by MaxDepth.
 	if p.config.EnableSanitization {
 		if p.audit != nil && p.config.Audit.Enabled {
-			internal.SanitizeDOM(doc, p.auditAdapter)
+			internal.SanitizeDOM(doc, p.audit)
 		} else {
 			internal.SanitizeDOM(doc, internal.NoOpAuditRecorder{})
 		}
@@ -600,7 +621,7 @@ func withTimeout[T any](parent context.Context, timeout time.Duration, fn func(c
 		current := activeTimeoutGoroutines.Load()
 		if current >= maxTimeoutGoroutines {
 			var zero T
-			return zero, fmt.Errorf("%w: too many concurrent operations (%d active)", ErrProcessingTimeout, current)
+			return zero, fmt.Errorf("%w: %d watchdogs active", ErrTooManyConcurrentOps, current)
 		}
 		if activeTimeoutGoroutines.CompareAndSwap(current, current+1) {
 			break
@@ -634,40 +655,56 @@ func withTimeout[T any](parent context.Context, timeout time.Duration, fn func(c
 			}()
 			return fn(ctx)
 		}()
-		// Try to send the result. If context is done, the result is discarded.
-		// This is intentional - we don't want to block if nobody is listening.
-		select {
-		case resultChan <- result{res: res, err: err}:
-			// Result sent successfully
-		case <-ctx.Done():
-			// Context cancelled/timed out, discard result
-		}
+		// Deliver the result unconditionally: resultChan is buffered with
+		// capacity 1 and this goroutine is its only sender, so the send never
+		// blocks — and racing it against ctx.Done() could discard a fully
+		// computed result that the caller's prefer-result select below was
+		// about to accept.
+		resultChan <- result{res: res, err: err}
 	}()
 
+	// Prefer a completed result when both cases are ready: fn finishing in
+	// the same instant the deadline fires made the blocking select below pick
+	// either case pseudo-randomly, so a successfully computed extraction
+	// could be reported as a timeout, run to run. Try the non-blocking
+	// receive first.
+	select {
+	case res := <-resultChan:
+		return res.res, res.err
+	default:
+	}
 	select {
 	case res := <-resultChan:
 		return res.res, res.err
 	case <-ctx.Done():
 		var zero T
-		// Return the context error so callers can distinguish a deadline (which
-		// they map to ErrProcessingTimeout) from a user cancellation. The
-		// goroutine above receives the same ctx and winds down at its next
-		// cooperative check; the buffered resultChan keeps it from blocking.
+		// Return the context error so callers can distinguish a deadline from
+		// a user cancellation. runWithTimeout normalizes it to
+		// ErrProcessingTimeout only when the parent context is still live
+		// (the processing timeout fired); a user deadline or cancellation
+		// passes through unchanged. The goroutine above receives the same ctx
+		// and winds down at its next cooperative check; the buffered
+		// resultChan keeps it from blocking.
 		return zero, ctx.Err()
 	}
 }
 
 // runWithTimeout executes fn under the processor's configured ProcessingTimeout
 // (if set), deriving the deadline from ctx so cooperative cancellation checks
-// inside fn honor both the user's context and the timeout. A fired deadline
-// surfaces as context.DeadlineExceeded and is normalized to ErrProcessingTimeout;
-// a user-initiated cancellation surfaces as context.Canceled and is returned
-// unchanged. It is a free function (not a method) because Go does not permit
-// type parameters on methods.
+// inside fn honor both the user's context and the timeout. The derived context
+// expires with context.DeadlineExceeded both when the processing timeout
+// elapses and when the caller's own (earlier) deadline does; only the former is
+// normalized to ErrProcessingTimeout — a user deadline or cancellation is
+// returned unchanged, matching the documented contract of the *WithContext
+// entry points and keeping the audit log from misattributing a user
+// cancellation to the library's timeout. It is a free function (not a method)
+// because Go does not permit type parameters on methods.
 func runWithTimeout[T any](p *Processor, ctx context.Context, fn func(context.Context) (T, error)) (T, error) {
 	if p.config.ProcessingTimeout > 0 {
 		result, err := withTimeout(ctx, p.config.ProcessingTimeout, fn)
-		if errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			// The parent context is still live, so the deadline that fired
+			// is the processing timeout itself.
 			err = ErrProcessingTimeout
 		}
 		return result, err
@@ -772,10 +809,25 @@ func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string) 
 		}
 
 		tb := internal.GetTrackedBuilder()
-		imageCounter := 0
-		linkCounter := 0
-		internal.ExtractTextWithStructureAndImages(contentNode, tb, &imageCounter, &linkCounter, p.config.TableFormat)
-		textWithPlaceholders := internal.CleanText(tb.String())
+		var imageCounter, linkCounter int
+		var imgCounter, linkCounterPtr *int
+		// Only emit the placeholder kinds a formatter will consume. A "none"
+		// format has no formatter, so its tokens would survive both formatting
+		// passes verbatim and leak into Text as literal [IMAGE:n]/[LINK:n]
+		// text when just one of the two formats is enabled. ("placeholder"
+		// keeps [IMAGE:n] visible by design and still needs the numbering.)
+		// Positions in result.Images/result.Links come from the independent
+		// counters in extractImagesAndLinks and are unaffected by this.
+		if imageFormat != "none" {
+			imgCounter = &imageCounter
+		}
+		if linkFormat != "none" {
+			linkCounterPtr = &linkCounter
+		}
+		internal.ExtractTextWithStructureAndImages(contentNode, tb, imgCounter, linkCounterPtr, p.config.TableFormat)
+		// CleanTextBytes reads the builder's buffer directly, skipping the
+		// tb.String() intermediate copy the string entry point would make.
+		textWithPlaceholders := internal.CleanTextBytes(tb.Bytes())
 		internal.PutTrackedBuilder(tb)
 
 		// Apply formatters in order: images first, then links
@@ -825,17 +877,26 @@ func (p *Processor) extractTitle(doc *stdxhtml.Node) string {
 	// traversal. The previous implementation issued up to three separate
 	// FindElementByTag calls (one full tree walk each); documents lacking a
 	// <title> or <h1> — common — paid for all three. Priority is unchanged:
-	// title → h1 → h2, each preferring a non-empty value.
+	// title → h1 → h2, each preferring a non-empty value. The nil guards keep
+	// the FIRST occurrence of each tag: without them the walk (which runs
+	// until all three candidates are found) kept overwriting the candidates,
+	// so the fallback title became the LAST h1/h2 before the stopping point.
 	var titleNode, h1Node, h2Node *stdxhtml.Node
 	internal.WalkNodes(doc, func(n *stdxhtml.Node) bool {
 		if n.Type == stdxhtml.ElementNode {
 			switch n.Data {
 			case "title":
-				titleNode = n
+				if titleNode == nil {
+					titleNode = n
+				}
 			case "h1":
-				h1Node = n
+				if h1Node == nil {
+					h1Node = n
+				}
 			case "h2":
-				h2Node = n
+				if h2Node == nil {
+					h2Node = n
+				}
 			}
 		}
 		// Keep walking until all three candidates have been located.
@@ -896,7 +957,10 @@ func (p *Processor) extractTextContent(node *stdxhtml.Node, tableFormat string) 
 	// per-call growth allocations or the GC churn they cause.
 	tb := internal.GetTrackedBuilder()
 	internal.ExtractTextWithStructureAndImages(node, tb, nil, nil, tableFormat)
-	result := internal.CleanText(tb.String())
+	// CleanTextBytes reads the builder's buffer directly, skipping the
+	// tb.String() intermediate copy the string entry point would make (the
+	// returned string is a fresh allocation and never aliases the pooled buffer).
+	result := internal.CleanTextBytes(tb.Bytes())
 	internal.PutTrackedBuilder(tb)
 	return result
 }
@@ -946,6 +1010,14 @@ func (p *Processor) formatInlineImages(textWithPlaceholders string, images []Ima
 			_, _ = htmlImg.WriteString(`" alt="`)
 			_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].Alt))
 			_, _ = htmlImg.WriteString(`"`)
+			// Mirror formatInlineLinks' html branch: the advisory title is a
+			// native HTML attribute, and ImageInfo.Title was collected but
+			// never rendered in either inline format.
+			if images[i].Title != "" {
+				_, _ = htmlImg.WriteString(` title="`)
+				_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].Title))
+				_, _ = htmlImg.WriteString(`"`)
+			}
 			if images[i].Width != "" {
 				_, _ = htmlImg.WriteString(` width="`)
 				_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].Width))
@@ -1094,6 +1166,19 @@ func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkI
 	return tb.String()
 }
 
+// imageScratchPool and linkScratchPool back extractImagesAndLinks' append
+// scratch. Results are built in a pooled, capacity-retaining slice and copied
+// out once at exact size: the previous fixed-cap preallocations
+// (make([]LinkInfo, 0, 128) alone) cost ~9.5 KB per extraction on every
+// document — link-sparse ones included — and was a profiled ~8% of allocation
+// bytes. The pooled scratch amortizes growth to zero across calls, and the
+// exact-size copy gives the returned slice no surplus capacity to carry into
+// the Result (and into cloneResult's copies).
+var (
+	imageScratchPool = internal.NewSlicePool[ImageInfo](initialSliceCap)
+	linkScratchPool  = internal.NewSlicePool[LinkInfo](initialSliceCap)
+)
+
 // extractImagesAndLinks collects images and/or links from node in a single
 // document-order traversal, assigning positions with the same semantics the
 // previous separate collectors used:
@@ -1108,18 +1193,32 @@ func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkI
 // previous two. Pass wantImages/wantLinks false to skip (and avoid allocating)
 // a kind; the traversal runs at most once.
 func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantLinks bool) (images []ImageInfo, links []LinkInfo) {
+	if !wantImages && !wantLinks {
+		return nil, nil
+	}
+
+	var imgBuf *[]ImageInfo
+	var linkBuf *[]LinkInfo
 	if wantImages {
-		images = make([]ImageInfo, 0, initialSliceCap)
+		imgBuf = imageScratchPool.Get()
+		defer imageScratchPool.Put(imgBuf)
 	}
 	if wantLinks {
-		links = make([]LinkInfo, 0, linksInitialCap)
-	}
-	if !wantImages && !wantLinks {
-		return images, links
+		linkBuf = linkScratchPool.Get()
+		defer linkScratchPool.Put(linkBuf)
 	}
 
 	imgPos, linkPos := 0, 0
-	internal.WalkNodes(node, func(n *stdxhtml.Node) bool {
+	// WalkAllNodes, not WalkNodes: this collector must observe exactly the
+	// same node set as the text pass (extractTextWithStructure), which
+	// recurses uncapped. WalkNodes stops silently at maxWalkNodes (50,000),
+	// so on larger documents the collector dropped every img/a past the cap
+	// while the text pass kept emitting [IMAGE:n]/[LINK:n] placeholders for
+	// them — unmatched tokens then leaked into Text verbatim and their URLs
+	// were silently dropped. MaxInputSize bounds the input bytes and the
+	// parse plus the text pass already visit every node, so the uncapped
+	// walk adds no asymptotic work.
+	internal.WalkAllNodes(node, func(n *stdxhtml.Node) bool {
 		if n.Type != stdxhtml.ElementNode {
 			return true
 		}
@@ -1133,7 +1232,7 @@ func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantL
 				return true
 			}
 			imgPos++
-			images = append(images, img)
+			*imgBuf = append(*imgBuf, img)
 		case "a":
 			if !wantLinks {
 				return true
@@ -1142,11 +1241,22 @@ func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantL
 			link := p.parseLinkNode(n)
 			link.Position = linkPos
 			if link.URL != "" {
-				links = append(links, link)
+				*linkBuf = append(*linkBuf, link)
 			}
 		}
 		return true
 	})
+
+	// Copy out at exact size. make(..., 0) on an empty result keeps the
+	// historical non-nil empty slice (marshals as [] rather than null).
+	if wantImages {
+		images = make([]ImageInfo, len(*imgBuf))
+		copy(images, *imgBuf)
+	}
+	if wantLinks {
+		links = make([]LinkInfo, len(*linkBuf))
+		copy(links, *linkBuf)
+	}
 	return images, links
 }
 
@@ -1208,6 +1318,17 @@ func (p *Processor) parseLinkNode(n *stdxhtml.Node) LinkInfo {
 	return link
 }
 
+// asciiWordSpace marks the ASCII bytes that end a word for countWords: the
+// four whitespace bytes that separate words. A table lookup replaces the
+// four-way comparison chain in the per-byte loop (countWords was a profiled
+// ~2% of Extract CPU on a realistic document).
+var asciiWordSpace = [256]bool{
+	' ':  true,
+	'\t': true,
+	'\n': true,
+	'\r': true,
+}
+
 // countWords counts whitespace-separated words, additionally counting each
 // CJK ideograph, kana, or Hangul syllable as one word. CJK text is
 // conventionally written without inter-word spaces, so a whitespace-only
@@ -1223,7 +1344,7 @@ func (p *Processor) countWords(text string) int {
 	for i := 0; i < n; {
 		c := text[i]
 		if c < utf8.RuneSelf {
-			if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			if asciiWordSpace[c] {
 				inWord = false
 			} else if !inWord {
 				inWord = true

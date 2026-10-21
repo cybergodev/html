@@ -27,13 +27,12 @@ func ScoreAttributes(n *html.Node) int {
 
 // contentMetrics holds all metrics collected during a single DOM traversal.
 type contentMetrics struct {
-	paragraphCount  int
-	headingCount    int
-	textLength      int
-	linkTextLength  int
-	totalTextLength int
-	tagCount        int
-	commaCount      int
+	paragraphCount int
+	headingCount   int
+	textLength     int
+	linkTextLength int
+	tagCount       int
+	commaCount     int
 }
 
 // metricsSkipTags lists tags whose subtrees contain no extractable main-content
@@ -101,7 +100,6 @@ func collectContentMetrics(node *html.Node) contentMetrics {
 			text := strings.TrimSpace(textData)
 			if text != "" {
 				metrics.textLength += len(text)
-				metrics.totalTextLength += len(text)
 				metrics.commaCount += strings.Count(text, ",") + strings.Count(text, "，")
 
 				// Check if this text is inside a link
@@ -135,11 +133,14 @@ func calculateDensityFromMetrics(m contentMetrics) float64 {
 }
 
 // calculateLinkDensityFromMetrics calculates link density from collected metrics.
+// The denominator is textLength: the two were kept as separate always-equal
+// fields (a historical "total" distinction never implemented), and the
+// link-density read was the only consumer of the redundant one.
 func calculateLinkDensityFromMetrics(m contentMetrics) float64 {
-	if m.totalTextLength == 0 {
+	if m.textLength == 0 {
 		return 0.0
 	}
-	return float64(m.linkTextLength) / float64(m.totalTextLength)
+	return float64(m.linkTextLength) / float64(m.textLength)
 }
 
 // MatchesPattern checks if value contains any pattern from the map with word boundaries.
@@ -176,9 +177,11 @@ func CountTags(n *html.Node) int {
 	return count
 }
 
-// CountChildElements counts child elements of specific tag type.
+// CountDescendantElements counts DESCENDANT elements of the given tag type at any
+// depth below n (n itself excluded), despite the historical name — it walks
+// the whole subtree, not just direct children.
 // Exported for testing only.
-func CountChildElements(n *html.Node, tag string) int {
+func CountDescendantElements(n *html.Node, tag string) int {
 	count := 0
 	WalkNodes(n, func(node *html.Node) bool {
 		if node != n && node.Type == html.ElementNode && node.Data == tag {

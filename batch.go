@@ -186,8 +186,21 @@ func (p *Processor) runBatch(extractors []extractFunc) *BatchResult {
 }
 
 // runBatchWithContext executes a batch of extractions concurrently with context support.
-func (p *Processor) runBatchWithContext(ctx context.Context, extractors []extractFunc) *BatchResult {
-	br := &BatchResult{
+func (p *Processor) runBatchWithContext(ctx context.Context, extractors []extractFunc) (br *BatchResult) {
+	// The batch API returns *BatchResult, not (value, error), so a panic on
+	// this caller-side preamble — e.g. a hand-built zero-value Processor whose
+	// config is nil (make(chan…, p.config.WorkerPoolSize) below), or a nil
+	// ctx in the Done() selects — would escape the public API unrecovered.
+	// Report it uniformly like the Extract family does: as ErrInternalPanic
+	// per item. Panics inside spawned workers are recovered separately in
+	// each worker's defer; this backstop only covers the caller goroutine.
+	defer func() {
+		if r := recover(); r != nil {
+			br = uniformErrorBatch(len(extractors), fmt.Errorf("%w: %v", ErrInternalPanic, r))
+		}
+	}()
+
+	br = &BatchResult{
 		Results: make([]*Result, len(extractors)),
 		Errors:  make([]error, len(extractors)),
 	}
@@ -291,7 +304,7 @@ func (p *Processor) prepareBatch(count int) *BatchResult {
 	}
 	if count > maxBatchSize {
 		return uniformErrorBatch(count,
-			fmt.Errorf("html: batch size %d exceeds maximum %d", count, maxBatchSize))
+			fmt.Errorf("%w: %d exceeds maximum %d", ErrBatchTooLarge, count, maxBatchSize))
 	}
 	if count == 0 {
 		return &BatchResult{Results: []*Result{}, Errors: []error{}}

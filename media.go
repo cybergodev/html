@@ -1,6 +1,7 @@
 package html
 
 import (
+	htmlstd "html"
 	"strings"
 
 	"github.com/cybergodev/html/internal"
@@ -306,8 +307,12 @@ func (p *Processor) extractTagAttributes(htmlContent, tagName string, attrNames 
 			}
 		}
 
-		// Find the end of the opening tag
-		tagEnd := strings.IndexByte(htmlContent[tagStart:], '>')
+		// Find the end of the opening tag, skipping quoted attribute values:
+		// HTML permits '>' inside quotes, and cutting at the first one both
+		// truncated the value being read and left the scan position inside
+		// the tag — any real attribute after a '>' within an earlier quoted
+		// value was never reached.
+		tagEnd := indexTagEnd(htmlContent[tagStart:])
 		if tagEnd == -1 {
 			break
 		}
@@ -318,7 +323,12 @@ func (p *Processor) extractTagAttributes(htmlContent, tagName string, attrNames 
 		// Extract requested attributes from this tag
 		for _, attrName := range attrNames {
 			if value := extractAttributeValue(tagContent, attrName); value != "" {
-				results = append(results, value)
+				// Attribute values here come from RAW, pre-parse HTML — unlike
+				// the DOM paths, no parser has decoded character references
+				// yet. Decode exactly one level so URLs extracted from tags the
+				// sanitizer removes match their DOM-extracted counterparts
+				// ("?a=1&amp;b=2" → "?a=1&b=2").
+				results = append(results, htmlstd.UnescapeString(value))
 			}
 		}
 
@@ -328,40 +338,54 @@ func (p *Processor) extractTagAttributes(htmlContent, tagName string, attrNames 
 	return results
 }
 
-// findTagIgnoreCase performs case-insensitive tag search more efficiently
-// by using a combination of Index for candidate positions and EqualFold for verification
-func findTagIgnoreCase(html, lowerTag string) int {
-	if len(lowerTag) == 0 || len(html) < len(lowerTag) {
-		return -1
-	}
-
-	// Fast path: try exact match first (most common case)
-	if idx := strings.Index(html, lowerTag); idx >= 0 {
-		return idx
-	}
-
-	// For case-insensitive search, check positions where first character matches (case-insensitive)
-	tagLen := len(lowerTag)
-	firstChar := lowerTag[0]
-
-	for i := 0; i <= len(html)-tagLen; i++ {
-		c := html[i]
-		// Quick ASCII case-insensitive check for first character
-		cfc := c
-		if cfc >= 'A' && cfc <= 'Z' {
-			cfc += 32
-		}
-		if cfc != firstChar {
-			continue
-		}
-
-		// Found potential match, verify with EqualFold for full case-insensitive comparison
-		candidate := html[i : i+tagLen]
-		if strings.EqualFold(candidate, lowerTag) {
+// indexTagEnd returns the index of the first '>' in s that lies outside a
+// quoted attribute value, or -1. An unterminated quote falls back to the raw
+// first '>' — the pre-existing truncation behavior (pinned by
+// media_internal_test.go) — so a value is still read from a tag whose source
+// was cut inside a quoted value.
+func indexTagEnd(s string) int {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"', '\'':
+			end := strings.IndexByte(s[i+1:], s[i])
+			if end < 0 {
+				return strings.IndexByte(s, '>')
+			}
+			i += end + 1
+		case '>':
 			return i
 		}
 	}
+	return -1
+}
 
+// findTagIgnoreCase returns the index of the first occurrence of lowerTag
+// (e.g. "<iframe") in html, comparing ASCII case-insensitively, or -1 if
+// absent. The scan jumps between '<' candidates with the vectorized
+// strings.IndexByte and verifies each with EqualFold, so the FIRST match in
+// document order wins regardless of letter case. A strings.Index exact-match
+// fast path here would jump to a later exact-case occurrence and permanently
+// skip an earlier mixed-case tag (e.g. <IFRAME> before <iframe>), silently
+// dropping its URLs from extraction.
+func findTagIgnoreCase(html, lowerTag string) int {
+	tagLen := len(lowerTag)
+	if tagLen == 0 || len(html) < tagLen {
+		return -1
+	}
+	for i := 0; i+tagLen <= len(html); {
+		if html[i] != '<' {
+			next := strings.IndexByte(html[i:], '<')
+			if next < 0 {
+				return -1
+			}
+			i += next
+			continue
+		}
+		if strings.EqualFold(html[i:i+tagLen], lowerTag) {
+			return i
+		}
+		i++
+	}
 	return -1
 }
 
@@ -380,6 +404,21 @@ func extractAttributeValue(tagContent, attrName string) string {
 	// Case-insensitive search for the attribute
 	pos := 0
 	for pos <= tagLen-searchLen {
+		// Skip quoted attribute values: an occurrence of the name inside
+		// another attribute's value (title="video src=here") is text, not an
+		// attribute, and the first such decoy match used to win — the real
+		// src after it was never read. Advancing to the closing quote keeps
+		// name-position matches outside values; an unterminated quote means
+		// the tag was truncated inside a value (the caller cut it at a '>'),
+		// so no further name-position match is trustworthy.
+		if q := tagContent[pos]; q == '"' || q == '\'' {
+			end := strings.IndexByte(tagContent[pos+1:], q)
+			if end < 0 {
+				break
+			}
+			pos += end + 2
+			continue
+		}
 		match := true
 		for j := 0; j < searchLen; j++ {
 			c := tagContent[pos+j]

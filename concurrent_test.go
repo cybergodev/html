@@ -460,16 +460,16 @@ func TestConcurrentPoolAccess(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	// Test BuilderPool
+	// Test byteBufPool
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
-				sb := internal.GetBuilder()
-				sb.WriteString("test string")
-				_ = sb.String()
-				internal.PutBuilder(sb)
+				bp := internal.GetByteBuf()
+				*bp = append(*bp, "test string"...)
+				_ = string(*bp)
+				internal.PutByteBuf(bp)
 			}
 		}()
 	}

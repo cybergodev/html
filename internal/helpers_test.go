@@ -187,9 +187,11 @@ func TestCleanText(t *testing.T) {
 			want  string
 		}{
 			{
-				name:  "HTML entities",
+				// Entities pass through: the HTML parser already decoded them
+				// once, and re-decoding here would strip a second escape level.
+				name:  "HTML entities passthrough",
 				input: "&lt;html&gt; &amp;",
-				want:  "<html> &",
+				want:  "&lt;html&gt; &amp;",
 			},
 			{
 				name:  "empty",
@@ -685,51 +687,6 @@ func TestGetListPrefix(t *testing.T) {
 	}
 }
 
-func TestReplaceEntityAt(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name         string
-		text         string
-		pos          int
-		wantRepl     string
-		wantConsumed int
-	}{
-		// Boundary / error arms
-		{"pos out of range", "abc", 3, "&", 1},
-		{"non-ampersand at pos", "abc", 0, "&", 1},
-		{"lone trailing ampersand", "a&", 1, "&", 1},
-		{"ampersand alone at end", "&", 0, "&", 1},
-		{"named entity without semicolon", "&abc", 0, "&", 1},
-		// Named-entity switch cases
-		{"amp entity", "&amp;", 0, "&", 5},
-		{"nbsp entity", "&nbsp;", 0, " ", 6},
-		{"lt entity", "&lt;", 0, "<", 4},
-		{"gt entity", "&gt;", 0, ">", 4},
-		{"quot entity", "&quot;", 0, "\"", 6},
-		{"apos entity", "&apos;", 0, "'", 6},
-		{"copy entity", "&copy;", 0, "©", 6},
-		{"reg entity", "&reg;", 0, "®", 5},
-		{"mdash entity", "&mdash;", 0, "—", 7},
-		{"ndash entity", "&ndash;", 0, "–", 7},
-		// Numeric entities
-		{"decimal numeric entity", "&#65;", 0, "A", 5},
-		{"hex numeric entity", "&#x41;", 0, "A", 6},
-		// Mid-string entity (pos != 0)
-		{"mid-string amp entity", "x&amp;y", 1, "&", 5},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			repl, consumed := replaceEntityAt(tt.text, tt.pos)
-			if repl != tt.wantRepl || consumed != tt.wantConsumed {
-				t.Errorf("replaceEntityAt(%q, %d) = (%q, %d), want (%q, %d)",
-					tt.text, tt.pos, repl, consumed, tt.wantRepl, tt.wantConsumed)
-			}
-		})
-	}
-}
-
 // TestReplaceNumericEntity covers decimal/hex decoding, the NBSP special case,
 // surrogate pairs, out-of-range code points, and every rejection path (no '#',
 // no semicolon, empty entity, oversized entity, invalid hex/decimal digits,
@@ -854,8 +811,8 @@ func TestNormalizeText(t *testing.T) {
 		{"carriage return dropped", "a\rb", "ab"},
 		{"cr lf pair", "a\r\nb", "a b"},
 		{"nbsp to space", "a b", "a b"},
-		{"ampersand only path", "a&amp;b", "a&b"},
-		{"combined entity and newline", "x&amp;\ny", "x& y"},
+		{"ampersand passthrough", "a&amp;b", "a&amp;b"},
+		{"combined entity and newline", "x&amp;\ny", "x&amp; y"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -897,12 +854,12 @@ func TestCleanTextClassificationRewrite(t *testing.T) {
 		{"space then nbsp becomes a pair", "x  y", "x y"},
 		{"nbsp across lines", "l1\n \nl2", "l1\n\nl2"},
 		{"ampersand only", "Tom & Jerry", "Tom & Jerry"},
-		{"entity with newlines", "a &amp;\nb", "a &\nb"},
+		{"entity with newlines", "a &amp;\nb", "a &amp;\nb"},
 		{"checkbox glyphs", "a☒b☐c☑d", "a[X]b[ ]c[X]d"},
 		{"trailing space on sole line", "word  ", "word"},
 		{"double space no newline", "a  b", "a b"},
 		{"tab no newline", "a\tb", "a b"},
-		{"uppercase entity path", "A&amp;B", "A&B"},
+		{"entity passthrough", "A&amp;B", "A&amp;B"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

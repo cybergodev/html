@@ -359,7 +359,7 @@ func TestIsNonContentElement(t *testing.T) {
 	}
 }
 
-func TestCountChildElements(t *testing.T) {
+func TestCountDescendantElements(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -400,20 +400,20 @@ func TestCountChildElements(t *testing.T) {
 				return true
 			})
 
-			count := CountChildElements(divNode, tt.tag)
+			count := CountDescendantElements(divNode, tt.tag)
 			if count != tt.want {
-				t.Errorf("CountChildElements() = %d, want %d", count, tt.want)
+				t.Errorf("CountDescendantElements() = %d, want %d", count, tt.want)
 			}
 		})
 	}
 }
 
-func TestCountChildElementsNil(t *testing.T) {
+func TestCountDescendantElementsNil(t *testing.T) {
 	t.Parallel()
 
-	count := CountChildElements(nil, "p")
+	count := CountDescendantElements(nil, "p")
 	if count != 0 {
-		t.Errorf("CountChildElements(nil) = %d, want 0", count)
+		t.Errorf("CountDescendantElements(nil) = %d, want 0", count)
 	}
 }
 

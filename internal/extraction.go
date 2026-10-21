@@ -133,6 +133,50 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 				// generic block handling below so each nested data table is
 				// dispatched and rendered on its own terms.
 			} else {
+				// Burn placeholder positions for the subtree the table
+				// processor is about to consume. extractImagesAndLinks (root
+				// package) numbers every valid-src <img> and every <a> in the
+				// whole document, table cells included; the dispatch below
+				// returns without walking this table's children, so without
+				// these silent increments the counters fall out of lockstep
+				// and every [IMAGE:n]/[LINK:n] after the table would be
+				// substituted with the wrong entry.
+				if imageCounter != nil || linkCounter != nil {
+					WalkNodes(node, func(c *html.Node) bool {
+						if c.Type != html.ElementNode {
+							return true
+						}
+						switch c.Data {
+						case "img":
+							if imageCounter != nil && imgHasValidSrc(c) {
+								*imageCounter++
+							}
+						case "a":
+							if linkCounter != nil {
+								*linkCounter++
+							}
+						}
+						return true
+					})
+				}
+				// A <caption> is visible rendered content, but the row-based
+				// table extractor below collects only <tr> subtrees and this
+				// dispatch returns without walking the subtree again —
+				// without this, the caption text vanished from every output
+				// format. Emit it as its own line ahead of the table
+				// (pipe-table Markdown has no caption element).
+				for child := node.FirstChild; child != nil; child = child.NextSibling {
+					if child.Type == html.ElementNode && child.Data == "caption" {
+						if text := GetTextContent(child); text != "" {
+							if tb.Len() > 0 && tb.LastChar != '\n' {
+								_ = tb.WriteByte('\n')
+							}
+							_, _ = tb.WriteString(text)
+							_ = tb.WriteByte('\n')
+						}
+						break
+					}
+				}
 				// Use the table processor for table extraction
 				TableProcessor().Extract(node, tb, tableFormat)
 				return
@@ -232,8 +276,6 @@ func CleanContentNode(node *html.Node) *html.Node {
 		return nil
 	}
 
-	toRemove := make([]*html.Node, 0, 8)
-
 	// Use pooled stack to avoid allocation
 	stackPtr := GetNodeSlice()
 	defer PutNodeSlice(stackPtr)
@@ -241,24 +283,25 @@ func CleanContentNode(node *html.Node) *html.Node {
 
 	stack = append(stack, node)
 
-	// Iterative traversal using explicit stack
+	// Iterative traversal using explicit stack. Marked children are detached
+	// immediately (saving next before RemoveChild, which clears the child's
+	// sibling links) instead of being collected into a toRemove slice for a
+	// second pass — that slice was one allocation per call. Detached subtrees
+	// are not pushed, so their descendants are never visited; the deferred
+	// removal loop this replaces achieved the same effect only incidentally,
+	// by removing nodes whose parents lived in already-detached subtrees.
 	for len(stack) > 0 {
 		n := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		for child := n.FirstChild; child != nil; child = child.NextSibling {
+		for child := n.FirstChild; child != nil; {
+			next := child.NextSibling
 			if child.Type == html.ElementNode && ShouldRemoveElement(child) {
-				toRemove = append(toRemove, child)
+				n.RemoveChild(child)
 			} else {
 				stack = append(stack, child)
 			}
-		}
-	}
-
-	// Remove marked nodes
-	for _, n := range toRemove {
-		if n.Parent != nil {
-			n.Parent.RemoveChild(n)
+			child = next
 		}
 	}
 
