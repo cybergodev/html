@@ -134,7 +134,13 @@ func main() {
 	fmt.Println("\n5. Batch Processing Errors")
 	fmt.Println("---------------------------")
 
-	processor2, err := html.New()
+	// Batch items can fail for different reasons: a malformed document, an
+	// oversize one, or a file that cannot be read. Set a per-document size
+	// limit so an oversize item fails with ErrInputTooLarge instead of being
+	// accepted (and instead of the parser rejecting deeply-nested input).
+	batchCfg := html.DefaultConfig()
+	batchCfg.MaxInputSize = 1024
+	processor2, err := html.New(batchCfg)
 	if err != nil {
 		log.Fatalf("Failed to create processor: %v", err)
 	}
@@ -142,7 +148,7 @@ func main() {
 
 	docs := [][]byte{
 		[]byte("<html><body><p>Doc 1 - Valid</p></body></html>"),
-		[]byte(""), // Empty - not an error, just empty result
+		[]byte(strings.Repeat("<div>", 600)), // Oversize → ErrInputTooLarge (exceeds MaxInputSize)
 		[]byte("<html><body><p>Doc 3 - Valid</p></body></html>"),
 	}
 
@@ -154,12 +160,20 @@ func main() {
 		if r != nil {
 			fmt.Printf("  Doc %d: %s (%d words)\n", i+1, r.Title, r.WordCount)
 		} else {
-			fmt.Printf("  Doc %d: nil result\n", i+1)
+			// Results[i] is nil exactly when the item failed; the matching
+			// error lives at Errors[i] (same index), and errors.Is still
+			// identifies the cause through the batch wrapper.
+			fmt.Printf("  Doc %d: nil result → %v", i+1, batchResult.Errors[i])
+			if errors.Is(batchResult.Errors[i], html.ErrInputTooLarge) {
+				fmt.Printf("  (errors.Is → ErrInputTooLarge)")
+			}
+			fmt.Println()
 		}
 	}
 
 	fmt.Println("\n✓ Continue processing on individual failures")
 	fmt.Println("✓ Track and report aggregate results")
+	fmt.Println("✓ Results[i] is nil ⇔ Errors[i] is non-nil (same index)")
 
 	// ============================================================
 	// 6. File Error Handling

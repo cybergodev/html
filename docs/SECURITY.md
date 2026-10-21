@@ -59,6 +59,16 @@ cfg.MaxDepth = 50 // Limit nesting to 50 levels
 - **Validation**: Cache size enforced with automatic eviction
 - **Cleanup**: Background cleanup of expired entries (configurable interval, default: 5 minutes)
 
+**Tree Traversal**
+- **Threat**: A document shaped to blow up a traversal's working set or CPU
+- **Mitigation**: Traversals are uncapped but bounded by the input itself: `MaxInputSize` bounds the parse and therefore the node count, and `MaxDepth` bounds nesting depth before any recursive pass runs. The iterative traversal stack holds one pointer per pending node, so its worst case is a flat document (millions of siblings under one parent) — measured at 22MB of stack growth for a 7MB, 1M-node document, against 61MB for the parsed DOM. Lower `MaxInputSize` if that bound matters for your workload.
+- **Note**: An earlier 50,000-visited-node cap stopped traversal *silently*. Because
+  a legal 50MB document can contain far more nodes than that, it truncated legal
+  input rather than hostile input, and it did so inconsistently: media, links,
+  `<base>` detection, the title fallback, link text, table rows, and the
+  `[IMAGE:n]`/`[LINK:n]` counters in large tables were dropped while the text pass
+  over the same tree kept running — producing wrong results with no error.
+
 #### 2. Code Injection
 
 **Script Injection (XSS)**
@@ -121,16 +131,22 @@ cfg.EnableSanitization = true // Default: true
 - **Threat**: Malicious input causes catastrophic backtracking in regex
 - **Mitigation**:
   - All regex patterns pre-compiled at initialization
-  - Regex only applied to size-limited content (`maxHTMLForRegex = 1,000,000 bytes`)
+  - The media-URL scan is not regex-based at all — it is a hand-rolled scanner
+    (`internal/media.go`'s `ScanMediaURLs`) that touches only candidate bytes,
+    so it cannot backtrack catastrophically
+  - Media scanning is only applied to size-limited content (`maxHTMLForRegex = 1,000,000 bytes`)
   - Match limits enforced (`maxRegexMatches = 1000`)
-  - Simple, non-backtracking patterns used
+  - Simple, non-backtracking patterns used for the remaining (charset / CSS padding) regexes
 
 ```go
 // Illustrative — the real path additionally gates on len > 0 and a
-// HasMediaReference() pre-scan, so the regex only runs when a media
-// signature is actually present (see extractVideos in media.go).
+// HasMediaReference() pre-scan, so the media scan only runs when a media
+// signature is actually present (see extractMedia in the root package's media.go).
 if len(htmlContent) <= maxHTMLForRegex {
-    matches := videoRegex.FindAllString(htmlContent, maxRegexMatches)
+    internal.ScanMediaURLs(htmlContent, true, maxRegexMatches, func(url string) bool {
+        // … classify and record url …
+        return true
+    })
 }
 ```
 
@@ -151,8 +167,7 @@ if len(htmlContent) <= maxHTMLForRegex {
 **Hash Collision Attacks**
 - **Threat**: Crafted inputs produce same cache key, causing incorrect results
 - **Mitigation**: Non-cryptographic `hash/maphash` digest (AES-NI accelerated; seeded randomly per process for hash-flooding resistance) with 128-bit (16-byte) output for cache keys (effective collision resistance ~64 bits; the second 8 bytes are derived from the first 8 via a splitmix64 finalizer, providing output-space separation but not doubling collision entropy)
-- **Key generation**: Config flags + format options + content (with 5-point sampling for large documents)
-- **Large document handling**: Multi-point sampling (5 regions) for documents exceeding 64KB ensures modifications anywhere in the document are detected
+- **Key generation**: Config flags + format options + the complete input bytes. Every byte participates in the digest: an earlier version sampled five ~819-byte windows of documents over 64KB, which made the key blind to the unsampled middle — two same-length documents differing only there collided and the second extraction was served the first document's cached result. `hash/maphash` runs on AES-NI at roughly 11-13 GB/s (measured), so even a 10MB document is hashed in under a millisecond — small against the parse and traversal it gates.
 
 **Cache Timing Attacks**
 - **Threat**: Timing differences reveal cached vs. non-cached content
@@ -385,6 +400,23 @@ for i, result := range br.Results {
 }
 ```
 
+**Buffer ownership**
+
+A returned `Result` never aliases the caller's input `[]byte`; the caller may
+reuse or overwrite its buffer the moment `Extract` returns. This holds on the
+timeout path too: with `ProcessingTimeout > 0` (the default) the deadline
+returns to the caller while the parser is still winding down on another
+goroutine, so the decoded document is a private copy in that mode rather than a
+zero-copy view of the input. Callers that pool their own input buffers therefore
+need no coordination with the library.
+
+Synchronization obligations that remain with the caller:
+
+- Do not mutate a `Config` after passing it to `New`; copy it first if per-call
+  settings are needed (the built-in `ExtractToMarkdown*` family already does).
+- A custom `Scorer` or `AuditSink` is invoked from multiple goroutines when a
+  processor is shared, and must synchronize its own state.
+
 ### 7. Audit Logging
 
 **Enable Audit Logging for Security Monitoring**
@@ -413,7 +445,10 @@ processor, err := html.New(cfg)
 - `golang.org/x/net/html` - Official Go supplementary network libraries (HTML5 parser)
 - `golang.org/x/text` - Official Go text processing libraries (encoding detection)
 
-Both maintained by the Go team. No transitive dependencies beyond these.
+Both maintained by the Go team. These are the only two **direct** dependencies;
+`x/net` and `x/text` transitively pull in a handful of additional `golang.org/x`
+modules (`crypto`, `sys`, `sync`, `mod`, `tools`, `term`), all also maintained by
+the Go team.
 
 **Dependency Verification**
 ```bash
@@ -449,8 +484,7 @@ If you discover a security vulnerability, please follow responsible disclosure:
 
 1. **Do Not** open a public GitHub issue
 2. **Preferred**: use [Private Vulnerability Reporting](https://github.com/cybergodev/html/security/advisories/new) — enable it in *Settings → Code security and analysis* if not yet active
-3. Alternatively, **email** security concerns to: `[security email - to be configured by maintainer]`
-4. **Include**:
+3. **Include**:
    - Description of the vulnerability
    - Steps to reproduce
    - Potential impact
@@ -474,7 +508,7 @@ Security fixes are released as:
 
 ### Automated Testing
 
-The library includes comprehensive security-focused tests with **~90% code coverage** (main package; internal packages exceed 91%):
+The library includes comprehensive security-focused tests with **~94% code coverage** (main package 93.9%; `internal` 92.8%, `internal/table` 92.4%):
 
 ```bash
 # Run all tests including security tests
@@ -500,6 +534,39 @@ go test -cover ./...
 - Data URL validation tests (size limits, content validation, media type whitelist)
 - Path traversal tests (file extraction security)
 - Panic recovery tests (defense-in-depth)
+
+### Panic Containment (SEC-003)
+
+Public API must never panic, in two distinct senses — both are enforced by
+tests in `panic_protection_test.go` and `panic_api_regression_test.go`.
+
+1. **Recovered panics.** Work performed on behalf of a caller runs under
+   `recoverPanic` (the `Extract*`/`ExtractAllLinks*`/`ExtractTo*` families), or
+   in a worker goroutine that recovers per item (`ExtractBatch*`), or inside a
+   `defer`-recover around a user extension point (`AuditSink.Write`,
+   `AuditSink.Close`, the cache sweeper). A panic there — an internal bug, a
+   custom `Scorer`, or a misbehaving sink — surfaces as `ErrInternalPanic` or as
+   a per-item batch error, never as a crash.
+2. **Panics recover cannot reach.** An allocation the runtime refuses aborts the
+   process (fatal OOM is not a panic), and a method called directly by the
+   caller has no recover above it. Those are prevented by construction instead:
+   - `NewChannelAuditSink` clamps `bufferSize` to `[0, 100000]`. A channel is
+     charged its full capacity up front, so an unchecked size was a one-line
+     `make(chan, 1<<40)` abort.
+   - Zero-value sinks (`var s html.LoggerAuditSink`, `LoggerAuditSink.logger` is
+     nil; `var s html.ChannelAuditSink`, no channel to `close`) are no-ops rather
+     than nil dereferences.
+   - The exported error types are nil-safe. A typed-nil pointer stored in an
+     `error` variable is non-nil as an interface, so `Error`, `Unwrap`,
+     `SafePath`, and `MarshalJSON` are reached with a nil receiver by ordinary
+     code such as `log.Printf("%v", err)` and `errors.Is`.
+   - `Result.MarshalJSON` returns `null` for a nil receiver, matching what
+     `encoding/json` itself produces.
+
+Sizes are the one class of caller input the library cannot fully defend: a
+request that is within the documented maxima but still larger than available
+memory (an enormous `MaxInputSize` on a small host) ends in a runtime abort, as
+it would for any Go program that allocates on request.
 
 ### Fuzzing
 
@@ -565,6 +632,12 @@ func FuzzExtract(f *testing.F) {
 > This section highlights security-relevant changes per release. For the complete
 > change history (features, performance, bug fixes), see [CHANGES.md](../CHANGES.md).
 
+### Unreleased
+
+- **Concurrency (P-002)**: media URLs extracted from raw pre-parse markup (`<iframe>`/`<embed>`/`<object>` attributes, and URL-shaped strings found by the media scan) were retained as substrings of the decoded document. On the zero-copy decode path that document is a view of the caller's input `[]byte`, so a returned — and cached — `Result` mutated when the caller recycled its buffer, and a cache-hit reader raced that write. `addVideo`/`addAudio` and `appendUniqueVideoURLs` now clone the URL before retaining it.
+- **Concurrency (P-002)**: with `ProcessingTimeout > 0` the parser can outlive `Extract` by one cooperative-cancellation window after a deadline fires. The decoded document is now a private copy in that mode instead of a zero-copy view of the caller's input, so a straggling parser can no longer read a buffer the caller has started reusing. With `ProcessingTimeout == 0` the work runs inline and the zero-copy path is unchanged.
+- Both fixes are covered by `regressions_media_test.go` (`TestMediaURLsNotAliasedWithInputBuffer`, `TestCachedMediaURLsNotAliasedWithInputBuffer`) and `regressions_timeout_test.go` (`TestDetectEncodingCopiesWhenTimeoutConfigured`, `TestDetectEncodingKeepsZeroCopyWhenSynchronous`), which fail if the copy is removed.
+
 ### v1.4.7 (2026-08-11)
 
 - Cache keys now use `hash/maphash` (AES-NI, per-process random seed) instead of a hand-rolled xxHash — offline collision precomputation is no longer possible
@@ -576,7 +649,7 @@ func FuzzExtract(f *testing.F) {
 - `ExtractFromFile` pre-reads `Stat` and rejects oversized files, preventing memory exhaustion from untrusted paths
 - `isSafeURIWithAudit` strips leading/trailing C0 controls and internal tab/LF/CR before scheme detection, closing an XSS-class bypass (`\x01javascript:`, `java&#9;script:`)
 - `AuditSink.Close` panics are now recovered, matching the `Record`/`Write` protection
-- HTML entity decoding is bounded to `maxEntityScanLen`, closing an O(N²) CPU-exhaustion DoS reachable from any text node via runs of bare `&`
+- ~~HTML entity decoding is bounded to `maxEntityScanLen`, closing an O(N²) CPU-exhaustion DoS reachable from any text node via runs of bare `&`~~ — the separate entity-decoding pass had no production caller and was removed; the HTML tokenizer in `golang.org/x/net/html` performs the only entity decoding, and raw text is never re-scanned for `&` sequences
 - `DetectCharsetSmart` now honors `ForcedEncoding`/`Config.Encoding` even with smart detection enabled
 
 ### v1.4.5 (2026-07-08)
@@ -585,6 +658,7 @@ func FuzzExtract(f *testing.F) {
 - Package-level entry points (`Extract*`, `ExtractAllLinks`, `ExtractBatch*`) now recover a pool-`New` panic and return `ErrInternalPanic` instead of letting it escape to callers
 - Data URLs with an empty media type (`data:;base64,...`) are now rejected — previously arbitrary base64 payload bypassed the safe-MIME whitelist
 - Table `colspan`/`rowspan` clamped to 1000 (HTML spec ceiling) to close a memory-exhaustion vector; oversized non-data URIs are now sanitized/rejected before emission
+- Table colspan expansion additionally bounded in aggregate: at most 10,000 placeholder cells per table (`maxExpandedCells`) and a rendering grid of at most 2^20 cells (`maxGridCells`), closing the amplification where a ~1.5MB document of `<td colspan="1000">` cells expanded into tens of millions of `CellData` (per-cell clamping and any node-count bound cannot see synthetic cells). Fixed in a later audit: the budget was per row rather than per table, so a 2,000-row hostile table still expanded to two million cells.
 - Pooled `[]byte`/node-slice buffers above 64 KiB / 8192 entries are no longer retained in `sync.Pool`, eliminating the retention footgun where one multi-MB buffer was reused for every later small request
 
 ### v1.4.4 (2026-06-26)
@@ -618,8 +692,8 @@ func FuzzExtract(f *testing.F) {
 ### v1.3.2 (2026-03-23)
 - Defense-in-depth for fast-path vulnerabilities (S-06 to S-16)
 - Enhanced numeric entity validation prevents DoS via long strings
-- Improved cache key collision resistance (5-point sampling)
-- `maxWalkDepth` (50,000 nodes) prevents memory exhaustion attacks (since renamed to `maxWalkNodes` and documented as a total visited-node limit)
+- Cache key sampling for large documents (5-point sampling) — later replaced: sampling made the key blind to unsampled bytes, so the whole input is hashed now
+- ~~`maxWalkDepth` (50,000 nodes) prevents memory exhaustion attacks~~ — removed in a later audit: the cap truncated legal input silently and desynchronized passes over the same tree. Traversal is now bounded by `MaxInputSize` (node count) and `MaxDepth` (nesting).
 
 ### v1.3.0 (2026-03-03)
 - Library confirmed fully thread-safe (100+ race detection iterations)

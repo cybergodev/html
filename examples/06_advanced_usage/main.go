@@ -297,6 +297,11 @@ func (s *ArticleScorer) Score(node html.ContentNode) int {
 }
 
 // ShouldRemove determines if a node should be removed.
+//
+// Note: ShouldRemove is part of the html.Scorer interface and must be
+// implemented, but the extraction pipeline does NOT invoke it on custom
+// scorers — node removal always follows the built-in scorer's rules. It is
+// shown here only to satisfy the interface; its return value has no effect.
 func (s *ArticleScorer) ShouldRemove(node html.ContentNode) bool {
 	if node.Type() != "element" {
 		return false

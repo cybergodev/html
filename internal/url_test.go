@@ -568,3 +568,120 @@ func TestNormalizeBaseURL_CaseInsensitiveScheme(t *testing.T) {
 		}
 	}
 }
+func TestResolveURLSchemeReferencesAreAbsolute(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ base, ref, want string }{
+		// Scheme-bearing references must be returned verbatim.
+		{"https://site.com/page", "mailto:user@example.com", "mailto:user@example.com"},
+		{"https://site.com/page", "tel:+1-555-0100", "tel:+1-555-0100"},
+		{"https://site.com/page", "ftp://files.example.com/x", "ftp://files.example.com/x"},
+		{"https://site.com/page", "data:image/png;base64,AAA", "data:image/png;base64,AAA"},
+		// ...while plain relative references keep resolving as before.
+		{"https://site.com/dir/page", "other.html", "https://site.com/dir/other.html"},
+		{"https://site.com/dir/page", "./x.js", "https://site.com/dir/./x.js"},
+		{"https://site.com/dir/", "y.css", "https://site.com/dir/y.css"},
+		{"https://site.com/page", "file7.html", "https://site.com/file7.html"},
+		// Not scheme references: ':' must appear before any '/', '?', '#'.
+		{"https://site.com/page", "path/to:file", "https://site.com/path/to:file"},
+		{"https://site.com/page", "q?a:b", "https://site.com/q?a:b"},
+		{"https://site.com/page", "#frag:x", "https://site.com/page#frag:x"},
+		// Digits cannot start a scheme (RFC 3986: scheme = ALPHA ...).
+		{"https://site.com/dir/", "2024:report.html", "https://site.com/dir/2024:report.html"},
+	}
+	for _, c := range cases {
+		if got := ResolveURL(c.base, c.ref); got != c.want {
+			t.Errorf("ResolveURL(%q, %q) = %q, want %q", c.base, c.ref, got, c.want)
+		}
+	}
+}
+
+func TestResolveURLProtocolRelativeBase(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ base, ref, want string }{
+		// The base's host must survive when resolving /path references.
+		{"//cdn.example.com/assets/", "/clip.mp4", "//cdn.example.com/clip.mp4"},
+		{"//cdn.example.com", "/clip.mp4", "//cdn.example.com/clip.mp4"},
+		// http(s) bases keep their existing behavior.
+		{"https://site.com/dir/page", "/root.css", "https://site.com/root.css"},
+		{"https://site.com", "/root.css", "https://site.com/root.css"},
+		{"http://site.com/a/b", "/x", "http://site.com/x"},
+	}
+	for _, c := range cases {
+		if got := ResolveURL(c.base, c.ref); got != c.want {
+			t.Errorf("ResolveURL(%q, %q) = %q, want %q", c.base, c.ref, got, c.want)
+		}
+	}
+}
+
+// url_authority_regression_test.go — pins the D-002 P1 authority-handling
+// fixes: ExtractDomain no longer scans '@' past the authority (profile URLs
+// like "/@alice" were misread as userinfo, extracting "alice" as the domain
+// and flagging same-site links as external), and the four base-URL builders
+// (ExtractBaseFromURL, NormalizeBaseURL, ResolveURL's rooted-reference
+// branch, asDirectoryBase) cut at the first '/', '?', or '#' after the
+// authority so a query/fragment-only tail can no longer end up inside the
+// base ("https://e.com?x=1/" corrupted every relative URL resolved against
+// it).
+
+func TestAuthorityDelimiters(t *testing.T) {
+	t.Parallel()
+
+	domainCases := []struct {
+		url  string
+		want string
+	}{
+		// '@' in the path is not userinfo.
+		{"https://example.com/@alice", "example.com"},
+		{"https://example.com/@alice/status/42", "example.com"},
+		// userinfo inside the authority still strips.
+		{"https://user:pass@example.com/path", "example.com"},
+		// query/fragment after the authority no longer leaks into the domain.
+		{"https://e.com?x=1", "e.com"},
+		{"https://e.com#top", "e.com"},
+		{"https://e.com/", "e.com"},
+		{"https://e.com/path", "e.com"},
+	}
+	for _, c := range domainCases {
+		if got := ExtractDomain(c.url); got != c.want {
+			t.Errorf("ExtractDomain(%q) = %q, want %q", c.url, got, c.want)
+		}
+	}
+
+	baseCases := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"ExtractBaseFromURL fragment", ExtractBaseFromURL("https://cdn.example.com#top"), "https://cdn.example.com/"},
+		{"ExtractBaseFromURL query", ExtractBaseFromURL("https://cdn.example.com?ref=x"), "https://cdn.example.com/"},
+		{"ExtractBaseFromURL path", ExtractBaseFromURL("https://cdn.example.com/p/page"), "https://cdn.example.com/"},
+		{"NormalizeBaseURL query", NormalizeBaseURL("https://e.com?x=1"), "https://e.com/"},
+		{"NormalizeBaseURL fragment", NormalizeBaseURL("https://e.com#top"), "https://e.com/"},
+		{"NormalizeBaseURL path", NormalizeBaseURL("https://e.com/a/b"), "https://e.com/"},
+		{"NormalizeBaseURL trailing slash", NormalizeBaseURL("https://e.com/"), "https://e.com/"},
+		{"ResolveURL rooted over query", ResolveURL("https://example.com?x=1", "/img.png"), "https://example.com/img.png"},
+		{"ResolveURL rooted over fragment", ResolveURL("https://example.com#top", "/img.png"), "https://example.com/img.png"},
+		{"ResolveURL rooted over path", ResolveURL("https://example.com/section/page.html", "/img.png"), "https://example.com/img.png"},
+		{"ResolveURL relative into query-only base", ResolveURL("https://host?q=1", "a/b.html"), "https://host/a/b.html"},
+		{"ResolveURL relative into plain base", ResolveURL("https://host/section/", "a/b.html"), "https://host/section/a/b.html"},
+	}
+	for _, c := range baseCases {
+		if c.got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, c.got, c.want)
+		}
+	}
+}
+
+// TestSameSitePathUserLinkNotExternal pins the user-visible effect: with
+// IncludeExternalLinks disabled, a same-site "/@user" profile link must be
+// kept, while a genuinely external link must still be filtered.
+func TestSameSitePathUserLinkNotExternal(t *testing.T) {
+	t.Parallel()
+
+	if IsDifferentDomain("https://example.com/page", "https://example.com/@alice") {
+		t.Error("IsDifferentDomain misclassified a same-site /@user link as external")
+	}
+	if !IsDifferentDomain("https://example.com/page", "https://other.example.net/x") {
+		t.Error("IsDifferentDomain failed to classify a cross-site link as external")
+	}
+}

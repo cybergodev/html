@@ -24,6 +24,15 @@ import (
 // read-only and satisfies this; a custom Scorer that holds mutable state must
 // synchronize it itself.
 //
+// # Complexity contract
+//
+// Score is invoked once per non-inline element of the document (roughly once
+// per block node), so its cost multiplies by the element count. A Score that
+// re-walks its whole subtree makes extraction O(N²) on an N-node document —
+// seconds of CPU on large pages. Prefer O(1) node-local inspection (tag name,
+// attributes, immediate children); when subtree text statistics are required,
+// cache them by node across calls rather than recomputing per invocation.
+//
 // The ContentNode interface abstracts away the internal HTML parser types,
 // allowing users to implement custom scorers without importing golang.org/x/net/html.
 //
@@ -157,11 +166,12 @@ type Processor struct {
 	// Pre-computed format strings to avoid repeated strings.ToLower in hot path
 	imageFormat string
 	linkFormat  string
-	// Cached audit adapter to avoid per-call allocation
-	auditAdapter *auditRecorderAdapter
 }
 
-// processorStats holds thread-safe statistics counters shared between processors.
+// processorStats holds thread-safe statistics counters. New creates one
+// instance per Processor; a Processor's transient format processors
+// (buildFormatProcessor) share the parent's pointer so their extractions are
+// reflected in the parent's GetStatistics.
 type processorStats struct {
 	totalProcessed   atomic.Int64
 	cacheHits        atomic.Int64
@@ -221,9 +231,6 @@ func New(cfg ...Config) (*Processor, error) {
 	p.imageFormat = normalizeInlineFormat(c.InlineImageFormat)
 	p.linkFormat = normalizeInlineFormat(c.InlineLinkFormat)
 
-	// Cache audit adapter to avoid per-call allocation
-	p.auditAdapter = &auditRecorderAdapter{collector: p.audit}
-
 	// Set up scorer from config
 	// Note: Scorer interface uses ContentNode abstraction; adapter converts to internal.Scorer
 	if c.Scorer != nil {
@@ -271,7 +278,9 @@ func (p *Processor) GetStatistics() Statistics {
 }
 
 // GetAuditLog returns the audit log entries collected during processing.
-// Returns nil if audit logging is not enabled.
+// Returns an empty (non-nil) slice when audit logging is disabled or no
+// entries have been recorded; use the entry count, not a nil check, to
+// distinguish the two.
 func (p *Processor) GetAuditLog() []AuditEntry {
 	if p == nil || p.audit == nil {
 		return nil
@@ -290,7 +299,9 @@ func (p *Processor) ClearAuditLog() {
 // ClearCache clears the cache contents but preserves cumulative statistics.
 // Use ResetStatistics to reset statistics counters.
 func (p *Processor) ClearCache() {
-	if p == nil {
+	// p.cache is nil only on a hand-built zero-value Processor (New always
+	// installs a cache, disabled or not); there is nothing to clear then.
+	if p == nil || p.cache == nil {
 		return
 	}
 	p.cache.Clear()
@@ -311,6 +322,12 @@ func (p *Processor) ResetStatistics() {
 
 // Close releases resources used by the processor.
 // After calling Close, the processor should not be used.
+//
+// When an audit sink is configured, its Close error is returned: MultiSink
+// aggregates close errors from every child sink precisely so real delivery
+// failures are not lost, and discarding that here made this error return
+// dead. The pooled one-shot path (withProcessor's deferred Close)
+// intentionally ignores it — there is no caller left to receive it.
 func (p *Processor) Close() error {
 	if p == nil {
 		return nil
@@ -318,11 +335,15 @@ func (p *Processor) Close() error {
 	if !p.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	// Stop background cleanup goroutine if running
-	p.cache.StopCleanup()
-	p.cache.Clear()
+	// Stop background cleanup goroutine if running. p.cache is nil only on a
+	// hand-built zero-value Processor (New always installs a cache, disabled
+	// or not), so guard it like audit below rather than dereferencing.
+	if p.cache != nil {
+		p.cache.StopCleanup()
+		p.cache.Clear()
+	}
 	if p.audit != nil {
-		_ = p.audit.Close() // best-effort cleanup
+		return p.audit.Close()
 	}
 	return nil
 }
@@ -370,8 +391,26 @@ func (p *Processor) errFileTooLarge(regular bool, size int64) error {
 // detectEncoding detects the character encoding and converts HTML bytes to UTF-8.
 // This is a helper method used by multiple extraction methods to avoid code duplication.
 // It records encoding issues to the audit log if enabled.
+//
+// It asks for a copy whenever a processing timeout is configured. That is
+// exactly when runWithTimeout runs the document work on another goroutine and
+// returns to the caller as soon as the deadline fires, leaving that goroutine
+// parsing until its next cooperative cancellation check. The fast (unsafe)
+// converter returns a string that ALIASES htmlBytes for ASCII/valid-UTF-8 input,
+// which is free and safe on the synchronous path, but a straggler holding that
+// view would read memory the caller is entitled to reuse the moment Extract
+// returns — an unsupervised data race the library cannot synchronize. Copying at
+// decode time gives the goroutine its own bytes. With ProcessingTimeout == 0
+// runWithTimeout calls fn directly, nothing outlives the call, and the zero-copy
+// view is kept.
 func (p *Processor) detectEncoding(htmlBytes []byte) (string, error) {
-	utf8String, _, convErr := internal.DetectAndConvertToUTF8String(htmlBytes, p.config.Encoding)
+	var utf8String string
+	var convErr error
+	if p.config.ProcessingTimeout > 0 {
+		utf8String, _, convErr = internal.DetectAndConvertToUTF8StringSafe(htmlBytes, p.config.Encoding)
+	} else {
+		utf8String, _, convErr = internal.DetectAndConvertToUTF8String(htmlBytes, p.config.Encoding)
+	}
 	if convErr != nil {
 		if p.audit != nil {
 			p.audit.RecordEncodingIssue(p.config.Encoding, convErr.Error())
@@ -394,9 +433,16 @@ func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
 	// Clean the file path to resolve any "." or ".." components
 	cleanPath := filepath.Clean(filePath)
 
-	// After cleaning, check if the path contains parent directory references
-	// This catches path traversal attempts like "../file", "subdir/../../file", etc.
-	if strings.Contains(cleanPath, "..") {
+	// After cleaning, reject paths that still contain a ".." path component.
+	// filepath.Clean resolves interior ".." components, so a survivor marks a
+	// relative path escaping upward ("../file", "..\..\file", or
+	// "subdir/../../file" reduced to "../file") — this is the path traversal
+	// rejection. Matching the whole component, not the ".." substring, keeps
+	// legal filenames such as "notes..txt" out of the trap: double dots
+	// inside a filename component are legal on every supported platform and
+	// previously produced a false traversal rejection plus a critical audit
+	// event.
+	if hasParentComponent(cleanPath) {
 		if p.audit != nil {
 			p.audit.RecordPathTraversal(filePath)
 		}
@@ -441,6 +487,16 @@ func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
 	defer func() { _ = f.Close() }() // best-effort close of a read-only handle
 
 	return p.readBounded(f, cleanPath)
+}
+
+// hasParentComponent reports whether a filepath.Clean'ed path contains ".."
+// as a path component. Clean resolves interior ".." components against their
+// left neighbors, so any surviving ".." can only be a leading component of a
+// relative path — a reference escaping the working directory upward. The
+// volume prefix is skipped so a Windows drive label ("C:") never matches.
+func hasParentComponent(cleanPath string) bool {
+	rest := cleanPath[len(filepath.VolumeName(cleanPath)):]
+	return rest == ".." || strings.HasPrefix(rest, ".."+string(filepath.Separator))
 }
 
 // readBounded reads the remaining contents of r, hard-capped at MaxInputSize+1

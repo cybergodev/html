@@ -6,34 +6,21 @@ import (
 	"golang.org/x/net/html"
 )
 
-// ScoreContentNode calculates a relevance score for content extraction.
-// Higher scores indicate more likely main content. Negative scores suggest non-content elements.
-// Exported for testing only.
-func ScoreContentNode(node *html.Node) int {
-	return getDefaultScorer().Score(node)
-}
-
-// ShouldRemoveElement determines if a node should be removed from the content tree.
-// This function delegates to the default Scorer implementation.
+// ShouldRemoveElement determines if a node should be removed from the content
+// tree, delegating to the shared default Scorer. CleanContentNode calls it for
+// every element, so it is production surface rather than a test entry point.
 func ShouldRemoveElement(n *html.Node) bool {
 	return getDefaultScorer().ShouldRemove(n)
 }
 
-// ScoreAttributes calculates a score based on element attributes.
-// Exported for testing only.
-func ScoreAttributes(n *html.Node) int {
-	return getDefaultScorer().ScoreAttributes(n)
-}
-
 // contentMetrics holds all metrics collected during a single DOM traversal.
 type contentMetrics struct {
-	paragraphCount  int
-	headingCount    int
-	textLength      int
-	linkTextLength  int
-	totalTextLength int
-	tagCount        int
-	commaCount      int
+	paragraphCount int
+	headingCount   int
+	textLength     int
+	linkTextLength int
+	tagCount       int
+	commaCount     int
 }
 
 // metricsSkipTags lists tags whose subtrees contain no extractable main-content
@@ -101,7 +88,6 @@ func collectContentMetrics(node *html.Node) contentMetrics {
 			text := strings.TrimSpace(textData)
 			if text != "" {
 				metrics.textLength += len(text)
-				metrics.totalTextLength += len(text)
 				metrics.commaCount += strings.Count(text, ",") + strings.Count(text, "，")
 
 				// Check if this text is inside a link
@@ -135,56 +121,12 @@ func calculateDensityFromMetrics(m contentMetrics) float64 {
 }
 
 // calculateLinkDensityFromMetrics calculates link density from collected metrics.
+// The denominator is textLength: the two were kept as separate always-equal
+// fields (a historical "total" distinction never implemented), and the
+// link-density read was the only consumer of the redundant one.
 func calculateLinkDensityFromMetrics(m contentMetrics) float64 {
-	if m.totalTextLength == 0 {
+	if m.textLength == 0 {
 		return 0.0
 	}
-	return float64(m.linkTextLength) / float64(m.totalTextLength)
-}
-
-// MatchesPattern checks if value contains any pattern from the map with word boundaries.
-// This is exported for testing purposes.
-func MatchesPattern(value string, patterns map[string]bool) bool {
-	for pattern := range patterns {
-		if hasWordBoundary(value, pattern, boundaryStandard) {
-			return true
-		}
-	}
-	return false
-}
-
-// CalculateContentDensity calculates text-to-tag ratio.
-// Exported for testing only.
-func CalculateContentDensity(n *html.Node) float64 {
-	if n == nil {
-		return 0
-	}
-	metrics := collectContentMetrics(n)
-	return calculateDensityFromMetrics(metrics)
-}
-
-// CountTags counts all element nodes in the subtree.
-// Exported for testing only.
-func CountTags(n *html.Node) int {
-	count := 0
-	WalkNodes(n, func(node *html.Node) bool {
-		if node.Type == html.ElementNode {
-			count++
-		}
-		return true
-	})
-	return count
-}
-
-// CountChildElements counts child elements of specific tag type.
-// Exported for testing only.
-func CountChildElements(n *html.Node, tag string) int {
-	count := 0
-	WalkNodes(n, func(node *html.Node) bool {
-		if node != n && node.Type == html.ElementNode && node.Data == tag {
-			count++
-		}
-		return true
-	})
-	return count
+	return float64(m.linkTextLength) / float64(m.textLength)
 }

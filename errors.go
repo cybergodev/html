@@ -41,6 +41,18 @@ var (
 	// ErrMultipleConfigs is returned when more than one Config is provided to a function.
 	// Package-level functions like Extract accept at most one optional Config.
 	ErrMultipleConfigs = errors.New("html: at most one Config may be provided")
+
+	// ErrBatchTooLarge is returned when a batch extraction is asked to process
+	// more items than the fixed maximum batch size. Split the batch and
+	// resubmit. (Previously this condition was only matchable by message
+	// string, inconsistent with every other batch failure mode.)
+	ErrBatchTooLarge = errors.New("html: batch size exceeds maximum")
+
+	// ErrTooManyConcurrentOps is returned when a timed extraction is rejected
+	// because the cap on concurrently active timeout watchdogs is already
+	// reached — a "too busy" condition distinct from ErrProcessingTimeout,
+	// where nothing has timed out. Retry once in-flight operations drain.
+	ErrTooManyConcurrentOps = errors.New("html: too many concurrent operations")
 )
 
 // InputError provides context for input-related errors.
@@ -53,7 +65,17 @@ type InputError struct {
 }
 
 // Error returns a formatted error message.
+//
+// A nil *InputError yields a fixed message instead of panicking. Callers reach
+// these methods through the `error` interface, and a typed-nil pointer stored
+// in a non-nil interface (`var e *InputError; var err error = e`) passes the
+// `err != nil` test and then crashes any code that formats it — including
+// `log.Printf("%v", err)` and errors.Is. Public API must not panic (SEC-003),
+// so each error type here is nil-safe.
 func (e *InputError) Error() string {
+	if e == nil {
+		return "html: input error"
+	}
 	if e.InputErr != nil {
 		return fmt.Sprintf("html: %s failed: %v (size=%d, max=%d)", e.Op, e.InputErr, e.Size, e.MaxSize)
 	}
@@ -64,9 +86,10 @@ func (e *InputError) Error() string {
 // When an underlying InputErr is present it is returned alongside
 // ErrInputTooLarge, so errors.Is(err, ErrInputTooLarge) holds for every
 // *InputError — including ones carrying a read failure — matching the
-// type's documented contract.
+// type's documented contract. A nil receiver still unwraps to
+// ErrInputTooLarge so the typed-nil case never panics.
 func (e *InputError) Unwrap() []error {
-	if e.InputErr == nil {
+	if e == nil || e.InputErr == nil {
 		return []error{ErrInputTooLarge}
 	}
 	return []error{e.InputErr, ErrInputTooLarge}
@@ -91,7 +114,13 @@ type ConfigError struct {
 }
 
 // Error returns a formatted error message.
+//
+// A nil *ConfigError yields a fixed message instead of panicking (see
+// InputError.Error for why the typed-nil case reaches public API).
 func (e *ConfigError) Error() string {
+	if e == nil {
+		return "html: invalid config"
+	}
 	return fmt.Sprintf("html: invalid config: %s=%v, %s", e.Field, e.Value, e.Message)
 }
 
@@ -121,7 +150,13 @@ type FileError struct {
 // SECURITY: Path information is truncated to prevent information disclosure
 // in production environments. Use SafePath() for the full path when needed
 // for internal logging or audit purposes.
+//
+// A nil *FileError yields a fixed message instead of panicking (see
+// InputError.Error for why the typed-nil case reaches public API).
 func (e *FileError) Error() string {
+	if e == nil {
+		return "html: file error"
+	}
 	// SECURITY: Truncate path in error message to prevent information disclosure
 	// Only show the base filename, not the full path
 	safePath := e.SafePath()
@@ -137,24 +172,33 @@ func (e *FileError) Error() string {
 // For production use, this truncates the path to just the filename.
 // The full path is still available via the Path field for internal use.
 func (e *FileError) SafePath() string {
-	if e.Path == "" {
+	if e == nil {
 		return ""
 	}
-	// Find the last path separator
-	for i := len(e.Path) - 1; i >= 0; i-- {
-		c := e.Path[i]
-		if c == '/' || c == '\\' {
-			return e.Path[i+1:]
+	return safeBaseName(e.Path)
+}
+
+// safeBaseName returns the portion of path after the last path separator
+// ('/' or '\\'), or path itself when it contains no separator. It backs both
+// FileError.SafePath and the audit subsystem's AuditEntry.Path sanitization,
+// keeping filesystem layouts out of error messages and audit logs while the
+// full raw value remains available through explicitly opt-in channels.
+func safeBaseName(path string) string {
+	if path == "" {
+		return ""
+	}
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '/' || path[i] == '\\' {
+			return path[i+1:]
 		}
 	}
-	// No separator found, return as-is (may be just a filename)
-	return e.Path
+	return path
 }
 
 // sanitizeErrorMessage removes potentially sensitive path information from
 // the underlying error message while preserving error type information.
 func (e *FileError) sanitizeErrorMessage() error {
-	if e.FileErr == nil {
+	if e == nil || e.FileErr == nil {
 		return nil
 	}
 	errStr := e.FileErr.Error()
@@ -164,19 +208,29 @@ func (e *FileError) sanitizeErrorMessage() error {
 	// (e.g., "path traversal detected", "not found") without exposing
 	// sensitive filesystem paths.
 
-	// Check for known error patterns and return sanitized versions
+	// Check for known error patterns and return sanitized versions. The
+	// Windows os package phrases itself differently ("The system cannot find
+	// the file specified", "Access is denied", "… is a directory"), so match
+	// those wordings too — they previously fell through to the generic
+	// "file operation failed" below.
 	lowerErr := strings.ToLower(errStr)
 	if strings.Contains(lowerErr, "path traversal") {
 		return fmt.Errorf("path traversal detected")
 	}
-	if strings.Contains(lowerErr, "not found") {
+	if strings.Contains(lowerErr, "not found") ||
+		strings.Contains(lowerErr, "cannot find the file") ||
+		strings.Contains(lowerErr, "no such file") {
 		return fmt.Errorf("file not found")
 	}
-	if strings.Contains(lowerErr, "permission denied") {
+	if strings.Contains(lowerErr, "permission denied") ||
+		strings.Contains(lowerErr, "access is denied") {
 		return fmt.Errorf("permission denied")
 	}
 	if strings.Contains(lowerErr, "access denied") {
 		return fmt.Errorf("access denied")
+	}
+	if strings.Contains(lowerErr, "is a directory") {
+		return fmt.Errorf("is a directory")
 	}
 
 	// Check if the error message contains what looks like a file path
@@ -189,7 +243,11 @@ func (e *FileError) sanitizeErrorMessage() error {
 }
 
 // Unwrap returns the appropriate sentinel error for errors.Is() support.
+// A nil receiver unwraps to ErrInvalidFilePath rather than panicking.
 func (e *FileError) Unwrap() error {
+	if e == nil {
+		return ErrInvalidFilePath
+	}
 	if errors.Is(e.FileErr, ErrFileNotFound) {
 		return ErrFileNotFound
 	}
@@ -202,7 +260,13 @@ func (e *FileError) Unwrap() error {
 // MarshalJSON implements custom JSON marshaling for FileError.
 // The Path field is sanitized via SafePath() to prevent filesystem path
 // disclosure when errors are serialized to JSON for API responses.
+//
+// A nil receiver marshals to null rather than panicking, matching
+// encoding/json's handling of nil pointers.
 func (e *FileError) MarshalJSON() ([]byte, error) {
+	if e == nil {
+		return []byte("null"), nil
+	}
 	msg := ""
 	if sanitized := e.sanitizeErrorMessage(); sanitized != nil {
 		msg = sanitized.Error()

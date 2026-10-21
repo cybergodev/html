@@ -354,15 +354,65 @@ func TestWriterAuditSinkWriteError(t *testing.T) {
 	}
 }
 
+// errWriter returns an error from every Write, exercising the write-failure
+// branch of WriterAuditSink.Write (the `s.writer.Write(data)` error path logs
+// and drops the entry rather than swallowing the delivery failure).
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
+
+// TestWriterAuditSinkWriteIOError covers the underlying-writer failure branch:
+// a writer whose Write returns an error must not panic, and must drop the entry.
+func TestWriterAuditSinkWriteIOError(t *testing.T) {
+	t.Parallel()
+
+	sink := NewWriterAuditSink(errWriter{})
+	defer func() { _ = sink.Close() }()
+
+	sink.Write(AuditEntry{EventType: AuditEventBlockedTag, Message: "x"}) // must not panic
+}
+
+// closeErrSink is a sink whose Close returns a fixed error, for the
+// MultiSink.Close aggregation branch.
+type closeErrSink struct{ err error }
+
+func (c *closeErrSink) Write(AuditEntry) {}
+func (c *closeErrSink) Close() error     { return c.err }
+
+// TestMultiSinkCloseAggregatesErrors covers MultiSink.Close's errors.Join path:
+// a sink that fails to close must surface its error instead of being dropped.
+func TestMultiSinkCloseAggregatesErrors(t *testing.T) {
+	t.Parallel()
+
+	boom := errors.New("sink close failed")
+	multi := NewMultiSink(
+		&closeErrSink{err: boom},
+		&closeErrSink{}, // closes cleanly
+	)
+	if err := multi.Close(); !errors.Is(err, boom) {
+		t.Fatalf("MultiSink.Close() = %v, want it to wrap %v", err, boom)
+	}
+
+	// Nil receiver and a nil inner sink are both safe no-ops.
+	var nilMulti *MultiSink
+	if err := nilMulti.Close(); err != nil {
+		t.Errorf("(*MultiSink)(nil).Close() = %v, want nil", err)
+	}
+	empty := NewMultiSink(nil)
+	if err := empty.Close(); err != nil {
+		t.Errorf("MultiSink with a nil inner sink = %v, want nil", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // AuditCollector — integration: RecordBlockedTag/Attr/URL via sanitization
 // ---------------------------------------------------------------------------
 
-// TestAuditRecorderAdapterViaExtraction exercises the auditRecorderAdapter
+// TestAuditRecorderViaExtraction exercises the *auditCollector recorder
 // methods (RecordBlockedTag/Attr/URL, all at 0%) by running extraction with
 // audit enabled on HTML containing dangerous tags, attributes, and URLs. The
 // sanitizer calls the adapter, which forwards to the collector.
-func TestAuditRecorderAdapterViaExtraction(t *testing.T) {
+func TestAuditRecorderViaExtraction(t *testing.T) {
 	t.Parallel()
 
 	cfg := DefaultConfig()
@@ -416,13 +466,16 @@ func TestAuditRecorderAdapterViaExtraction(t *testing.T) {
 
 // TestAuditRecorderAdapterNilCollector verifies the nil-collector branches of
 // auditRecorderAdapter are safe.
-func TestAuditRecorderAdapterNilCollector(t *testing.T) {
+func TestAuditRecorderNilCollector(t *testing.T) {
 	t.Parallel()
 
-	a := &auditRecorderAdapter{collector: nil}
-	a.RecordBlockedTag("script") // must not panic
-	a.RecordBlockedAttr("onclick", "evil()")
-	a.RecordBlockedURL("javascript:alert(1)", "xss")
+	// *auditCollector itself satisfies internal.AuditRecorder, and every
+	// Record method is nil-receiver safe (the former forwarding adapter's
+	// only added value).
+	var c *auditCollector
+	c.RecordBlockedTag("script") // must not panic
+	c.RecordBlockedAttr("onclick", "evil()")
+	c.RecordBlockedURL("javascript:alert(1)", "xss")
 }
 
 // TestAuditCollectorWait covers the non-nil Wait path (50% → 100%).
@@ -461,6 +514,64 @@ func TestAuditCollectorRecordPathTraversal(t *testing.T) {
 		}
 		if entries[0].EventType != AuditEventPathTraversal {
 			t.Errorf("EventType = %q, want %q", entries[0].EventType, AuditEventPathTraversal)
+		}
+		// SECURITY: Path must carry only the base filename (documented
+		// contract); the raw path must not appear unless IncludeRawValues
+		// is explicitly enabled.
+		if entries[0].Path != "passwd" {
+			t.Errorf("Path = %q, want base filename %q", entries[0].Path, "passwd")
+		}
+		if entries[0].RawValue != "" {
+			t.Errorf("RawValue = %q, want empty when IncludeRawValues=false", entries[0].RawValue)
+		}
+	})
+
+	t.Run("path sanitized to base filename", func(t *testing.T) {
+		t.Parallel()
+		cfg := AuditConfig{Enabled: true, LogPathTraversal: true}
+		c := newAuditCollector(cfg)
+		defer func() { _ = c.Close() }()
+
+		cases := []struct {
+			input, want string
+		}{
+			{"../../../etc/passwd", "passwd"},
+			{`..\..\Windows\System32\config\SAM`, "SAM"}, // Windows separators
+			{"/etc/shadow", "shadow"},                    // absolute path
+			{"passwd", "passwd"},                         // no separator
+			{"/", ""},                                    // separator only
+			{"", ""},                                     // empty
+		}
+		for _, tc := range cases {
+			c.RecordPathTraversal(tc.input)
+		}
+		entries := c.GetEntries()
+		if len(entries) != len(cases) {
+			t.Fatalf("expected %d entries, got %d", len(cases), len(entries))
+		}
+		for i, tc := range cases {
+			if entries[i].Path != tc.want {
+				t.Errorf("entry %d (%q): Path = %q, want %q", i, tc.input, entries[i].Path, tc.want)
+			}
+		}
+	})
+
+	t.Run("raw value kept when IncludeRawValues", func(t *testing.T) {
+		t.Parallel()
+		cfg := AuditConfig{Enabled: true, LogPathTraversal: true, IncludeRawValues: true}
+		c := newAuditCollector(cfg)
+		defer func() { _ = c.Close() }()
+
+		c.RecordPathTraversal("../../../etc/passwd")
+		entries := c.GetEntries()
+		if len(entries) != 1 {
+			t.Fatalf("expected 1 entry, got %d", len(entries))
+		}
+		if entries[0].Path != "passwd" {
+			t.Errorf("Path = %q, want %q", entries[0].Path, "passwd")
+		}
+		if entries[0].RawValue != "../../../etc/passwd" {
+			t.Errorf("RawValue = %q, want the full sanitized raw path", entries[0].RawValue)
 		}
 	})
 

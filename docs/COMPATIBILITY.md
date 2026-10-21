@@ -560,6 +560,23 @@ fmt.Printf("Cache hit rate: %.1f%%\n",
 - `golang.org/x/net/html` - HTML5 parser (official Go supplementary library)
 - `golang.org/x/text` - Character encoding detection and conversion
 
+### Unicode Normalization Data by Go Version
+
+`golang.org/x/text` v0.43.0 ships its `unicode/norm` tables in two
+version-gated files: `tables15.0.0.go` (`//go:build !go1.27`) and
+`tables17.0.0.go` (`//go:build go1.27`). As a result, the NFC normalization
+the sanitizer applies before its URL-scheme checks uses Unicode 15.0 data
+when built with Go 1.26 and Unicode 17.0 data when built with Go 1.27 or
+later.
+
+This is not a security gap — both files are complete, self-consistent
+normalization tables, and NFC has been essentially stable across these
+Unicode releases. The only observable difference is how characters newly
+introduced in Unicode 16/17 normalize, which is irrelevant to the
+`javascript:`/`vbscript:`/`file:` scheme policy. To keep normalization
+byte-identical across a fleet, build the library with a single pinned Go
+version.
+
 ## Examples
 
 See the `examples/` directory for complete examples (each is a self-contained `main` package in its own subdirectory):

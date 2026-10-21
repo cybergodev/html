@@ -88,6 +88,13 @@ func containsWord(text, word string) bool {
 // getCellAlign extracts the alignment from a table cell node.
 // It first checks the align attribute, then the style attribute for text-align.
 // Optimized to use a single loop through attributes.
+//
+// Attribute keys are compared as-is: the HTML tokenizer lowercases attribute
+// names for HTML-namespace elements (only foreign content such as SVG keeps
+// camelCase, and a <td>/<th> is never foreign), so a strings.ToLower per
+// attribute was dead work on the per-cell hot path. The mixed-case markup case
+// (<td ALIGN="Center">) is covered by the "mixed case alignment attributes"
+// case of TestTableAlignmentPreservation.
 func getCellAlign(n *html.Node) table.CellAlignment {
 	if n == nil {
 		return table.AlignDefault
@@ -97,8 +104,7 @@ func getCellAlign(n *html.Node) table.CellAlignment {
 
 	// Single pass through attributes - collect style and check align
 	for _, attr := range n.Attr {
-		attrKey := strings.ToLower(attr.Key)
-		switch attrKey {
+		switch attr.Key {
 		case "align":
 			alignVal := strings.ToLower(strings.TrimSpace(attr.Val))
 			switch alignVal {
@@ -142,10 +148,12 @@ func getCellAlign(n *html.Node) table.CellAlignment {
 	return table.AlignDefault
 }
 
-// maxCellSpan caps colspan/rowspan values. The HTML spec clamps both to 1000
-// (browsers ignore anything larger), and oversized values are almost always
-// malformed; capping also bounds the placeholder cells expandColspanCells
-// allocates (colspan-1 per cell), which would otherwise let a single
+// maxCellSpan caps colspan/rowspan values. Per the HTML spec, colspan clamps
+// to 1000 and rowspan to 65534; the tighter uniform 1000 bound here is a
+// library resource limit rather than a spec transcription, and oversized
+// values are almost always malformed. Capping also bounds the placeholder
+// cells the inline expansion in extractTableData (internal/table) allocates
+// (colspan-1 per cell), which would otherwise let a single
 // <td colspan="N"> exhaust memory.
 const maxCellSpan = 1000
 
@@ -157,7 +165,7 @@ func getCellSpan(n *html.Node, attrKey string) int {
 		return 1
 	}
 	for _, attr := range n.Attr {
-		if strings.ToLower(attr.Key) == attrKey {
+		if attr.Key == attrKey {
 			if val, err := strconv.Atoi(strings.TrimSpace(attr.Val)); err == nil && val > 0 {
 				if val > maxCellSpan {
 					return maxCellSpan
@@ -204,13 +212,12 @@ func getCellWidth(n *html.Node) string {
 	// attribute takes precedence over style per the HTML/CSS cascade for
 	// presentational hints.
 	var styleAttr string
-	widthFound := false
 	for _, attr := range n.Attr {
-		switch strings.ToLower(attr.Key) {
+		switch attr.Key {
 		case "width":
-			if widthFound {
-				continue
-			}
+			// First non-zero width attribute value wins; a duplicate
+			// attribute is dropped by the parser, and zero widths fall
+			// through to the style fallback below.
 			widthVal := strings.TrimSpace(attr.Val)
 			if !isZeroWidthValue(widthVal) {
 				return widthVal

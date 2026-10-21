@@ -1,11 +1,10 @@
 # HTML Extraction Library
 
-[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://golang.org)
 [![GoDoc](https://pkg.go.dev/badge/github.com/cybergodev/html.svg)](https://pkg.go.dev/github.com/cybergodev/html)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Security](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
 [![Thread Safe](https://img.shields.io/badge/thread%20safe-yes-brightgreen.svg)](#-thread-safety)
-[![CI](https://github.com/cybergodev/html/actions/workflows/ci.yaml/badge.svg)](https://github.com/cybergodev/html/actions/workflows/ci.yaml)
 
 **A high-performance Go library for intelligent HTML content extraction**, built on `golang.org/x/net/html`.
 
@@ -46,7 +45,7 @@
 go get github.com/cybergodev/html
 ```
 
-**Requirements**: Go 1.25+
+**Requirements**: Go 1.26+
 
 ---
 
@@ -689,7 +688,7 @@ processor, _ := html.New(config)
 | `NewLoggerAuditSink()` | Writes to stderr with `[AUDIT]` prefix |
 | `NewLoggerAuditSinkWithWriter(w)` | Writes to custom io.Writer |
 | `NewWriterAuditSink(w)` | Writes to io.Writer as JSON lines |
-| `NewChannelAuditSink(bufferSize)` | Sends to channel for external processing |
+| `NewChannelAuditSink(bufferSize)` | Sends to channel for external processing (`bufferSize` is clamped to `[0, 100000]`) |
 | `NewMultiSink(sinks...)` | Combines multiple sinks |
 | `NewFilteredSink(sink, filter)` | Filters entries before writing |
 | `NewLevelFilteredSink(sink, level)` | Only writes entries at or above specified level |
@@ -760,6 +759,22 @@ for i := 0; i < 100; i++ {
 }
 wg.Wait()
 ```
+
+The input is shared safely here because `Extract` never writes to it and all
+strings in the returned `Result` are owned by the caller. One consequence worth
+knowing if you pool your own buffers:
+
+- A returned `Result` does not alias the input slice. You may reuse or mutate
+  your `[]byte` as soon as `Extract` returns, including on the timeout path:
+  when `ProcessingTimeout > 0` (the default), `Extract` returns at the deadline
+  while the parser is still winding down. The library decodes a private copy of
+  the document in that mode so the straggler can never read a buffer you have
+  started reusing.
+- A `Processor` itself may be shared across goroutines; a `Config` may not be
+  mutated after `New` (copy it first if you need per-call settings, as the
+  `ExtractToMarkdown*` family does).
+- A custom `Scorer` or `AuditSink` is called from multiple goroutines and must
+  synchronize its own state.
 
 ---
 

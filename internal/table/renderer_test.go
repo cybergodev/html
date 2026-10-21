@@ -208,13 +208,6 @@ func TestTrackedBuilder(t *testing.T) {
 func TestMarkdownRenderer(t *testing.T) {
 	t.Parallel()
 
-	t.Run("Format returns markdown", func(t *testing.T) {
-		r := &table.MarkdownRenderer{}
-		if r.Format() != "markdown" {
-			t.Errorf("Format() = %q, want 'markdown'", r.Format())
-		}
-	})
-
 	t.Run("Render simple table", func(t *testing.T) {
 		tb := table.NewTrackedBuilder()
 
@@ -403,13 +396,6 @@ func TestMarkdownRowspanGrid(t *testing.T) {
 // TestHTMLRenderer tests the HTMLRenderer.
 func TestHTMLRenderer(t *testing.T) {
 	t.Parallel()
-
-	t.Run("Format returns html", func(t *testing.T) {
-		r := &table.HTMLRenderer{}
-		if r.Format() != "html" {
-			t.Errorf("Format() = %q, want 'html'", r.Format())
-		}
-	})
 
 	t.Run("Render basic table", func(t *testing.T) {
 		tb := table.NewTrackedBuilder()

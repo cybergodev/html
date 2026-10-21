@@ -278,7 +278,15 @@ type jsonResult struct {
 // Result will lose duration fields (ProcessingTime, ReadingTime) because the JSON keys
 // differ from the struct field names. This is intentional — the JSON format is designed
 // for external consumption, not round-tripping.
+//
+// A nil receiver marshals to null instead of panicking, matching what
+// encoding/json itself does for a nil *Result. encoding/json short-circuits
+// nil pointers before calling this method, but MarshalJSON is exported and can
+// be called directly (SEC-003: public API must not panic).
 func (r *Result) MarshalJSON() ([]byte, error) {
+	if r == nil {
+		return []byte("null"), nil
+	}
 	jr := jsonResult{
 		Text:             r.Text,
 		Title:            r.Title,
@@ -293,23 +301,28 @@ func (r *Result) MarshalJSON() ([]byte, error) {
 	return json.Marshal(jr)
 }
 
-// Shared no-op resources for transient format processors. The disabled cache
-// (maxEntries == 0) makes Set a no-op and Get an empty-map miss, and the
-// disabled audit collector drops every record before touching any state, so
-// both are safe to share across concurrently created transients while
-// sparing each ExtractToMarkdown* call three small allocations.
-var (
-	disabledFormatCache   = internal.NewCache[[16]byte](0, 0)
-	disabledFormatAudit   = newAuditCollector(AuditConfig{Enabled: false})
-	disabledFormatAdapter = &auditRecorderAdapter{}
-)
+// disabledFormatCache is shared by all transient format processors: the
+// disabled cache (maxEntries == 0) makes Set a no-op and Get an empty-map
+// miss, and no lifecycle method is ever invoked on it, so one instance is
+// safe to share across concurrently created transients while sparing each
+// ExtractToMarkdown* call the allocation.
+var disabledFormatCache = internal.NewCache[[16]byte](0, 0)
 
 // buildFormatProcessor returns a transient processor that reuses p's scorer but
 // applies the given inline image/link formats. It copies p's immutable config
 // (never mutated after New, so no lock is needed) and overrides only the format
-// fields, uses a disabled cache to avoid polluting p's cache with format-specific
-// results, and an independent disabled audit collector so a parent Close() cannot
-// race with an in-flight extraction on the temporary processor.
+// fields, and uses a disabled cache to avoid polluting p's cache with
+// format-specific results.
+//
+// Audit events and statistics are forwarded to the parent: the transient
+// shares p's audit collector, recorder adapter, and stats counters, so
+// ExtractToMarkdown* runs are visible in GetAuditLog/GetStatistics exactly
+// like Extract runs (they used to vanish into a disabled collector, leaving a
+// blind spot precisely when the user enabled auditing). Sharing is safe: the
+// collector is mutex-guarded and nil-safe, its counters are atomics, and a
+// concurrent parent Close() poses the same sink Write-after-Close exposure
+// that already exists for the parent's own in-flight extractions (the
+// built-in sinks treat Write after Close as a no-op).
 func (p *Processor) buildFormatProcessor(imageFormat, linkFormat string) *Processor {
 	// p.config is immutable after New(), so a plain value copy is safe without a lock.
 	cfg := *p.config
@@ -324,14 +337,13 @@ func (p *Processor) buildFormatProcessor(imageFormat, linkFormat string) *Proces
 	cfg.MaxCacheEntries = 0
 
 	return &Processor{
-		config:       &cfg,
-		cache:        disabledFormatCache,
-		scorer:       p.scorer,
-		audit:        disabledFormatAudit,
-		auditAdapter: disabledFormatAdapter,
-		stats:        &processorStats{},
-		imageFormat:  normalizeInlineFormat(imageFormat),
-		linkFormat:   normalizeInlineFormat(linkFormat),
+		config:      &cfg,
+		cache:       disabledFormatCache,
+		scorer:      p.scorer,
+		audit:       p.audit,
+		stats:       p.stats,
+		imageFormat: normalizeInlineFormat(imageFormat),
+		linkFormat:  normalizeInlineFormat(linkFormat),
 	}
 }
 
@@ -368,6 +380,15 @@ func (p *Processor) extractWithFormatsWithContext(ctx context.Context, htmlBytes
 func (p *Processor) extractFromFileWithFormatsWithContext(ctx context.Context, filePath, imageFormat, linkFormat string) (*Result, error) {
 	if p == nil || p.closed.Load() {
 		return nil, ErrProcessorClosed
+	}
+	// Early cancellation check, matching ExtractFromFileWithContext: without
+	// it, an already-cancelled ctx still read the whole (uncancellable) file
+	// before failing inside the inner ExtractWithContext — the same input
+	// returned context.Canceled on one path and a *FileError on the other.
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
 	}
 	data, err := p.validateAndReadFile(filePath)
 	if err != nil {

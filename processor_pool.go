@@ -54,7 +54,14 @@ func getPooledProcessor() *Processor {
 		// Pool corruption detected: create a new processor as fallback. This
 		// builds a fully initialized Processor (New sets stats/scorer/audit),
 		// unlike the old pool.New fallback which hand-built an incomplete one.
-		p, _ = New(poolCfg)
+		// New(poolCfg) cannot fail (poolCfg is derived from DefaultConfig()),
+		// so a failure is an invariant violation: panic here and let
+		// getPooledProcessorSafe convert it into ErrInternalPanic, rather
+		// than returning a nil Processor with a nil error.
+		var err error
+		if p, err = New(poolCfg); err != nil {
+			panic(fmt.Sprintf("html: pool fallback New(poolCfg) failed: %v", err))
+		}
 	}
 	return p
 }
@@ -142,6 +149,14 @@ func withProcessor[T any](pooled bool, cfg Config, fn func(*Processor) (T, error
 		defer putPooledProcessor(p)
 		return fn(p)
 	}
+	// A one-shot processor is discarded as soon as fn returns, so its cache can
+	// never serve a later Get — but New would still start the TTL cleanup
+	// goroutine and Extract would still hash the input and insert the result
+	// on every call. Zeroing the cache knobs removes those costs with no
+	// observable difference (the statistics die with the processor).
+	cfg.MaxCacheEntries = 0
+	cfg.CacheTTL = 0
+	cfg.CacheCleanup = 0
 	p, err := New(cfg)
 	if err != nil {
 		var zero T
@@ -165,6 +180,11 @@ func withProcessorBatch(pooled bool, cfg Config, itemCount int, fn func(*Process
 		}
 		defer putPooledProcessor(p)
 	} else {
+		// See withProcessor: a one-shot processor's cache can never be read
+		// again, so skip the cleanup goroutine and per-call cache writes.
+		cfg.MaxCacheEntries = 0
+		cfg.CacheTTL = 0
+		cfg.CacheCleanup = 0
 		var err error
 		p, err = New(cfg)
 		if err != nil {

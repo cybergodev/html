@@ -4,6 +4,29 @@ All notable changes to the cybergodev/html library will be documented in this fi
 
 ---
 
+## v1.4.9 - Correctness, Concurrency & Resource-Limit Fixes (2026-10-22)
+
+### Fixed
+- Cache keys hash the whole input; same-length documents differing only mid-way no longer collide and serve the wrong cached `Result`
+- NBSP folding no longer mis-rewrites ordinary text such as `#00a0ff`; article-scoring metrics agree with content metrics
+- Leading control bytes can no longer bypass the protocol-relative scheme policy (`//javascript:` / `//data:` / `//file:` blocked again)
+- Extraction no longer silently truncates past 50,000 nodes — media, links, `<base>`, title, tables and text content are now complete
+- Table colspan expansion is bounded table-wide, closing a ~780 MB hostile-table allocation
+- Markdown table cells containing `|` or `\` now align with their column header
+- Media `Type` is filled from the URL when markup declares none (e.g. `<video src="movie.mp4">`)
+- `Result` never aliases the caller's input buffer (cloned media URLs; timeout path copies the decoded document), fixing concurrent cache-hit races
+- The batch error-handling example now uses an oversize input so its failure path actually runs
+
+### Changed
+- Single-kind media configuration no longer scans the disabled kind; disabled kinds stay omitted from JSON
+- Removed ~550 lines of test-only production surface (entity re-decode, exported test helpers, string-sanitize round trip)
+- `docs/SECURITY.md` and README aligned with the buffer-ownership contract and current coverage
+
+### Added
+- Regression coverage for cache-key coverage, traversal past the walk cap, media URL aliasing, timeout copy semantics, and article selection
+
+---
+
 ## v1.4.8 - Security Audit Fixes, Performance & Production Readiness (2026-10-10)
 
 ### Security

@@ -55,7 +55,6 @@ type Cache[K comparable] struct {
 
 type cacheEntry[K comparable] struct {
 	prev, next *cacheEntry[K]
-	lastUsed   int64
 	expiresAt  int64
 	value      any
 	key        K
@@ -124,7 +123,6 @@ func (c *Cache[K]) Get(key K) any {
 	}
 
 	// Update LRU position
-	entry.lastUsed = now
 	c.moveToFront(entry)
 
 	return entry.value
@@ -142,7 +140,6 @@ func (c *Cache[K]) Set(key K, value any) {
 	// Check if key already exists (update case)
 	if entry, exists := c.entries[key]; exists {
 		entry.value = value
-		entry.lastUsed = now
 		if c.ttl > 0 {
 			entry.expiresAt = now + c.ttl.Nanoseconds()
 		}
@@ -158,7 +155,6 @@ func (c *Cache[K]) Set(key K, value any) {
 	// Create new entry
 	entry := &cacheEntry[K]{
 		value:     value,
-		lastUsed:  now,
 		key:       key,
 		expiresAt: 0,
 	}
@@ -270,6 +266,10 @@ func (c *Cache[K]) Clear() {
 //
 // This method is idempotent - calling it multiple times has no additional effect.
 //
+// Concurrency: StartCleanup, StopCleanup, and RestartCleanup are serialized
+// per Cache instance (cleanupMu covers the Once.Do below and the Once reset
+// in RestartCleanup), so they are safe to call concurrently with each other.
+//
 // IMPORTANT: The cleanup goroutine holds a reference to the Cache, so the
 // Cache can never be garbage-collected (and no finalizer could ever run)
 // while the goroutine is alive. Call StopCleanup() to release the goroutine
@@ -283,16 +283,28 @@ func (c *Cache[K]) Clear() {
 //	cache.StartCleanup(5 * time.Minute)
 //	defer cache.StopCleanup()
 func (c *Cache[K]) StartCleanup(interval time.Duration) context.CancelFunc {
+	c.cleanupMu.Lock()
+	defer c.cleanupMu.Unlock()
+	return c.startCleanupLocked(interval)
+}
+
+// startCleanupLocked starts the cleanup goroutine; c.cleanupMu must be held.
+// The interval is clamped here so every public entry point shares one policy.
+//
+// cleanupMu is held across the Once.Do as well: RestartCleanup resets
+// cleanupOnce under this same lock, so anchoring Do() inside the critical
+// section is what makes a concurrent StartCleanup/RestartCleanup pair
+// race-free (Do would otherwise read the cleanupOnce field while
+// RestartCleanup writes it). The Do closure runs with the lock already
+// held and therefore must not re-acquire it.
+func (c *Cache[K]) startCleanupLocked(interval time.Duration) context.CancelFunc {
 	if interval <= 0 {
 		interval = DefaultCacheCleanupInterval
 	}
 
 	c.cleanupOnce.Do(func() {
 		ctx, cancelFunc := context.WithCancel(context.Background())
-
-		c.cleanupMu.Lock()
 		c.cleanupCancel = cancelFunc
-		c.cleanupMu.Unlock()
 
 		go func() {
 			ticker := time.NewTicker(interval)
@@ -320,22 +332,32 @@ func (c *Cache[K]) StartCleanup(interval time.Duration) context.CancelFunc {
 		}()
 	})
 
-	// Always return the stored cancel func, even on repeated calls
-	c.cleanupMu.Lock()
-	cancel := c.cleanupCancel
-	c.cleanupMu.Unlock()
-	return cancel
+	// Always return the stored cancel func, even on repeated calls. After a
+	// StopCleanup the sync.Once is spent and no new goroutine starts, so the
+	// stored cancel is nil — return a no-op instead so a caller doing
+	// `defer cancel()` does not panic on a nil function.
+	if c.cleanupCancel == nil {
+		return func() {}
+	}
+	return c.cleanupCancel
 }
 
 // StopCleanup stops the background cleanup goroutine if it was started.
 // It is safe to call this method multiple times.
 func (c *Cache[K]) StopCleanup() {
 	c.cleanupMu.Lock()
-	cancel := c.cleanupCancel
-	c.cleanupCancel = nil
-	c.cleanupMu.Unlock()
+	defer c.cleanupMu.Unlock()
+	c.stopCleanupLocked()
+}
 
-	if cancel != nil {
+// stopCleanupLocked cancels a running cleanup goroutine; c.cleanupMu must be
+// held. Cancel runs under the lock (the previous public method canceled after
+// unlocking) so a RestartCleanup holding the lock observes a fully stopped
+// cleaner before it resets the Once. The cleanup goroutine itself never takes
+// cleanupMu, so canceling under it cannot deadlock.
+func (c *Cache[K]) stopCleanupLocked() {
+	if cancel := c.cleanupCancel; cancel != nil {
+		c.cleanupCancel = nil
 		cancel()
 	}
 }
@@ -351,23 +373,24 @@ func (c *Cache[K]) StopCleanup() {
 // It is retained as part of the Cache API for callers that manage the cleanup
 // lifecycle directly (and is exercised by TestCacheRestartCleanup).
 //
-// Concurrency: callers MUST serialize StartCleanup/StopCleanup/RestartCleanup
-// against each other for a given Cache. The cleanupOnce reset below is taken
-// under cleanupMu so it cannot race with a concurrent StartCleanup's Do(), but
-// the broader start→stop→restart sequence is not internally serialized.
+// Concurrency: StartCleanup, StopCleanup, and RestartCleanup are serialized
+// per Cache instance via cleanupMu (which covers both the cleanupOnce reset
+// below and StartCleanup's Once.Do), so they are safe to call concurrently
+// with each other on the same Cache.
 func (c *Cache[K]) RestartCleanup(interval time.Duration) {
-	c.StopCleanup()
-	// This assignment is NOT made race-free by cleanupMu alone: StartCleanup
-	// reads cleanupOnce via Do() WITHOUT that lock (it only takes cleanupMu
-	// inside the Do closure and again afterward to read cleanupCancel). Safety
-	// against a concurrent StartCleanup therefore rests entirely on the caller
-	// honoring the "MUST serialize" contract in the method doc above. cleanupMu
-	// is still taken here to keep this write ordered with the cleanupCancel
-	// reads/writes in StartCleanup/StopCleanup.
 	c.cleanupMu.Lock()
+	defer c.cleanupMu.Unlock()
+	// Atomic under the lock: stop, reset the Once, start. The previous
+	// three-step sequence released the lock between the steps, so a
+	// concurrent StartCleanup could slip in between the stop and the Once
+	// reset — its goroutine's cancel func was then overwritten by the start
+	// below, and that first goroutine (holding its Cache reference) leaked
+	// for good. Holding cleanupMu across all three steps makes the restart
+	// one indivisible transition, honoring the documented "safe to call
+	// concurrently" contract.
+	c.stopCleanupLocked()
 	c.cleanupOnce = sync.Once{}
-	c.cleanupMu.Unlock()
-	c.StartCleanup(interval)
+	c.startCleanupLocked(interval)
 }
 
 // cleanupExpired removes all expired entries from the cache.

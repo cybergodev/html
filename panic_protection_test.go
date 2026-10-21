@@ -416,3 +416,79 @@ func TestPanicRecovery_PanickingAuditSinkClose(t *testing.T) {
 	// aborting the process.
 	_ = p.Close()
 }
+
+// TestPanicRecovery_ZeroValueProcessor verifies that a hand-built zero-value
+// Processor (legal for external code: exported type, unexported fields, empty
+// composite literal) cannot panic the public API. The Extract family already
+// folds its nil-config dereference into ErrInternalPanic inside recoverPanic,
+// but the batch family previously dereferenced p.config on the caller's
+// goroutine with no recover at all, and ClearCache/Close dereferenced a nil
+// p.cache — both escaped as process-crashing panics. The batch cases run
+// before the lifecycle calls because Close marks the processor closed, which
+// would short-circuit them to ErrProcessorClosed instead.
+func TestPanicRecovery_ZeroValueProcessor(t *testing.T) {
+	t.Parallel()
+
+	p := &html.Processor{} // zero value: nil config, nil cache, nil audit
+
+	batchCases := []struct {
+		name string
+		run  func() *html.BatchResult
+	}{
+		{"ExtractBatch", func() *html.BatchResult { return p.ExtractBatch([][]byte{[]byte(testHTML)}) }},
+		{"ExtractBatchWithContext", func() *html.BatchResult {
+			return p.ExtractBatchWithContext(context.Background(), [][]byte{[]byte(testHTML)})
+		}},
+		{"ExtractBatchFiles", func() *html.BatchResult { return p.ExtractBatchFiles([]string{"a.html"}) }},
+		{"ExtractBatchFilesWithContext", func() *html.BatchResult {
+			return p.ExtractBatchFilesWithContext(context.Background(), []string{"a.html"})
+		}},
+	}
+	for _, tc := range batchCases {
+		br := tc.run()
+		if br == nil {
+			t.Fatalf("%s: returned nil BatchResult", tc.name)
+		}
+		if br.Failed != 1 || br.Success != 0 {
+			t.Errorf("%s: expected Failed=1 Success=0, got Failed=%d Success=%d", tc.name, br.Failed, br.Success)
+		}
+		if len(br.Errors) != 1 || !errors.Is(br.Errors[0], html.ErrInternalPanic) {
+			t.Errorf("%s: expected ErrInternalPanic, got: %v", tc.name, br.Errors)
+		}
+	}
+
+	// Lifecycle methods must be safe no-ops on a zero-value Processor.
+	p.ClearCache()
+	if err := p.Close(); err != nil {
+		t.Errorf("zero-value Close should return nil, got: %v", err)
+	}
+}
+
+// TestPanicRecovery_BatchNilContext verifies that a nil context — caller error
+// by Go convention — surfaces as a uniform ErrInternalPanic BatchResult
+// instead of a caller-goroutine panic in the Done() selects, matching what
+// ExtractWithContext already does for the same input via recoverPanic.
+func TestPanicRecovery_BatchNilContext(t *testing.T) {
+	t.Parallel()
+
+	p, err := html.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+
+	// The nil ctx is the input under test (SA1012 is the point: callers do
+	// pass nil by mistake, and the API must not crash their process).
+	br := p.ExtractBatchWithContext(nil, [][]byte{[]byte(testHTML)}) //nolint:staticcheck // deliberately nil
+	if br.Failed != 1 || br.Success != 0 {
+		t.Fatalf("expected Failed=1 Success=0, got Failed=%d Success=%d", br.Failed, br.Success)
+	}
+	if len(br.Errors) != 1 || !errors.Is(br.Errors[0], html.ErrInternalPanic) {
+		t.Fatalf("expected ErrInternalPanic for nil context, got: %v", br.Errors)
+	}
+
+	brf := p.ExtractBatchFilesWithContext(nil, []string{"a.html"}) //nolint:staticcheck // deliberately nil
+	if brf.Failed != 1 || brf.Success != 0 || !errors.Is(brf.Errors[0], html.ErrInternalPanic) {
+		t.Fatalf("expected ErrInternalPanic for nil context (files), got: %v", brf.Errors)
+	}
+}

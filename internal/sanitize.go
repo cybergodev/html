@@ -75,7 +75,15 @@ func TruncateAuditURL(url string) string {
 	if len(url) <= maxAuditURLLength {
 		return url
 	}
-	return url[:maxAuditURLLength] + "...[truncated]"
+	cut := maxAuditURLLength
+	// Back the cut off UTF-8 continuation bytes so the truncated value stays
+	// valid UTF-8 — audit logs are routinely re-encoded as JSON downstream,
+	// and a split rune would surface as an encoding error there. Mirrors the
+	// rune-safe cut in the root package's RawValue truncation.
+	for cut > 0 && url[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return url[:cut] + "...[truncated]"
 }
 
 // sanitizeStyleValue removes dangerous CSS constructs from a style attribute value.
@@ -103,12 +111,14 @@ var uriAttributes = map[string]bool{
 	"longdesc":   true,
 	"usemap":     true,
 	"profile":    true,
+	// Multi-URL attributes: srcset lists image candidates ("a.png 1x, b.png
+	// 2x"), ping lists beacon URLs. Neither is a single URL, but the scheme
+	// policy below still applies to the value as a whole, so a hidden
+	// "javascript:" or scriptable data: prefix cannot ride through unchecked.
+	"srcset": true,
+	"ping":   true,
 	// SVG attack vectors - xlink:href can execute JavaScript
 	"xlink:href": true,
-}
-
-func SanitizeHTML(htmlContent string) string {
-	return SanitizeHTMLWithAudit(htmlContent, NoOpAuditRecorder{})
 }
 
 // SanitizeDOM sanitizes an already-parsed HTML DOM tree in-place.
@@ -121,70 +131,12 @@ func SanitizeDOM(doc *html.Node, audit AuditRecorder) {
 	sanitizeNodeWithAudit(doc, audit)
 }
 
-// SanitizeHTMLWithAudit sanitizes HTML content and records security events.
-// The audit recorder receives events for blocked tags, attributes, and URLs.
-func SanitizeHTMLWithAudit(htmlContent string, audit AuditRecorder) string {
-	if htmlContent == "" {
-		return ""
-	}
-
-	doc, err := html.Parse(strings.NewReader(htmlContent))
-	if err != nil {
-		return ""
-	}
-
-	sanitizeNodeWithAudit(doc, audit)
-
-	// Find body element and extract its content properly
-	body := findBodyElement(doc)
-	if body == nil {
-		// No body element found, render the entire document (fragment case)
-		buf := GetBuffer()
-		defer PutBuffer(buf)
-
-		if err := html.Render(buf, doc); err != nil {
-			return ""
-		}
-		result := buf.String()
-		// Remove the automatic html/head/body wrapper for fragments
-		result = strings.ReplaceAll(result, "<html><head></head><body>", "")
-		result = strings.ReplaceAll(result, "</body></html>", "")
-		return result
-	}
-
-	buf := GetBuffer()
-	defer PutBuffer(buf)
-
-	for child := body.FirstChild; child != nil; child = child.NextSibling {
-		if err := html.Render(buf, child); err != nil {
-			continue
-		}
-	}
-
-	return buf.String()
-}
-
-// findBodyElement locates the body element in the parsed HTML document.
-// html.Parse nests <body> under <html> (Document → html → {head, body}), so
-// <body> is a grandchild of the document node rather than a direct child; a
-// direct-children walk (the old implementation) therefore returned nil for
-// every real document and forced SanitizeHTMLWithAudit onto its fragment
-// fallback, leaking <html><head>… into output when head carried surviving
-// content. FindElementByTag descends the subtree to locate it correctly. The
-// DocumentNode guard above is retained so non-document input still returns nil.
-func findBodyElement(doc *html.Node) *html.Node {
-	if doc.Type != html.DocumentNode {
-		return nil
-	}
-	return FindElementByTag(doc, "body")
-}
-
 // sanitizeNodeWithAudit sanitizes n and its entire subtree in place.
 //
 // The traversal is iterative with an explicit stack rather than recursive:
-// SanitizeDOM's callers pre-validate nesting depth, but SanitizeHTMLWithAudit
-// parses arbitrary strings, and a recursive walk on hostile deeply nested
-// input could exhaust the call stack before any depth guard ran. Children
+// SanitizeDOM's callers pre-validate nesting depth, but the traversal must not
+// depend on that — a recursive walk on hostile deeply nested input could
+// exhaust the call stack before a depth guard ran. Children
 // are pushed in reverse so they pop in document order, exactly matching the
 // previous pre-order recursion, and sibling pointers saved on the stack are
 // unaffected by removals performed deeper in the walk. The stack is pooled,
@@ -256,15 +208,13 @@ func sanitizeNodeInPlace(n *html.Node, audit AuditRecorder) bool {
 					continue
 				}
 				if attrKey == "style" {
-					sanitized := sanitizeStyleValue(attr.Val)
-					if sanitized == "" {
+					// sanitizeStyleValue returns either "" (blocked) or its
+					// input unchanged, so there is no partial-rewrite case to
+					// write back here.
+					if sanitizeStyleValue(attr.Val) == "" {
 						audit.RecordBlockedAttr(attr.Key, attr.Val)
 						modified = true
 						continue
-					}
-					if sanitized != attr.Val {
-						attr.Val = sanitized
-						modified = true
 					}
 				}
 				if uriAttributes[attrKey] {
@@ -297,6 +247,64 @@ func removeNode(n *html.Node) {
 	}
 }
 
+// dangerousSchemePrefixes lists the scheme prefixes blocked everywhere a URI
+// is checked, in evaluation order: javascript:, vbscript:, file:. data: is
+// deliberately absent — every check site gives it a dedicated branch because
+// safe data: image URLs are conditionally allowed. This table is the single
+// source of a policy that was previously hand-copied across four call sites
+// (the fast and slow paths of both isSafeURIWithAudit and
+// containsDangerousScheme) and kept in sync only by comments and a
+// differential test; add a scheme here and every site picks it up.
+var dangerousSchemePrefixes = []string{"javascript:", "vbscript:", "file:"}
+
+// protocolRelativeBlockedPrefixes lists the scheme prefixes blocked in
+// protocol-relative form ("//javascript:…" and friends), evaluated after
+// trimming ASCII whitespace following the "//". Unlike the direct list it
+// includes data: — no protocol-relative data: URL is safe.
+var protocolRelativeBlockedPrefixes = []string{"javascript:", "vbscript:", "data:", "file:"}
+
+// blockedFoldPrefix returns the first policy prefix in list matched by an
+// ASCII-case-insensitive prefix comparison against s, or "". Used on the
+// printable-ASCII fast paths, where folding on raw bytes is exact.
+func blockedFoldPrefix(s string, list []string) string {
+	for _, p := range list {
+		if asciiFoldHasPrefix(s, p) {
+			return p
+		}
+	}
+	return ""
+}
+
+// blockedDangerousPrefix returns the first policy prefix in list for which
+// isDangerousScheme(s, p) holds, or "". Used on the normalized slow paths,
+// which pass an NFC/trim/lowercased URI; isDangerousScheme carries the
+// remaining Unicode-disguise comparisons.
+func blockedDangerousPrefix(s string, list []string) string {
+	for _, p := range list {
+		if isDangerousScheme(s, p) {
+			return p
+		}
+	}
+	return ""
+}
+
+// protocolRelativeRemainder returns the lowercased remainder of s after a
+// leading "//" — with leading C0/space removed and the bytes browsers delete
+// while parsing a URL (tab, LF, CR) stripped — or "" when s is not
+// protocol-relative.
+//
+// The trailing slice must come from the same C0-stripped string that passed
+// the "//" test. Slicing the unstripped text instead was a bypass: with two
+// leading control bytes, trimmed[2:] consumed the "//" and the remainder began
+// at "javascript:", so the "//javascript:" policy prefix no longer matched.
+func protocolRelativeRemainder(s string) string {
+	rest, ok := strings.CutPrefix(s, "//")
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(stripURLWhitespace(strings.TrimLeft(rest, c0ControlOrSpace)))
+}
+
 func isSafeURIWithAudit(uri string, audit AuditRecorder) bool {
 	if uri == "" {
 		return true
@@ -315,24 +323,13 @@ func isSafeURIWithAudit(uri string, audit AuditRecorder) bool {
 			audit.RecordBlockedURL(TruncateAuditURL(uri), "URL exceeds size limit")
 			return false
 		}
-		if asciiFoldHasPrefix(uri, "javascript:") {
-			audit.RecordBlockedURL(TruncateAuditURL(uri), "javascript scheme")
-			return false
-		}
-		if asciiFoldHasPrefix(uri, "vbscript:") {
-			audit.RecordBlockedURL(TruncateAuditURL(uri), "vbscript scheme")
-			return false
-		}
-		if asciiFoldHasPrefix(uri, "file:") {
-			audit.RecordBlockedURL(TruncateAuditURL(uri), "file scheme")
+		if s := blockedFoldPrefix(uri, dangerousSchemePrefixes); s != "" {
+			audit.RecordBlockedURL(TruncateAuditURL(uri), strings.TrimSuffix(s, ":")+" scheme")
 			return false
 		}
 		if strings.HasPrefix(uri, "//") {
 			rest := strings.TrimLeft(uri[2:], " \t\n\r")
-			if asciiFoldHasPrefix(rest, "javascript:") ||
-				asciiFoldHasPrefix(rest, "vbscript:") ||
-				asciiFoldHasPrefix(rest, "data:") ||
-				asciiFoldHasPrefix(rest, "file:") {
+			if blockedFoldPrefix(rest, protocolRelativeBlockedPrefixes) != "" {
 				audit.RecordBlockedURL(TruncateAuditURL(uri), "dangerous protocol-relative URL")
 				return false
 			}
@@ -390,41 +387,29 @@ func isSafeURIWithAudit(uri string, audit AuditRecorder) bool {
 		return false
 	}
 
-	// SECURITY: Check for dangerous schemes with multiple Unicode attack vectors.
-	// Every RecordBlockedURL below passes TruncateAuditURL(uri): these branches
-	// are reached only after the MaxURLLength gate above, but the data: branch
-	// is exempt from that gate and can carry megabytes, and a future recorder
-	// implementation must never receive an unbounded URL.
-
-	// Check for javascript: scheme and its Unicode variants
-	if isDangerousScheme(lowerURI, "javascript:") {
-		audit.RecordBlockedURL(TruncateAuditURL(uri), "javascript scheme")
-		return false
-	}
-
-	// Check for vbscript: scheme and its Unicode variants
-	if isDangerousScheme(lowerURI, "vbscript:") {
-		audit.RecordBlockedURL(TruncateAuditURL(uri), "vbscript scheme")
-		return false
-	}
-
-	// Check for file: scheme and its Unicode variants
-	if isDangerousScheme(lowerURI, "file:") {
-		audit.RecordBlockedURL(TruncateAuditURL(uri), "file scheme")
+	// SECURITY: Check for dangerous schemes with multiple Unicode attack
+	// vectors, via the shared policy tables. Every RecordBlockedURL below
+	// passes TruncateAuditURL(uri): these branches are reached only after
+	// the MaxURLLength gate above, but the data: branch is exempt from that
+	// gate and can carry megabytes, and a future recorder implementation
+	// must never receive an unbounded URL.
+	if s := blockedDangerousPrefix(lowerURI, dangerousSchemePrefixes); s != "" {
+		audit.RecordBlockedURL(TruncateAuditURL(uri), strings.TrimSuffix(s, ":")+" scheme")
 		return false
 	}
 
 	// Check for dangerous protocol-relative URL patterns
-	// Block //javascript:, //vbscript:, etc. with potential whitespace bypass
-	if strings.HasPrefix(trimmed, "//") {
-		restLower := strings.ToLower(strings.TrimLeft(trimmed[2:], " \t\n\r"))
-		if isDangerousScheme(restLower, "javascript:") ||
-			isDangerousScheme(restLower, "vbscript:") ||
-			isDangerousScheme(restLower, "data:") ||
-			isDangerousScheme(restLower, "file:") {
-			audit.RecordBlockedURL(TruncateAuditURL(uri), "dangerous protocol-relative URL")
-			return false
-		}
+	// Block //javascript:, //vbscript:, etc. with potential whitespace bypass.
+	// The check runs against schemeStripped (C0-stripped) for BOTH the "//"
+	// test and the remainder, so a leading control byte cannot disguise the
+	// protocol-relative form. Slicing the unstripped `trimmed` here was a
+	// hole: with two leading C0 bytes, trimmed[2:] consumed the "//" and the
+	// remainder began at "javascript:", which no longer matched the
+	// "//javascript:" policy prefix.
+	if blockedDangerousPrefix(
+		protocolRelativeRemainder(schemeStripped), protocolRelativeBlockedPrefixes) != "" {
+		audit.RecordBlockedURL(TruncateAuditURL(uri), "dangerous protocol-relative URL")
+		return false
 	}
 
 	if strings.HasPrefix(lowerURI, "data:") {
@@ -558,21 +543,16 @@ func asciiFoldContains(s, substr string) bool {
 // isPlainPrintableASCII): direct ASCII-fold prefix checks replace the
 // NFC/trim/lowercase pipeline, which is an identity on such input.
 func containsDangerousSchemeFast(uri string) bool {
-	if asciiFoldHasPrefix(uri, "javascript:") ||
-		asciiFoldHasPrefix(uri, "vbscript:") ||
-		asciiFoldHasPrefix(uri, "file:") {
+	if blockedFoldPrefix(uri, dangerousSchemePrefixes) != "" {
 		return true
 	}
-	// Protocol-relative dangerous forms, mirroring the slow path's TrimLeft of
-	// ASCII whitespace after the "//". A printable-ASCII uri cannot actually
-	// contain those bytes (isPlainPrintableASCII rejects them), so the trim is
-	// a provable no-op kept for structural parallelism with the slow path.
-	if strings.HasPrefix(uri, "//") {
-		rest := strings.TrimLeft(uri[2:], " \t\n\r")
-		if asciiFoldHasPrefix(rest, "javascript:") ||
-			asciiFoldHasPrefix(rest, "vbscript:") ||
-			asciiFoldHasPrefix(rest, "data:") ||
-			asciiFoldHasPrefix(rest, "file:") {
+	// Protocol-relative dangerous forms, via the same helper the slow paths
+	// use. A printable-ASCII uri cannot contain C0 controls or whitespace
+	// (isPlainPrintableASCII rejects them), so the trims inside the helper are
+	// provable no-ops here — but sharing the helper keeps a single
+	// implementation of the "//" policy.
+	if rest, ok := strings.CutPrefix(uri, "//"); ok {
+		if blockedFoldPrefix(rest, protocolRelativeBlockedPrefixes) != "" {
 			return true
 		}
 	}
@@ -616,30 +596,30 @@ func containsDangerousScheme(uri string) bool {
 	schemeStripped := strings.Trim(trimmed, c0ControlOrSpace)
 	lowerURI := strings.ToLower(stripURLWhitespace(schemeStripped))
 
-	if isDangerousScheme(lowerURI, "javascript:") ||
-		isDangerousScheme(lowerURI, "vbscript:") ||
-		isDangerousScheme(lowerURI, "file:") {
+	if blockedDangerousPrefix(lowerURI, dangerousSchemePrefixes) != "" {
 		return true
 	}
 
 	// Protocol-relative dangerous forms: //javascript:, //vbscript:, //data:,
-	// //file:. Match the sanitizer's protocol-relative branch (including the
-	// TrimLeft of ASCII whitespace after the //) so the two stay consistent.
-	if strings.HasPrefix(trimmed, "//") {
-		restLower := strings.ToLower(strings.TrimLeft(trimmed[2:], " \t\n\r"))
-		if isDangerousScheme(restLower, "javascript:") ||
-			isDangerousScheme(restLower, "vbscript:") ||
-			isDangerousScheme(restLower, "data:") ||
-			isDangerousScheme(restLower, "file:") {
-			return true
-		}
+	// //file:. Shares the sanitizer's helper so both entry points run the same
+	// C0-stripped "//" test over the same string they then slice.
+	if blockedDangerousPrefix(
+		protocolRelativeRemainder(schemeStripped), protocolRelativeBlockedPrefixes) != "" {
+		return true
 	}
 
 	return false
 }
 
 func isValidDataURLWithAudit(url string, audit AuditRecorder) bool {
-	if !strings.HasPrefix(url, "data:") {
+	// Scheme names are case-insensitive (RFC 3986 §3.1) and browsers accept
+	// "DATA:" data URLs. Both callers gate this function behind a
+	// case-insensitive "data:" prefix test, so this re-check must fold case
+	// too: a case-sensitive test made every uppercase data URL fail here
+	// without recording an audit event — valid "DATA:image/png" images were
+	// silently dropped, and the same case-sensitive test in IsValidURL let
+	// scriptable "DATA:text/html" URLs through instead.
+	if len(url) < 5 || !strings.EqualFold(url[:5], "data:") {
 		return false
 	}
 

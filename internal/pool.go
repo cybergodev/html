@@ -2,8 +2,6 @@
 package internal
 
 import (
-	"bytes"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -14,14 +12,8 @@ import (
 
 // Pool configuration constants
 const (
-	// builderPoolInitialCapacity is the initial capacity for pooled strings.Builder
-	// Increased from 256 to 1024 to reduce reallocations for typical HTML content
-	builderPoolInitialCapacity = 1024
 
-	// bufferPoolInitialCapacity is the initial capacity for pooled bytes.Buffer
-	bufferPoolInitialCapacity = 1024
-
-	// maxPooledByteCap is the largest []byte/bytes.Buffer capacity that is returned
+	// maxPooledByteCap is the largest []byte capacity that is returned
 	// to a pool. Buffers that grew beyond this (e.g. a multi-MB extraction result)
 	// are dropped on Put so the pool does not retain them indefinitely — the
 	// classic sync.Pool retention footgun, where one oversized buffer is handed
@@ -95,165 +87,9 @@ func logPoolCorruption(poolName, expectedType string, got any) {
 	}
 }
 
-// BuilderPool is a sync.Pool for strings.Builder instances.
-// Use this for functions that build strings incrementally to reduce allocations.
-//
-// For most use cases, prefer the helper functions GetBuilder() and PutBuilder():
-//
-//	sb := internal.GetBuilder()
-//	defer internal.PutBuilder(sb)
-//	sb.Grow(estimatedSize)
-//	// ... use sb ...
-//	return sb.String()
-//
-// Direct pool access is also available for advanced use cases:
-//
-//	sbPtr := internal.BuilderPool.Get().(*strings.Builder)
-//	sb := *sbPtr
-//	defer func() {
-//	    sb.Reset()
-//	    internal.BuilderPool.Put(sbPtr)
-//	}()
-var BuilderPool = sync.Pool{
-	New: func() any {
-		sb := &strings.Builder{}
-		sb.Grow(builderPoolInitialCapacity)
-		return sb
-	},
-}
-
-// BufferPool is a sync.Pool for bytes.Buffer instances.
-// Use this for functions that work with byte slices to reduce allocations.
-//
-// For most use cases, prefer the helper functions GetBuffer() and PutBuffer():
-//
-//	buf := internal.GetBuffer()
-//	defer internal.PutBuffer(buf)
-//	buf.Grow(estimatedSize)
-//	// ... use buf ...
-//	return buf.Bytes()
-//
-// Direct pool access is also available for advanced use cases:
-//
-//	bufPtr := internal.BufferPool.Get().(*bytes.Buffer)
-//	buf := *bufPtr
-//	defer func() {
-//	    buf.Reset()
-//	    internal.BufferPool.Put(bufPtr)
-//	}()
-var BufferPool = sync.Pool{
-	New: func() any {
-		return bytes.NewBuffer(make([]byte, 0, bufferPoolInitialCapacity))
-	},
-}
-
-// GetBuilder gets a strings.Builder from the pool.
-// The returned builder has been reset and is ready for use.
-// Call PutBuilder when done to return it to the pool.
-//
-// IMPORTANT: Callers MUST ensure PutBuilder is called even on error paths.
-// Use defer immediately after GetBuilder to guarantee cleanup:
-//
-//	sb := internal.GetBuilder()
-//	defer internal.PutBuilder(sb)
-//	// ... use sb ...
-//
-// Failure to return the builder to the pool will not cause memory leaks
-// (the GC will collect it), but will reduce the effectiveness of the pool.
-func GetBuilder() *strings.Builder {
-	v := BuilderPool.Get()
-	sb, ok := v.(*strings.Builder)
-	if !ok {
-		// Log pool corruption if debugging is enabled
-		logPoolCorruption("BuilderPool", "*strings.Builder", v)
-		// Fallback: return a new builder if pool is corrupted
-		sb = &strings.Builder{}
-		sb.Grow(builderPoolInitialCapacity)
-	}
-	return sb
-}
-
-// PutBuilder returns a strings.Builder to the pool.
-// The builder is reset before being returned to the pool.
-// It is safe to call PutBuilder with a nil pointer (no-op).
-//
-// SECURITY: When poolSecureClear is enabled, the builder is NOT returned to
-// the pool. Unlike bytes.Buffer, strings.Builder exposes no mutable accessor
-// for its internal []byte (String() shares immutable memory, and the Write*
-// methods only append), so the buffer cannot be zeroed in place without
-// coupling to its unexported, version-specific layout via reflect/unsafe.
-// Dropping the builder instead of repooling still honors the secure-clear
-// intent: the builder and its buffer are never reused, so no prior content can
-// leak into a later GetBuilder call. The cost is reduced pooling effectiveness,
-// which is the accepted trade-off for an opt-in paranoid mode.
-func PutBuilder(sb *strings.Builder) {
-	if sb == nil {
-		return
-	}
-	sb.Reset()
-	if poolSecureClear.Load() {
-		// Do not return to the pool; let the GC reclaim the builder and its
-		// buffer so the sensitive content is not retained for reuse.
-		return
-	}
-	BuilderPool.Put(sb)
-}
-
-// GetBuffer gets a bytes.Buffer from the pool.
-// The returned buffer has been reset and is ready for use.
-// Call PutBuffer when done to return it to the pool.
-//
-// IMPORTANT: Callers MUST ensure PutBuffer is called even on error paths.
-// Use defer immediately after GetBuffer to guarantee cleanup:
-//
-//	buf := internal.GetBuffer()
-//	defer internal.PutBuffer(buf)
-//	// ... use buf ...
-//
-// Failure to return the buffer to the pool will not cause memory leaks
-// (the GC will collect it), but will reduce the effectiveness of the pool.
-func GetBuffer() *bytes.Buffer {
-	v := BufferPool.Get()
-	buf, ok := v.(*bytes.Buffer)
-	if !ok {
-		// Log pool corruption if debugging is enabled
-		logPoolCorruption("BufferPool", "*bytes.Buffer", v)
-		// Fallback: return a new buffer if pool is corrupted
-		buf = bytes.NewBuffer(make([]byte, 0, bufferPoolInitialCapacity))
-	}
-	return buf
-}
-
-// PutBuffer returns a bytes.Buffer to the pool.
-// The buffer is reset before being returned to the pool.
-// It is safe to call PutBuffer with a nil pointer (no-op).
-//
-// SECURITY: When poolSecureClear is enabled, the buffer's internal data
-// is zeroed before being returned to prevent data leakage.
-func PutBuffer(buf *bytes.Buffer) {
-	if buf == nil {
-		return
-	}
-	// Drop oversized buffers so the pool does not retain a multi-MB backing array
-	// indefinitely (see maxPooledByteCap rationale).
-	if cap(buf.Bytes()) > maxPooledByteCap {
-		return
-	}
-	// SECURITY: Optionally clear sensitive data before returning to pool
-	if poolSecureClear.Load() {
-		// Zero out the buffer contents before reset
-		b := buf.Bytes()
-		for i := range b {
-			b[i] = 0
-		}
-	}
-	buf.Reset()
-	BufferPool.Put(buf)
-}
-
 // byteBufPool pools reusable []byte scratch buffers.
 //
-// Unlike BuilderPool, whose *strings.Builder loses its backing array on every
+// Unlike a pooled *strings.Builder, which loses its backing array on every
 // Reset() (strings.Builder.Reset sets buf = nil), a pooled []byte retains its
 // capacity across uses because it is reset with [:0]. On hot paths that build a
 // string per call (e.g. GetTextContent, invoked once per <a> and per table cell),
@@ -286,6 +122,11 @@ func GetByteBuf() *[]byte {
 
 // PutByteBuf returns a buffer obtained from GetByteBuf to the pool, retaining its
 // capacity for reuse. Safe to call with nil.
+//
+// SECURITY: When poolSecureClear is enabled, the whole backing array is zeroed
+// before the buffer is returned. These buffers carry extracted document text
+// (GetTextContent, the entity passes, CleanText scratch space), so the opt-in
+// anti-leakage guarantee must cover them, not just the bytes.Buffer pool.
 func PutByteBuf(bp *[]byte) {
 	if bp == nil {
 		return
@@ -295,13 +136,17 @@ func PutByteBuf(bp *[]byte) {
 	if cap(*bp) > maxPooledByteCap {
 		return
 	}
-	*bp = (*bp)[:0]
+	if poolSecureClear.Load() {
+		clear((*bp)[:cap(*bp)])
+	} else {
+		*bp = (*bp)[:0]
+	}
 	byteBufPool.Put(bp)
 }
 
 // trackedBuilderPool pools *table.TrackedBuilder instances for the text-extraction
 // hot path. A TrackedBuilder is []byte-backed, so its Reset (buf[:0]) retains the
-// backing capacity across uses — unlike BuilderPool's *strings.Builder, whose
+// backing capacity across uses — unlike a pooled *strings.Builder, whose
 // Reset nils the buffer. extractTextContent builds a document-length string per
 // Extract() call, so reusing a buffer that is already large enough after warmup
 // removes the per-call growth allocations and the GC churn they cause.
@@ -320,6 +165,10 @@ func GetTrackedBuilder() *table.TrackedBuilder {
 // PutTrackedBuilder returns a TrackedBuilder to the pool. Oversized buffers are
 // dropped (see maxPooledByteCap) so a single huge document cannot make the pool
 // retain a multi-MB backing array indefinitely.
+//
+// SECURITY: When poolSecureClear is enabled, the backing array is zeroed via
+// SecureClear — these builders hold the entire extracted document, the most
+// sensitive data the pool retains.
 func PutTrackedBuilder(tb *table.TrackedBuilder) {
 	if tb == nil {
 		return
@@ -327,57 +176,77 @@ func PutTrackedBuilder(tb *table.TrackedBuilder) {
 	if tb.Cap() > maxPooledByteCap {
 		return
 	}
-	tb.Reset()
+	if poolSecureClear.Load() {
+		tb.SecureClear()
+	} else {
+		tb.Reset()
+	}
 	trackedBuilderPool.Put(tb)
 }
 
-// TransformBufferPool is a sync.Pool for byte slices used in encoding transformation.
-// These buffers are used for charset conversion operations.
-var TransformBufferPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, 0, 8192)
-		return &buf
-	},
-}
+// maxPooledResultScratchElems bounds the element count of a SlicePool scratch
+// slice that is returned to its pool. Result slices (images, links) are copied
+// out to exact size before escaping, so the scratch only feeds appends; a slice
+// grown beyond this bound indicates a pathologically link-dense document whose
+// backing array should not be retained per-P. At ≤512 elements the retained
+// arrays stay in the same size class neighborhood as maxPooledByteCap's intent.
+const maxPooledResultScratchElems = 512
 
-// GetTransformBuffer gets a byte slice from the transform buffer pool.
-// The returned slice has zero length but retained capacity.
-func GetTransformBuffer() *[]byte {
-	v := TransformBufferPool.Get()
-	buf, ok := v.(*[]byte)
-	if !ok {
-		// Log pool corruption if debugging is enabled
-		logPoolCorruption("TransformBufferPool", "*[]byte", v)
-		// Fallback: return a new buffer if pool is corrupted
-		newBuf := make([]byte, 0, 8192)
-		return &newBuf
-	}
-	return buf
-}
-
-// PutTransformBuffer returns a byte slice to the transform buffer pool.
-// The slice is reset to zero length before being returned.
-// It is safe to call PutTransformBuffer with a nil pointer (no-op).
+// SlicePool reuses grow-only scratch slices of T across calls. Callers append
+// into the borrowed slice and then copy the finished run out to an exactly
+// sized result, so the backing array's growth is amortized to zero across
+// calls instead of leaving doubled-and-discarded intermediate arrays for the
+// GC on every call (the classic append-growth churn).
 //
-// SECURITY: When poolSecureClear is enabled, the buffer's data is zeroed
-// before being returned to prevent data leakage.
-func PutTransformBuffer(buf *[]byte) {
-	if buf == nil {
+// Usage:
+//
+//	sp := internal.NewSlicePool[ImageInfo](16)
+//	scratch := sp.Get()
+//	defer sp.Put(scratch)
+//	*scratch = append(*scratch, ...)
+//	result := make([]ImageInfo, len(*scratch))
+//	copy(result, *scratch)
+//
+// The borrowed slice must not be retained past Put (the backing array is
+// reused). SECURITY: unlike the byte-buffer pools, these scratch slices hold
+// structured result values, not raw document text; zeroing them on Put is not
+// provided because the values are copies of data the caller already holds in
+// the returned result.
+type SlicePool[T any] struct {
+	pool sync.Pool
+}
+
+// NewSlicePool creates a SlicePool whose first borrowed slice starts with the
+// given initial capacity.
+func NewSlicePool[T any](initialCap int) *SlicePool[T] {
+	return &SlicePool[T]{
+		pool: sync.Pool{
+			New: func() any {
+				s := make([]T, 0, initialCap)
+				return &s
+			},
+		},
+	}
+}
+
+// Get returns a zero-length slice backed by a capacity-retaining pooled array.
+func (sp *SlicePool[T]) Get() *[]T {
+	s := sp.pool.Get().(*[]T)
+	*s = (*s)[:0]
+	return s
+}
+
+// Put returns a scratch slice to the pool, retaining its capacity. Oversized
+// slices are dropped (see maxPooledResultScratchElems). Safe to call with nil.
+func (sp *SlicePool[T]) Put(s *[]T) {
+	if s == nil {
 		return
 	}
-	// Drop oversized buffers so the pool does not retain a multi-MB backing array
-	// indefinitely (see maxPooledByteCap rationale).
-	if cap(*buf) > maxPooledByteCap {
+	if cap(*s) > maxPooledResultScratchElems {
 		return
 	}
-	// SECURITY: Optionally clear sensitive data before returning to pool
-	if poolSecureClear.Load() {
-		for i := range *buf {
-			(*buf)[i] = 0
-		}
-	}
-	*buf = (*buf)[:0]
-	TransformBufferPool.Put(buf)
+	*s = (*s)[:0]
+	sp.pool.Put(s)
 }
 
 // NodeSlicePool is a sync.Pool for HTML node slices used in tree traversal.
@@ -419,11 +288,14 @@ func PutNodeSlice(s *[]*html.Node) {
 		return
 	}
 	// SECURITY: Optionally clear node pointers to prevent potential
-	// stale pointer access or information leakage
+	// stale pointer access or information leakage. Clear the whole capacity,
+	// not just len(*s): both borrowers return the slice at length zero on
+	// natural completion, so a len-bounded loop cleared nothing while stale
+	// *html.Node pointers stayed in the capacity-retained region — pinning
+	// entire parsed DOM documents in memory for as long as the slice sits in
+	// the pool. Mirrors PutByteBuf's cap-wide clear.
 	if poolSecureClear.Load() {
-		for i := range *s {
-			(*s)[i] = nil
-		}
+		clear((*s)[:cap(*s)])
 	}
 	*s = (*s)[:0]
 	NodeSlicePool.Put(s)

@@ -79,6 +79,17 @@ func (tb *TrackedBuilder) Reset() {
 	tb.LastChar = 0
 }
 
+// SecureClear zeroes the entire backing array (up to cap, not just len) and
+// resets the builder. It implements internal.SetPoolSecureClear's
+// no-data-retention guarantee for pooled builders: these buffers carry whole
+// extracted documents, so a plain Reset would leave the document text in the
+// pooled backing array until a later write overwrote it.
+func (tb *TrackedBuilder) SecureClear() {
+	clear(tb.buf[:cap(tb.buf)])
+	tb.buf = tb.buf[:0]
+	tb.LastChar = 0
+}
+
 // Len returns the number of bytes written so far.
 func (tb *TrackedBuilder) Len() int { return len(tb.buf) }
 

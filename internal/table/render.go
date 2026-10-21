@@ -47,8 +47,9 @@ func anyRowspan(tableData [][]CellData) bool {
 // the originating cell's text (the convention used by Pandoc and other
 // converters).
 //
-// colspan is already expanded into separate CellData entries by
-// expandColspanCells, so each entry in a row represents exactly one column.
+// colspan is already expanded into separate CellData entries by the inline
+// expansion in extractTableData, so each entry in a row represents exactly one
+// column.
 // The grid places entries left-to-right, skipping columns already occupied by
 // a rowspan from an earlier row (filling them with the repeated text). Rows
 // shorter than maxCols are padded with empty cells; rows longer than maxCols
@@ -149,8 +150,16 @@ func spannedFill(text string) CellData {
 // count. Computing maxCols from raw counts (the old behavior) made
 // applyRowspanGrid drop those shifted cells at its "col >= maxCols" guard,
 // silently losing trailing cells. colspan is already expanded into separate
-// one-column entries by expandColspanCells, so each cell occupies exactly one
-// column here.
+// one-column entries by the inline expansion in extractTableData, so each cell
+// occupies exactly one column here.
+// maxGridCells bounds the rendering grid (numRows x maxCols) the Markdown
+// renderer allocates: padTableColumns, applyRowspanGrid, and the per-column
+// slices all size off that product, and maxCols can be dominated by synthetic
+// colspan expansion — a 1000-column row against tens of thousands of rows
+// would otherwise allocate gigabytes from a small document. 2^20 cells is
+// over an order of magnitude above the largest realistic HTML table.
+const maxGridCells = 1 << 20
+
 func calculateMaxColumns(tableData [][]CellData) int {
 	maxCols := 0
 	numRows := len(tableData)
@@ -178,6 +187,13 @@ func calculateMaxColumns(tableData [][]CellData) int {
 			}
 			col++
 		}
+	}
+	// Clamp the grid so numRows*maxCols stays bounded (see maxGridCells). The
+	// comparison is written as a division to avoid overflow on hostile inputs.
+	// Cells beyond the clamped width are dropped by the renderer's existing
+	// col >= maxCols guards — the same degradation overlong rows already had.
+	if maxCols > 1 && numRows > maxGridCells/maxCols {
+		maxCols = max(maxGridCells/numRows, 1)
 	}
 	return maxCols
 }
@@ -369,7 +385,15 @@ func calculateMaxColumnWidths(tableData [][]CellData, maxCols int) []int {
 	colMaxWidths := make([]int, maxCols)
 	for _, row := range tableData {
 		for j := 0; j < maxCols && j < len(row); j++ {
-			textLen := utf8.RuneCountInString(row[j].Text)
+			text := row[j].Text
+			// writeMarkdownCellText renders each '\' and '|' as a two-byte
+			// escape sequence, so the rendered width is the rune count plus
+			// one per escapable byte. Without the adjustment, a cell
+			// containing them made its row one character wider than the
+			// padded column (the table stayed structurally valid; only the
+			// alignment the padding exists to provide was lost).
+			textLen := utf8.RuneCountInString(text) +
+				strings.Count(text, "\\") + strings.Count(text, "|")
 			if textLen > colMaxWidths[j] {
 				colMaxWidths[j] = textLen
 			}
@@ -382,7 +406,6 @@ func calculateMaxColumnWidths(tableData [][]CellData, maxCols int) []int {
 // Returns a list of included column indices (columns with real content).
 // Optimized with pre-allocated slice capacity.
 func filterExpandedColumns(tableData [][]CellData, maxCols int) []int {
-	includeCol := make([]bool, maxCols)
 	// Pre-allocate with estimated capacity: assume 80% of columns are included
 	estimatedInclusions := maxCols * 4 / 5
 	if estimatedInclusions < 1 {
@@ -400,7 +423,6 @@ func filterExpandedColumns(tableData [][]CellData, maxCols int) []int {
 			}
 		}
 
-		includeCol[j] = !allExpanded
 		if !allExpanded {
 			newToOldCol = append(newToOldCol, j)
 		}
@@ -468,7 +490,13 @@ func renderMarkdownRow(tb *TrackedBuilder, row []CellData, newToOldCol []int,
 		}
 
 		maxWidth := colMaxWidths[newJ]
-		textLen := utf8.RuneCountInString(cellText)
+		// The rendered width must count the escapes writeMarkdownCellText
+		// emits, exactly as calculateMaxColumnWidths does. Without the
+		// adjustment a cell containing a pipe or a backslash rendered one
+		// character wider per escapable byte than its column, which knocked
+		// the padding of every cell in that row out of alignment.
+		textLen := utf8.RuneCountInString(cellText) +
+			strings.Count(cellText, "\\") + strings.Count(cellText, "|")
 		pad := maxWidth - textLen
 
 		// Apply alignment-based padding. Cell text is written through

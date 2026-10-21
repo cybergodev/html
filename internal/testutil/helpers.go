@@ -4,7 +4,7 @@ package testutil
 import (
 	"os"
 	"path/filepath"
-	"sync"
+	"strings"
 	"testing"
 
 	"github.com/cybergodev/html"
@@ -14,23 +14,12 @@ import (
 // Returns the file path. The file is automatically cleaned up after the test.
 func CreateTempHTML(t *testing.T, content string) string {
 	t.Helper()
-	return CreateTempHTMLWithEncoding(t, []byte(content), "test_*.html")
-}
-
-// CreateTempHTMLWithEncoding creates a temporary HTML file with specific encoding bytes.
-// The name parameter should be a pattern like "test_*.html".
-func CreateTempHTMLWithEncoding(t *testing.T, content []byte, name string) string {
-	t.Helper()
 
 	tmpDir := t.TempDir()
-	tmpFile := filepath.Join(tmpDir, name)
+	tmpFile := filepath.Join(tmpDir, "test_*.html")
 
-	// Remove the * if present and replace with a timestamp-free name
-	if filepath.Ext(tmpFile) == "" || len(filepath.Ext(tmpFile)) < 2 {
-		tmpFile = tmpFile + ".html"
-	}
-
-	// Create the file without the glob pattern
+	// Replace the glob '*' with a fixed name so the file is created directly
+	// rather than as a literal glob path.
 	ext := filepath.Ext(tmpFile)
 	base := tmpFile[:len(tmpFile)-len(ext)]
 	if base[len(base)-1] == '*' {
@@ -38,7 +27,7 @@ func CreateTempHTMLWithEncoding(t *testing.T, content []byte, name string) strin
 		tmpFile = base + ext
 	}
 
-	if err := os.WriteFile(tmpFile, content, 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -72,7 +61,7 @@ func AssertEqual[T comparable](t *testing.T, got, want T, msg string) {
 // AssertContains asserts that s contains substr.
 func AssertContains(t *testing.T, s, substr, msg string) {
 	t.Helper()
-	if !containsString(s, substr) {
+	if !strings.Contains(s, substr) {
 		t.Errorf("%s: string does not contain substring\ngot: %s\nwant to contain: %s", msg, s, substr)
 	}
 }
@@ -80,7 +69,7 @@ func AssertContains(t *testing.T, s, substr, msg string) {
 // AssertNotContains asserts that s does not contain substr.
 func AssertNotContains(t *testing.T, s, substr, msg string) {
 	t.Helper()
-	if containsString(s, substr) {
+	if strings.Contains(s, substr) {
 		t.Errorf("%s: string should not contain substring\ngot: %s\nshould not contain: %s", msg, s, substr)
 	}
 }
@@ -123,63 +112,6 @@ func NewTestProcessor(t *testing.T, cfg ...html.Config) *html.Processor {
 	})
 
 	return p
-}
-
-// containsString is a helper to check if s contains substr.
-func containsString(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
-		(len(s) > 0 && len(substr) > 0 && findSubstring(s, substr)))
-}
-
-// findSubstring finds substr in s.
-func findSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
-// CreateBatchTempFiles creates multiple temporary HTML files for batch testing.
-// Returns slice of file paths. Files are automatically cleaned up after the test.
-func CreateBatchTempFiles(t *testing.T, contents []string) []string {
-	t.Helper()
-
-	tmpDir := t.TempDir()
-	files := make([]string, len(contents))
-
-	for i, content := range contents {
-		files[i] = filepath.Join(tmpDir, "file_"+string(rune('A'+i%26))+".html")
-		if err := os.WriteFile(files[i], []byte(content), 0644); err != nil {
-			t.Fatalf("Failed to create temp file %d: %v", i, err)
-		}
-	}
-
-	return files
-}
-
-// RunConcurrent executes fn concurrently n times, collecting any errors.
-// Returns a slice of errors from each goroutine (nil if successful).
-func RunConcurrent(n int, fn func(int) error) []error {
-	var wg sync.WaitGroup
-	errs := make([]error, n)
-	var errsMu sync.Mutex
-
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			if err := fn(idx); err != nil {
-				errsMu.Lock()
-				errs[idx] = err
-				errsMu.Unlock()
-			}
-		}(i)
-	}
-
-	wg.Wait()
-	return errs
 }
 
 // CommonHTMLSnippets contains common HTML test snippets.

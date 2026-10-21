@@ -37,6 +37,19 @@ func hasHTTPScheme(url string) bool {
 		(len(url) >= 8 && strings.EqualFold(url[:8], "https://"))
 }
 
+// authorityLen returns the length of the authority component at the start of
+// s, where s begins after the scheme (see schemeEnd): the span up to the
+// first path '/', query '?', or fragment '#' delimiter.
+func authorityLen(s string) int {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '/', '?', '#':
+			return i
+		}
+	}
+	return len(s)
+}
+
 // ExtractDomain extracts the host portion of a URL (e.g. "example.com" for
 // "https://example.com/path"), stripping the scheme and path. When the input
 // has no "://" or leading "//", the scheme is treated as absent and the input
@@ -44,13 +57,25 @@ func hasHTTPScheme(url string) bool {
 func ExtractDomain(url string) string {
 	start := schemeEnd(url)
 
-	// Find the end of the domain (first slash)
-	if pathStart := strings.IndexByte(url[start:], '/'); pathStart >= 0 {
-		return url[start : start+pathStart]
+	// The domain ends at the first path, query, or fragment delimiter —
+	// previously only '/' ended it, so an authority followed directly by a
+	// query ("https://e.com?x=1") reported "e.com?x=1" as the domain.
+	end := start + authorityLen(url[start:])
+
+	// Strip userinfo ("user:pass@"): browsers ignore credentials for
+	// origin/scheme-host comparisons, and keeping them made IsDifferentDomain
+	// flag "https://user@example.com/" against "https://example.com/" as
+	// different domains. The '@' scan is confined to the authority: a literal
+	// '@' is legal unencoded in a path segment (profile URLs like "/@alice"),
+	// and scanning the whole remainder used to read such a path as userinfo,
+	// extract "alice" as the domain, and flag same-site links as external.
+	// LastIndexByte is correct because a literal '@' in a userinfo component
+	// must be percent-encoded.
+	if at := strings.LastIndexByte(url[start:end], '@'); at >= 0 {
+		start += at + 1
 	}
 
-	// No path found, return everything after scheme
-	return url[start:]
+	return url[start:end]
 }
 
 // ExtractBaseFromURL extracts the base URL (scheme://domain/) from a URL.
@@ -62,9 +87,16 @@ func ExtractBaseFromURL(url string) string {
 
 	start := schemeEnd(url)
 
-	// Find the first slash after the domain
-	if pathStart := strings.IndexByte(url[start:], '/'); pathStart >= 0 {
-		return url[:start+pathStart+1]
+	// The base ends at the first path, query, or fragment delimiter after
+	// the authority. A '/' terminates the authority with a path (base keeps
+	// that slash); a '?' or '#' means the authority has no path, and the
+	// trailing slash must land after the authority ("https://e.com/")
+	// rather than inside its query or fragment ("https://e.com?ref=x/").
+	if e := authorityLen(url[start:]); e < len(url)-start {
+		if url[start+e] == '/' {
+			return url[:start+e+1]
+		}
+		return url[:start+e] + "/"
 	}
 
 	// No path found, add trailing slash
@@ -88,10 +120,16 @@ func NormalizeBaseURL(baseURL string) string {
 	if IsExternalURL(baseURL) {
 		start := schemeEnd(baseURL)
 
-		// Find the first slash after the domain
-		if pathStart := strings.IndexByte(baseURL[start:], '/'); pathStart >= 0 {
-			// Already has a path, return up to and including the first slash
-			return baseURL[:start+pathStart+1]
+		// Cut at the first '/', '?', or '#' after the authority so an
+		// authority directly followed by a query or fragment normalizes to
+		// "scheme://host/" rather than "scheme://host?q=1/" (which corrupted
+		// every relative URL resolved against it).
+		if e := authorityLen(baseURL[start:]); e < len(baseURL)-start {
+			if baseURL[start+e] == '/' {
+				// Already has a path, return up to and including the first slash
+				return baseURL[:start+e+1]
+			}
+			return baseURL[:start+e] + "/"
 		}
 
 		// No path found, add trailing slash
@@ -111,6 +149,35 @@ func NormalizeBaseURL(baseURL string) string {
 	return baseURL
 }
 
+// hasSchemePrefix reports whether s begins with an ASCII scheme prefix such
+// as "mailto:", "tel:", "ftp:", or "data:": a letter followed by letters,
+// digits, '+', '-', or '.', terminated by ':' before any '/', '?', or '#'
+// (RFC 3986 §3.1). Such a reference is absolute by definition even though
+// IsExternalURL — which recognizes only http(s) and protocol-relative forms —
+// returns false for it.
+func hasSchemePrefix(s string) bool {
+	if len(s) < 2 || !isASCIIAlphaByte(s[0]) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == ':':
+			return true
+		case isASCIIAlphaByte(c), c >= '0' && c <= '9', c == '+', c == '-', c == '.':
+			// scheme character
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// isASCIIAlphaByte reports whether c is an ASCII letter.
+func isASCIIAlphaByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
 // ResolveURL resolves a relative URL against a base URL.
 // Handles absolute URLs, protocol-relative URLs, absolute paths, and relative paths.
 func ResolveURL(baseURL, relativeURL string) string {
@@ -126,12 +193,27 @@ func ResolveURL(baseURL, relativeURL string) string {
 	// Note: protocol-relative URLs ("//example.com/path") are caught by
 	// IsExternalURL above and never reach here, so no dedicated branch is needed.
 
+	// Any other scheme-bearing reference (mailto:, tel:, ftp:, data:, ...) is
+	// absolute by definition. Concatenating it onto the base — the previous
+	// behavior, since IsExternalURL only knows http(s) — produced garbage such
+	// as "https://host/mailto:user@example.com" from href="mailto:...".
+	if hasSchemePrefix(relativeURL) {
+		return relativeURL
+	}
+
 	// Handle absolute paths (/path)
 	if len(relativeURL) > 0 && relativeURL[0] == '/' {
-		if idx := strings.Index(baseURL, "://"); idx >= 0 {
-			domainEnd := strings.IndexByte(baseURL[idx+3:], '/')
-			if domainEnd >= 0 {
-				return baseURL[:idx+3+domainEnd] + relativeURL
+		// schemeEnd handles both "scheme://host/…" and protocol-relative
+		// "//host/…" bases. The previous raw strings.Index(baseURL, "://")
+		// scan never matched a protocol-relative base, silently dropping it
+		// and returning the bare path.
+		if start := schemeEnd(baseURL); start > 0 {
+			// e is the offset of the first '/', '?', or '#' after the
+			// authority. Cutting there and appending the rooted reference
+			// drops any query or fragment tail: base "https://e.com?x=1" +
+			// "/img.png" previously produced "https://e.com?x=1/img.png".
+			if e := authorityLen(baseURL[start:]); e < len(baseURL)-start {
+				return baseURL[:start+e] + relativeURL
 			}
 			return baseURL + relativeURL
 		}
@@ -185,7 +267,12 @@ func asDirectoryBase(baseURL string) string {
 	if lastSlash := strings.LastIndexByte(baseURL[pathStart:], '/'); lastSlash >= 0 {
 		return baseURL[:pathStart+lastSlash+1]
 	}
-	// Authority with no path component.
+	// Authority with no path component. A query or fragment sitting directly
+	// behind the authority is not a path: drop it before appending the root
+	// slash ("https://e.com?q=1" -> "https://e.com/", not "https://e.com?q=1/").
+	if e := authorityLen(baseURL[pathStart:]); e < len(baseURL)-pathStart {
+		return baseURL[:pathStart+e] + "/"
+	}
 	return baseURL + "/"
 }
 

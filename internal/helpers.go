@@ -1,11 +1,10 @@
 package internal
 
 import (
-	htmlstd "html"
+	"bytes"
 	"regexp"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"golang.org/x/net/html"
 )
@@ -15,8 +14,6 @@ import (
 var (
 	paddingLeftRegex = regexp.MustCompile(`padding-left:\s*(\d+(?:\.\d+)?)\s*pt`)
 )
-
-// Clean text and builder sizing constants are now in constants.go
 
 // boundaryCharSets defines different character sets for word boundary detection
 type boundaryCharSet int
@@ -76,6 +73,30 @@ func hasWordBoundary(text, pattern string, charSet boundaryCharSet) bool {
 	return false
 }
 
+// hasWordBoundaryAt reports whether pattern occurs at exactly text[i:] with a
+// valid boundary character (or string edge) on both sides of that occurrence.
+// It is the positional building block for the single-pass pattern scans: a
+// caller iterating over every position i tests the same (position, pattern)
+// pairs that hasWordBoundary locates via repeated substring search, so a
+// boolean "any occurrence is bounded" computed with this helper is identical to
+// hasWordBoundary's result.
+func hasWordBoundaryAt(text string, i int, pattern string) bool {
+	patLen := len(pattern)
+	if patLen == 0 || len(text)-i < patLen {
+		return false
+	}
+	if text[i:i+patLen] != pattern {
+		return false
+	}
+	if i > 0 && !isBoundaryChar(text[i-1], boundaryStandard) {
+		return false
+	}
+	if end := i + patLen; end < len(text) && !isBoundaryChar(text[end], boundaryStandard) {
+		return false
+	}
+	return true
+}
+
 // isBoundaryChar checks if a character is a valid boundary character.
 // For boundaryStandard, digits (0-9) are treated as boundary characters in
 // addition to -, _, space, and tab. CSS class/id naming conventions frequently
@@ -96,15 +117,48 @@ func isBoundaryChar(c byte, charSet boundaryCharSet) bool {
 	}
 }
 
+// trimASCIISpaceAndNBSP trims leading/trailing ASCII whitespace (' ', '\t',
+// '\n', '\r') and NBSP (UTF-8 0xC2 0xA0) from s — the exact trim class of
+// GetTextContent's general path. The fast path previously used
+// strings.TrimSpace, whose wider Unicode White_Space set (\v, \f, U+2028, …)
+// made single-child subtrees trim differently than the same text reached
+// through the general path.
+func trimASCIISpaceAndNBSP(s string) string {
+	start := 0
+	for start < len(s) {
+		c := s[start]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			start++
+		} else if c == 0xC2 && start+1 < len(s) && s[start+1] == 0xA0 {
+			start += 2
+		} else {
+			break
+		}
+	}
+	end := len(s)
+	for end > start {
+		c := s[end-1]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			end--
+		} else if c == 0xA0 && end-1 > start && s[end-2] == 0xC2 {
+			end -= 2
+		} else {
+			break
+		}
+	}
+	return s[start:end]
+}
+
 // textNeedsNormalization reports whether s contains any byte sequence that
-// GetTextContent's normalization pass would rewrite: a newline/CR, an '&'
-// (potential entity), or an NBSP (UTF-8 0xC2 0xA0). When it returns false, the
-// text passes through unchanged apart from edge trimming, so GetTextContent can
-// skip its pooled buffer and tree walk entirely.
+// GetTextContent's normalization pass would rewrite: a newline/CR or an NBSP
+// (UTF-8 0xC2 0xA0). '&' is not a trigger: the parser already decoded
+// entities once, so the normalization pass never rewrites them. When it
+// returns false, the text passes through unchanged apart from edge trimming,
+// so GetTextContent can skip its pooled buffer and tree walk entirely.
 func textNeedsNormalization(s string) bool {
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
-		case '\n', '\r', '&':
+		case '\n', '\r':
 			return true
 		case 0xC2:
 			if i+1 < len(s) && s[i+1] == 0xA0 {
@@ -116,7 +170,12 @@ func textNeedsNormalization(s string) bool {
 }
 
 // normalizeText performs text normalization in a single pass.
-// It handles NBSP replacement, line break normalization, and HTML entity replacement.
+// It handles NBSP replacement and line break normalization. HTML entity
+// decoding is deliberately NOT performed: every caller feeds text that
+// golang.org/x/net/html already decoded once during tokenization, so a
+// remaining "&name;" sequence is visible page content (a page showing
+// "&amp;lt;"), not an escape to unwrap — decoding here stripped a second
+// escape level the source never had.
 // This is more efficient than calling the individual functions sequentially.
 func normalizeText(s string) string {
 	if len(s) == 0 {
@@ -124,19 +183,16 @@ func normalizeText(s string) string {
 	}
 
 	// First-modification scan via vectorized stdlib searches: firstMod is the
-	// earliest position of any trigger — a newline/CR, an '&', or an NBSP pair
-	// (whose trigger position is the start of its 2-byte UTF-8 sequence). The
-	// former byte-at-a-time loop was a profiled cost on text-heavy documents.
+	// earliest position of any trigger — a newline/CR or an NBSP pair (whose
+	// trigger position is the start of its 2-byte UTF-8 sequence). The former
+	// byte-at-a-time loop was a profiled cost on text-heavy documents. '&' is
+	// not a trigger (see the doc comment).
 	n := len(s)
 	nlIdx := strings.IndexByte(s, '\n')
 	crIdx := strings.IndexByte(s, '\r')
-	ampIdx := strings.IndexByte(s, '&')
-	nbspIdx := strings.Index(s, " ")
-	hasNewline := nlIdx >= 0 || crIdx >= 0
-	hasAmpersand := ampIdx >= 0
-	hasNBSP := nbspIdx >= 0
+	nbspIdx := strings.Index(s, nbspString)
 	firstMod := -1
-	for _, idx := range [...]int{nlIdx, crIdx, ampIdx, nbspIdx} {
+	for _, idx := range [...]int{nlIdx, crIdx, nbspIdx} {
 		if idx >= 0 && (firstMod == -1 || idx < firstMod) {
 			firstMod = idx
 		}
@@ -145,11 +201,6 @@ func normalizeText(s string) string {
 	// Fast path: no processing needed
 	if firstMod == -1 {
 		return s
-	}
-
-	// If only ampersands present (no NBSP or newlines), delegate to entity replacement
-	if hasAmpersand && !hasNBSP && !hasNewline {
-		return ReplaceHTMLEntities(s)
 	}
 
 	// Single-pass processing for NBSP and newlines.
@@ -179,11 +230,6 @@ func normalizeText(s string) string {
 			// UTF-8 encoding of NBSP (U+00A0) - replace with space
 			*bp = append(*bp, ' ')
 			i += 2
-		case c == '&':
-			// Handle entity at this position
-			replaced, consumed := replaceEntityAt(s, i)
-			*bp = append(*bp, replaced...)
-			i += consumed
 		default:
 			*bp = append(*bp, c)
 			i++
@@ -193,98 +239,31 @@ func normalizeText(s string) string {
 	return string(*bp)
 }
 
-// commonHTMLEntities lists the ten most frequent HTML entities, ordered roughly
-// by frequency. It is the single source of truth shared by replaceEntityAt and
-// fastReplaceCommonEntities; previously the same ten mappings were hand-copied
-// across three switches, so adding an entity required editing all three in
-// sync. Each entry is the full entity token (including & and ;) and its
-// replacement.
-var commonHTMLEntities = [...]struct {
-	token string
-	repl  string
-}{
-	{"&amp;", "&"},
-	{"&nbsp;", " "},
-	{"&lt;", "<"},
-	{"&gt;", ">"},
-	{"&quot;", "\""},
-	{"&apos;", "'"},
-	{"&copy;", "©"},
-	{"&reg;", "®"},
-	{"&mdash;", "—"},
-	{"&ndash;", "–"},
-}
-
-// maxEntityScanLen bounds how far the entity decoders look ahead for a
-// terminating ';'. HTML named character references are at most 32 characters
-// long (e.g. &CounterClockwiseContourIntegral;), so an ampersand with no ';'
-// within '&' + 32 + ';' = 34 bytes cannot begin a valid entity and is treated
-// as a literal '&'. The bound also converts what was an O(n²) scan over
-// ampersand-heavy input — every bare '&' re-scanned the whole tail for a ';'
-// via strings.IndexByte — into O(n). Numeric references are far shorter, so the
-// same bound safely covers them too.
-const maxEntityScanLen = 34
-
-// replaceEntityAt handles an HTML entity starting at position pos.
-// Returns the replacement string and the number of bytes consumed.
-func replaceEntityAt(text string, pos int) (string, int) {
-	textLen := len(text)
-	if pos >= textLen || text[pos] != '&' {
-		return "&", 1
-	}
-
-	// Find the end of the entity (semicolon or end of string)
-	end := pos + 1
-	if end >= textLen {
-		return "&", 1
-	}
-
-	// Check for common entities first (most frequent case), table-driven.
-	remainingLen := textLen - pos
-	for _, e := range commonHTMLEntities {
-		if remainingLen >= len(e.token) && text[pos:pos+len(e.token)] == e.token {
-			return e.repl, len(e.token)
-		}
-	}
-
-	// Check for numeric entity
-	if text[end] == '#' {
-		return replaceNumericEntity(text, pos)
-	}
-
-	// Find the semicolon for a named entity. Bound the scan to maxEntityScanLen:
-	// a valid named reference is at most 32 chars, so a ';' beyond this window
-	// cannot terminate an entity starting at pos. Without the bound, a run of N
-	// bare ampersands (no ';') made this O(N²) — each '&' re-scanned the tail.
-	scanEnd := pos + maxEntityScanLen
-	if scanEnd > textLen {
-		scanEnd = textLen
-	}
-	semi := strings.IndexByte(text[pos:scanEnd], ';')
-	if semi == -1 {
-		return "&", 1
-	}
-	semi += pos
-
-	// Extract entity name
-	entityName := text[pos+1 : semi]
-	if !isValidEntityName(entityName) {
-		return "&", 1
-	}
-
-	// Use standard library for other entities
-	decoded := htmlstd.UnescapeString(text[pos : semi+1])
-	return decoded, semi - pos + 1
-}
-
 var unwantedCharReplacer = strings.NewReplacer(
 	"☒", "[X]",
 	"☐", "[ ]",
 	"☑", "[X]",
 )
 
-func CleanText(text string) string {
-	if text == "" {
+// nbspString and nbspBytes are the UTF-8 encoding of NBSP (U+00A0) — the
+// bytes 0xC2 0xA0 — spelled with the \u00a0 escape because a raw U+00A0 in
+// source is visually indistinguishable from a plain space. (An ASCII "00a0"
+// literal in the scorer shipped exactly that class of bug.) nbspString backs
+// the string scans (normalizeText); nbspBytes backs the []byte scans in
+// CleanTextBytes.
+const nbspString = "\u00a0"
+
+var nbspBytes = []byte(nbspString)
+
+// CleanTextBytes cleans extracted text and returns it as a new string. It
+// never modifies b and never aliases it in the returned string — the result is
+// always a fresh allocation — so callers may hand in a buffer (e.g. a pooled
+// TrackedBuilder's Bytes) that is recycled immediately after the call. The
+// byte signature is what lets builder-backed callers skip an intermediate
+// String() copy: that copy was ~4% of total allocation bytes on a profiled
+// realistic document.
+func CleanTextBytes(text []byte) string {
+	if len(text) == 0 {
 		return ""
 	}
 
@@ -295,21 +274,21 @@ func CleanText(text string) string {
 	// anywhere, or two adjacent spaces — the loop's prevSpace tracked only the
 	// immediately preceding space, so "a  b" and "x\ty" are precisely the shapes
 	// that set it.
-	hasNewlines := strings.IndexByte(text, '\n') >= 0
-	hasTabs := strings.IndexByte(text, '\t') >= 0
-	hasMultipleSpaces := hasTabs || strings.Contains(text, "  ")
-	hasNBSP := strings.Contains(text, " ")
-	hasAmpersand := strings.IndexByte(text, '&') >= 0
-	hasUnwanted := strings.Contains(text, "☒") ||
-		strings.Contains(text, "☐") ||
-		strings.Contains(text, "☑")
+	hasNewlines := bytes.IndexByte(text, '\n') >= 0
+	hasTabs := bytes.IndexByte(text, '\t') >= 0
+	hasMultipleSpaces := hasTabs || bytes.Contains(text, []byte("  "))
+	hasNBSP := bytes.Contains(text, nbspBytes)
+	hasUnwanted := bytes.Contains(text, []byte("☒")) ||
+		bytes.Contains(text, []byte("☐")) ||
+		bytes.Contains(text, []byte("☑"))
 	n := len(text)
 
 	if !hasNewlines && !hasMultipleSpaces && !hasNBSP && !hasUnwanted {
-		if hasAmpersand {
-			return ReplaceHTMLEntities(text)
-		}
-		return text
+		// Single-line text with no compression triggers (a newline would be
+		// one). The slow path trims each line's trailing spaces/tabs; do the
+		// same here so trailing-space behavior does not depend on the presence
+		// of unrelated triggers like double spaces.
+		return string(bytes.TrimRight(text, " \t"))
 	}
 
 	// When the classification pass found no tab and no adjacent spaces, no line
@@ -321,12 +300,12 @@ func CleanText(text string) string {
 	// below only matches ' ' and '\t', so without this the NBSP bytes passed
 	// through verbatim — inconsistent with the other normalizers.
 	if hasNBSP {
-		text = strings.ReplaceAll(text, " ", " ")
+		text = bytes.ReplaceAll(text, nbspBytes, []byte(" "))
 		n = len(text)
 		// The NBSP→space rewrite can create new adjacent-space pairs (NBSP
 		// followed by space becomes two spaces), so re-evaluate
 		// anyCompressible on the rewritten text.
-		anyCompressible = anyCompressible || strings.Contains(text, "  ")
+		anyCompressible = anyCompressible || bytes.Contains(text, []byte("  "))
 	}
 
 	// Use a capacity-retaining pooled []byte instead of BuilderPool: a pooled
@@ -343,14 +322,14 @@ func CleanText(text string) string {
 			rawLine := text[start:i]
 			isEmpty := true
 
-			if rawLine != "" {
+			if len(rawLine) != 0 {
 				firstNonSpace := 0
 				lineLen := len(rawLine)
 				for firstNonSpace < lineLen && rawLine[firstNonSpace] == ' ' {
 					firstNonSpace++
 				}
 
-				var indent, contentPart string
+				var indent, contentPart []byte
 				if firstNonSpace < lineLen {
 					indent = rawLine[:firstNonSpace]
 					contentPart = rawLine[firstNonSpace:]
@@ -426,21 +405,12 @@ func CleanText(text string) string {
 	if hasUnwanted {
 		result = unwantedCharReplacer.Replace(result)
 	}
-	if hasAmpersand {
-		return ReplaceHTMLEntities(result)
-	}
+	// Entity decoding is intentionally not performed: both production callers
+	// feed text the HTML parser already decoded once, and a second decode
+	// would strip an escape level that is visible page content (see
+	// normalizeText).
 	return result
 }
-
-// maxWalkNodes caps the number of nodes a single WalkNodes call may visit,
-// bounding the traversal stack's memory on pathologically large documents.
-// Despite the historical name (maxWalkDepth), this is a total node-count
-// limit, NOT a tree-depth limit — nesting depth is bounded separately by
-// Config.MaxDepth before any recursive pass runs.
-// SECURITY: This limit prevents potential DoS attacks through extremely large
-// node counts. Traversal past the cap stops silently; callers that must know
-// use WalkNodesWithTruncation.
-const maxWalkNodes = 50000
 
 // WalkNodes traverses the HTML node tree iteratively using an explicit stack
 // to avoid potential stack overflow on deeply nested documents.
@@ -448,30 +418,28 @@ const maxWalkNodes = 50000
 // stops for that branch (node's children are not visited).
 // Optimized with pooled stack slice to reduce allocations.
 //
-// SECURITY: Traversal is limited to maxWalkNodes (50,000) visited nodes to
-// prevent memory exhaustion attacks through extremely large structures.
-// If the limit is exceeded, traversal stops early without notification.
-// For applications that need to know if traversal was truncated, use WalkNodesWithTruncation.
+// The walk is uncapped and visits every node. It used to stop silently at
+// 50,000 visited nodes, which lost data with no error and no way for a caller
+// to notice: media elements, links, <base>, the h1/h2 title fallback, link
+// text built by GetTextContent, table rows, and the image/link placeholder
+// counters inside a large <table> were all dropped past that point — while
+// other passes over the same document (the text pass, sanitization,
+// CleanContentNode) run uncapped, so the results disagreed with each other.
+// The cap also contradicted Config.MaxInputSize: a legal 50MB document can
+// contain far more than 50,000 nodes, so truncation was guaranteed for legal
+// input rather than reserved for hostile input.
+//
+// What bounds the work instead: input size (MaxInputSize), which bounds the
+// parse and therefore the node count, and nesting depth (MaxDepth), which
+// bounds the stack's depth. The stack holds one pointer per *pending sibling*,
+// so its worst case is a flat document with millions of children directly
+// under one parent (measured: 22MB of stack growth for a 7MB, 1M-node
+// document, against 61MB for the parsed DOM itself). Bounding this by dropping
+// nodes would reintroduce the silent-truncation bug; documents that large are
+// better handled by lowering MaxInputSize.
 func WalkNodes(node *html.Node, fn func(*html.Node) bool) {
-	_, _ = WalkNodesWithTruncation(node, fn)
-}
-
-// WalkNodesWithTruncation traverses the HTML node tree iteratively using an explicit stack
-// to avoid potential stack overflow on deeply nested documents.
-// The fn callback is called for each node. If fn returns false, traversal
-// stops for that branch (node's children are not visited).
-//
-// Returns:
-//   - truncated: true if traversal was stopped due to exceeding the maxWalkNodes limit
-//   - visited: the number of nodes visited before completion or truncation
-//
-// SECURITY: Traversal is limited to maxWalkNodes (50,000) visited nodes to
-// prevent memory exhaustion attacks through extremely large structures.
-//
-// Optimized with pooled stack slice to reduce allocations.
-func WalkNodesWithTruncation(node *html.Node, fn func(*html.Node) bool) (truncated bool, visited int) {
 	if node == nil || fn == nil {
-		return false, 0
+		return
 	}
 
 	// Use pooled stack to avoid allocation
@@ -481,20 +449,7 @@ func WalkNodesWithTruncation(node *html.Node, fn func(*html.Node) bool) (truncat
 
 	stack = append(stack, node)
 
-	// SECURITY: Track visited count to detect potential infinite loops
-	// or extremely deep structures
-	visitedCount := 0
-
 	for len(stack) > 0 {
-		// SECURITY: Check depth limit to prevent memory exhaustion
-		visitedCount++
-		if visitedCount > maxWalkNodes {
-			// Stop traversal to prevent memory exhaustion
-			// Update the pointer for pool return before returning
-			*stackPtr = stack
-			return true, visitedCount - 1 // Return truncation status
-		}
-
 		n := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
@@ -506,23 +461,30 @@ func WalkNodesWithTruncation(node *html.Node, fn func(*html.Node) bool) (truncat
 		// singly-linked list (FirstChild -> NextSibling), so append them in document
 		// order to the end of the stack, then reverse just that segment in place.
 		// This yields correct document order when popped without an intermediate
-		// buffer allocation.
+		// buffer allocation. The reverse is skipped for segments of 0 or 1
+		// entries (childless and single-child nodes — the common case on
+		// text-heavy markup), where it would be a no-op anyway.
 		segStart := len(stack)
 		for child := n.FirstChild; child != nil; child = child.NextSibling {
 			stack = append(stack, child)
 		}
-		for i, j := segStart, len(stack)-1; i < j; i, j = i+1, j-1 {
-			stack[i], stack[j] = stack[j], stack[i]
+		if segEnd := len(stack) - 1; segEnd > segStart {
+			for i, j := segStart, segEnd; i < j; i, j = i+1, j-1 {
+				stack[i], stack[j] = stack[j], stack[i]
+			}
 		}
 	}
 
 	// Update the pointer for pool return
 	*stackPtr = stack
-	return false, visitedCount
 }
 
 // FindElementByTag returns the first element node with the given tag name found
 // in a pre-order traversal of doc, or nil if none exists.
+//
+// Every caller looks for a document-level landmark — <body> (extractArticleNode's
+// fallback) or <base> (link base-URL detection). The walk stops at the first
+// match and is bounded by the parse that produced the tree.
 func FindElementByTag(doc *html.Node, tagName string) *html.Node {
 	var result *html.Node
 	WalkNodes(doc, func(n *html.Node) bool {
@@ -552,7 +514,7 @@ func GetTextContent(node *html.Node) string {
 	if node.Type == html.ElementNode {
 		if c := node.FirstChild; c != nil && c.NextSibling == nil && c.Type == html.TextNode {
 			if data := c.Data; !textNeedsNormalization(data) {
-				return strings.TrimSpace(data)
+				return trimASCIISpaceAndNBSP(data)
 			}
 		}
 	}
@@ -568,6 +530,17 @@ func GetTextContent(node *html.Node) string {
 	prevEndedWithSpace := false
 
 	WalkNodes(node, func(n *html.Node) bool {
+		// Skip raw-text subtrees: their contents are code, not visible text.
+		// The main extraction pass skips these via IsNonContentElement; a link
+		// title built from GetTextContent used to concatenate script bodies
+		// into the title ("evil()click") on the unsanitized ExtractAllLinks
+		// path.
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "script", "style", "noscript":
+				return false
+			}
+		}
 		if n.Type == html.TextNode {
 			data := n.Data
 			dataLen := len(data)
@@ -575,7 +548,8 @@ func GetTextContent(node *html.Node) string {
 				return true
 			}
 
-			// Single-pass: trim, normalize NBSP+newlines, replace entities
+			// Single-pass: trim, normalize NBSP+newlines (entities are left
+			// alone — the HTML parser already decoded them once).
 			// Find first non-whitespace and last non-whitespace in one scan
 			// Whitespace includes: space, tab, newline, CR, and NBSP (0xC2 0xA0)
 			start := 0
@@ -612,9 +586,9 @@ func GetTextContent(node *html.Node) string {
 			// Extract trimmed content and apply normalizations in one pass
 			trimmed := data[start : end+1]
 
-			// textNeedsNormalization checks exactly the three triggers the
-			// per-byte loop it replaced tested for (newline/CR, '&', NBSP); a
-			// false result proves the normalization pass below is an identity.
+			// textNeedsNormalization checks exactly the two triggers the
+			// per-byte loop it replaced tests for (newline/CR, NBSP); a false
+			// result proves the normalization pass below is an identity.
 			var text string
 			if !textNeedsNormalization(trimmed) {
 				text = trimmed
@@ -629,10 +603,6 @@ func GetTextContent(node *html.Node) string {
 					case c == 0xC2 && i+1 < len(trimmed) && trimmed[i+1] == 0xA0:
 						*nb = append(*nb, ' ')
 						i++
-					case c == '&':
-						replaced, consumed := replaceEntityAt(trimmed, i)
-						*nb = append(*nb, replaced...)
-						i += consumed - 1
 					default:
 						*nb = append(*nb, c)
 					}
@@ -656,402 +626,6 @@ func GetTextContent(node *html.Node) string {
 		return true
 	})
 	return string(*bp)
-}
-
-var entityReplacer = strings.NewReplacer(
-	// Note: Common entities (&amp;, &nbsp;, &lt;, &gt;, &quot;, &apos;, &copy;, &reg;, &mdash;, &ndash;)
-	// are handled in fastReplaceCommonEntities() for better performance.
-
-	// Remaining typographic entities
-	"&hellip;", "…",
-	"&trade;", "™",
-	// Currency symbols
-	"&euro;", "€",
-	"&pound;", "£",
-	"&cent;", "¢",
-	"&yen;", "¥",
-	"&curren;", "¤",
-	// Mathematical symbols
-	"&sect;", "§",
-	"&para;", "¶",
-	"&plusmn;", "±",
-	"&times;", "×",
-	"&divide;", "÷",
-	"&frac12;", "½",
-	"&frac14;", "¼",
-	"&frac34;", "¾",
-	"&deg;", "°",
-	"&prime;", "'",
-	"&Prime;", "\"",
-	"&sup1;", "¹",
-	"&sup2;", "²",
-	"&sup3;", "³",
-	// Additional common entities
-	"&middot;", "·",
-	"&bull;", "•",
-	"&rsquo;", "'",
-	"&lsquo;", "'",
-	"&rdquo;", "\"",
-	"&ldquo;", "\"",
-	"&sbquo;", "‚",
-	"&bdquo;", "„",
-	"&dagger;", "†",
-	"&Dagger;", "‡",
-	"&permil;", "‰",
-	"&micro;", "µ",
-)
-
-// needsEntityDecoding reports whether s contains an '&' that could begin an
-// entity reference the decoding passes might rewrite: one followed by '#'
-// (numeric) or followed by a ';' within maxEntityScanLen (named). Both
-// entityReplacer entries and replaceHTMLEntitiesFull rewrite text only at such
-// positions, so a false result proves those passes would return their input
-// unchanged. A lone '&' without a terminator (e.g. "Tom & Jerry") is extremely
-// common in extracted text, so this guard lets ReplaceHTMLEntities skip both
-// the replacer pass — which allocates a full copy even when it replaces
-// nothing — and the full per-entity walk.
-func needsEntityDecoding(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] != '&' {
-			continue
-		}
-		if i+1 < len(s) && s[i+1] == '#' {
-			return true
-		}
-		scanEnd := i + maxEntityScanLen
-		if scanEnd > len(s) {
-			scanEnd = len(s)
-		}
-		if strings.IndexByte(s[i:scanEnd], ';') >= 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// ReplaceHTMLEntities replaces HTML entities with their corresponding characters.
-// It handles both named entities (like &amp;, &nbsp;) and numeric entities (like &#65;, &#x41;).
-// For unknown entities, it falls back to the standard library's html.UnescapeString.
-// Optimized with a fast path for the most common entities.
-func ReplaceHTMLEntities(text string) string {
-	if !strings.ContainsRune(text, '&') {
-		return text
-	}
-
-	// Fast path: handle the 10 most common entities directly
-	// This avoids the overhead of strings.NewReplacer for the majority case
-	result := fastReplaceCommonEntities(text)
-	if result != text {
-		// Common entities were replaced. The full pass below only rewrites
-		// numeric or unknown named entities; when none remain possible, the
-		// replaced result is already final and the extra full-document copy
-		// (pooled buffer + string conversion) is skipped.
-		if !needsEntityDecoding(result) {
-			return result
-		}
-		// Still need to handle numeric and unknown named entities
-		return replaceHTMLEntitiesFull(result)
-	}
-
-	// Slow path: an '&' is present but no common entity matched. Every entry in
-	// entityReplacer is of the form "&name;", so it cannot match when no '&' is
-	// followed by a ';' at all; needsEntityDecoding establishes exactly that
-	// (plus the '#' numeric form) in one allocation-free scan, a strictly
-	// stronger guard than the previous ';' presence check. When a terminator is
-	// present the original behavior is preserved; either way
-	// replaceHTMLEntitiesFull (which runs below) decodes every entity.
-	if !needsEntityDecoding(text) {
-		return text
-	}
-	if strings.IndexByte(text, ';') != -1 {
-		text = entityReplacer.Replace(text)
-	}
-	return replaceHTMLEntitiesFull(text)
-}
-
-// fastReplaceCommonEntities handles the 10 most common HTML entities with direct scanning.
-// This is significantly faster than strings.NewReplacer for these common cases.
-// Returns the input string unchanged if no common entities were found.
-// Optimized with single-pass detection to avoid multiple scans.
-func fastReplaceCommonEntities(text string) string {
-	textLen := len(text)
-
-	// Locate the first ampersand with the vectorized IndexByte, then hop
-	// ampersand-to-ampersand checking each against the common-entity table.
-	// The previous byte-at-a-time scan walked the whole text once per call.
-	firstAmpersand := strings.IndexByte(text, '&')
-
-	// Fast path: no ampersands means no entities possible
-	if firstAmpersand == -1 {
-		return text
-	}
-
-	hasCommonEntity := false
-	for i := firstAmpersand; i < textLen && !hasCommonEntity; {
-		// Check for a common entity at this position (table-driven).
-		remLen := textLen - i
-		for _, e := range commonHTMLEntities {
-			if remLen >= len(e.token) && text[i:i+len(e.token)] == e.token {
-				hasCommonEntity = true
-				break
-			}
-		}
-		next := strings.IndexByte(text[i+1:], '&')
-		if next < 0 {
-			break
-		}
-		i += 1 + next
-	}
-
-	// Fast path: ampersands present but no common entities
-	if !hasCommonEntity {
-		return text
-	}
-
-	// Use capacity-retaining pooled []byte for better memory efficiency
-	bp := GetByteBuf()
-	defer PutByteBuf(bp)
-
-	// Write prefix unchanged
-	if firstAmpersand > 0 {
-		*bp = append(*bp, text[:firstAmpersand]...)
-	}
-
-	i := firstAmpersand
-	for i < textLen {
-		if text[i] != '&' {
-			// Copy the span through the next '&' (or the rest of the text)
-			// in one append instead of one byte at a time.
-			next := strings.IndexByte(text[i:], '&')
-			if next < 0 {
-				*bp = append(*bp, text[i:]...)
-				break
-			}
-			next += i
-			*bp = append(*bp, text[i:next]...)
-			i = next
-			continue
-		}
-
-		// Check if we have at least 4 characters for the shortest entity (&lt;)
-		remainingLen := textLen - i
-		if remainingLen < 4 {
-			*bp = append(*bp, text[i])
-			i++
-			continue
-		}
-
-		// Common entities, table-driven (ordered by frequency). Each entry
-		// checks bounds before slicing to prevent panic.
-		matched := false
-		for _, e := range commonHTMLEntities {
-			if remainingLen >= len(e.token) && text[i:i+len(e.token)] == e.token {
-				*bp = append(*bp, e.repl...)
-				i += len(e.token)
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			// Not a common entity, copy as-is
-			*bp = append(*bp, text[i])
-			i++
-		}
-	}
-
-	return string(*bp)
-}
-
-// replaceHTMLEntitiesFull handles numeric entities and unknown named entities.
-// Runs between '&' positions are appended as whole spans rather than
-// byte-by-byte: the entities themselves are far shorter than the text around
-// them, so the bulk appends dominate the loop on entity-bearing input.
-func replaceHTMLEntitiesFull(text string) string {
-	// Use capacity-retaining pooled []byte for better memory efficiency
-	bp := GetByteBuf()
-	defer PutByteBuf(bp)
-
-	i := 0
-	for i < len(text) {
-		if text[i] != '&' {
-			// Copy the span through the next '&' (or the rest of the text)
-			// in one append instead of one byte at a time.
-			next := strings.IndexByte(text[i:], '&')
-			if next < 0 {
-				*bp = append(*bp, text[i:]...)
-				break
-			}
-			next += i
-			*bp = append(*bp, text[i:next]...)
-			i = next
-			continue
-		}
-
-		// Find the end of the entity (semicolon or end of string)
-		end := i + 1
-		if end >= len(text) {
-			*bp = append(*bp, text[i])
-			break
-		}
-
-		// Check if this is a numeric entity
-		if text[end] == '#' {
-			replaced, consumed := replaceNumericEntity(text, i)
-			*bp = append(*bp, replaced...)
-			i += consumed
-			continue
-		}
-
-		// For non-numeric entities, find the semicolon. Bound the scan to
-		// maxEntityScanLen so ampersand-heavy input without a terminator is O(n)
-		// rather than O(n²) (see replaceEntityAt).
-		scanEnd := i + maxEntityScanLen
-		if scanEnd > len(text) {
-			scanEnd = len(text)
-		}
-		semi := strings.IndexByte(text[i:scanEnd], ';')
-		if semi == -1 {
-			// No semicolon found, write the '&' and continue
-			*bp = append(*bp, text[i])
-			i++
-			continue
-		}
-		semi += i
-
-		// Extract entity name
-		entityName := text[i+1 : semi]
-
-		// Validate entity name (alphanumeric only)
-		if !isValidEntityName(entityName) {
-			*bp = append(*bp, text[i])
-			i++
-			continue
-		}
-
-		// Try to decode using standard library for unknown entities
-		// This handles HTML5 named entities not in our replacer
-		decoded := decodeEntityFallback("&" + entityName + ";")
-		*bp = append(*bp, decoded...)
-		i = semi + 1
-	}
-
-	return string(*bp)
-}
-
-// replaceNumericEntity handles numeric character references like &#65; or &#x41;
-// SECURITY: Includes validation to prevent DoS and injection attacks through
-// malformed or malicious numeric entities.
-func replaceNumericEntity(text string, start int) (string, int) {
-	// Maximum valid Unicode code point is 0x10FFFF: at most 8 decimal digits or
-	// 6 hex digits. maxEntityLength covers the hex prefix + digits and also
-	// bounds the ';' search below so '&#' runs without a terminator are O(n),
-	// not O(n²).
-	const maxEntityLength = 10
-
-	if start+2 >= len(text) || text[start+1] != '#' {
-		return string(text[start]), 1
-	}
-
-	// Find the semicolon, bounded to maxEntityScanLen so '&#' runs without a
-	// terminator are O(n), not O(n²) (each scans at most maxEntityScanLen bytes
-	// instead of the whole tail). A ';' beyond the window cannot belong to a
-	// valid numeric reference (at most maxEntityLength digits); treating the '&'
-	// as literal and resuming reproduces the previous verbatim output.
-	scanEnd := start + maxEntityScanLen
-	if scanEnd > len(text) {
-		scanEnd = len(text)
-	}
-	semi := strings.IndexByte(text[start:scanEnd], ';')
-	if semi == -1 {
-		return string(text[start]), 1
-	}
-	semi += start
-
-	entity := text[start+2 : semi]
-	if len(entity) == 0 {
-		return text[start : semi+1], semi - start + 1
-	}
-
-	// Security: limit entity length to prevent DoS through extremely long numeric strings.
-	if len(entity) > maxEntityLength {
-		return text[start : semi+1], semi - start + 1
-	}
-
-	var base int
-	if entity[0] == 'x' || entity[0] == 'X' {
-		base = 16
-		entity = entity[1:]
-		// SECURITY: Validate that remaining characters are valid hex digits
-		if len(entity) == 0 {
-			return text[start : semi+1], semi - start + 1
-		}
-		for _, c := range entity {
-			if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
-				return text[start : semi+1], semi - start + 1
-			}
-		}
-	} else {
-		base = 10
-		// SECURITY: Validate that all characters are valid decimal digits
-		for _, c := range entity {
-			if c < '0' || c > '9' {
-				return text[start : semi+1], semi - start + 1
-			}
-		}
-	}
-
-	// Parse the number with 64-bit to prevent overflow
-	num, err := strconv.ParseInt(entity, base, 64)
-	if err != nil || num < 0 || num > 0x10FFFF {
-		// Invalid numeric entity, return as-is
-		return text[start : semi+1], semi - start + 1
-	}
-
-	// Check for surrogate pairs and invalid Unicode code points
-	if num >= 0xD800 && num <= 0xDFFF {
-		// Surrogate pair, not valid as a standalone character
-		return "\uFFFD", semi - start + 1
-	}
-
-	// Convert to rune and validate it's a valid Unicode code point
-	r := rune(num)
-	if !utf8.ValidRune(r) {
-		return "\uFFFD", semi - start + 1
-	}
-
-	// Special handling: convert non-breaking space (0xa0) to regular space (0x20)
-	// This ensures consistent behavior with named entity &nbsp; which maps to regular space
-	if num == 0xA0 {
-		return " ", semi - start + 1
-	}
-
-	// Valid Unicode character
-	return string(r), semi - start + 1
-}
-
-// isValidEntityName checks if an entity name contains only valid characters.
-func isValidEntityName(name string) bool {
-	if len(name) == 0 {
-		return false
-	}
-	for _, c := range name {
-		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
-			return false
-		}
-	}
-	return true
-}
-
-// decodeEntityFallback attempts to decode an entity using the standard library.
-// This serves as a fallback for HTML5 named entities not in our fast replacer.
-func decodeEntityFallback(entity string) string {
-	// The standard library handles all HTML5 named entities
-	decoded := htmlstd.UnescapeString(entity)
-	if decoded == entity {
-		// Entity was not recognized, return as-is
-		return entity
-	}
-	return decoded
 }
 
 // IsValidURL checks if a URL is valid and safe for processing.
@@ -1086,7 +660,11 @@ func IsValidURL(url string) bool {
 	// no raw <>"' and passed the charset scan below — would reach results as a
 	// clickable link. dataURLMediaType is shared with isValidDataURLWithAudit
 	// so the two gates enforce one policy (see isSafeURIWithAudit).
-	if strings.HasPrefix(url, "data:") {
+	// Fold case on the scheme prefix: schemes are case-insensitive (RFC 3986
+	// §3.1) and isValidDataURLWithAudit folds the same test, so the two gates
+	// share one policy. A case-sensitive test here let "DATA:text/html,…" skip
+	// the whitelist while "DATA:image/png" images were rejected.
+	if len(url) >= 5 && strings.EqualFold(url[:5], "data:") {
 		if urlLen > MaxDataURILength {
 			return false
 		}

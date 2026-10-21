@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 	"unsafe"
 
@@ -113,8 +114,11 @@ func extractCharsetFromHTML(html string) string {
 }
 
 // extractCharsetFromBytes extracts charset from HTML bytes using fast byte operations.
-// This is a zero-allocation version for pure ASCII content.
-// Returns empty string if not found or if data contains non-ASCII bytes.
+// extractCharsetFromBytes scans raw bytes (the first 1KB) for a
+// <meta charset=...> declaration. It is byte-based to avoid materializing a
+// string for the ASCII fast path in DetectCharsetBasic; callers routinely
+// pass non-ASCII data (the scan simply looks for ASCII patterns in it), and
+// the extracted value is allocated as a string on a hit.
 func extractCharsetFromBytes(data []byte) string {
 	dataLen := len(data)
 	if dataLen == 0 {
@@ -127,11 +131,17 @@ func extractCharsetFromBytes(data []byte) string {
 		maxSearch = dataLen
 	}
 
-	// Look for <meta charset="..."> using byte comparison
-	if idx := asciiIndexIgnoreCaseBytes(data[:maxSearch], []byte("<meta charset=")); idx >= 0 {
-		// Bounds check: ensure we have enough bytes after the match
-		if idx+14 < maxSearch {
-			rest := data[idx+14 : maxSearch]
+	// Look for <meta charset="..."> using byte comparison. HTML5 allows ASCII
+	// whitespace around the '=', so skip any between the attribute name and
+	// the '=' before requiring the separator.
+	if idx := asciiIndexIgnoreCaseBytes(data[:maxSearch], []byte("<meta charset")); idx >= 0 {
+		pos := idx + 13
+		for pos < maxSearch && (data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\n' || data[pos] == '\r') {
+			pos++
+		}
+		// Bounds check: ensure we have enough bytes after the separator
+		if pos < maxSearch && data[pos] == '=' && pos+1 < maxSearch {
+			rest := data[pos+1 : maxSearch]
 			if charset := extractAttributeValueBytes(rest); charset != "" {
 				return charset
 			}
@@ -281,9 +291,12 @@ func (ed *EncodingDetector) SetMaxSampleSize(size int) {
 // EncodingMatch represents a detected encoding with confidence score
 type EncodingMatch struct {
 	Charset    string
-	Confidence int  // 0-100
-	Score      int  // Detailed score
-	Valid      bool // Whether decoding produced valid UTF-8
+	Confidence int // 0-100
+	Score      int // Detailed score
+	// Valid is a heuristic quality flag derived from a score threshold by the
+	// statistical pass — it does NOT literally mean "decoding produced valid
+	// UTF-8", and no production code branches on it.
+	Valid bool
 }
 
 // DetectCharset attempts to detect the character encoding from HTML content
@@ -303,6 +316,24 @@ func (ed *EncodingDetector) DetectCharset(data []byte) string {
 	return ed.DetectCharsetBasic(data)
 }
 
+// detectBOMCharset returns the charset declared by a byte-order mark at the
+// start of data ("utf-8", "utf-16be", or "utf-16le"), or "" when no BOM is
+// present. A BOM is a deterministic encoding declaration embedded in the data
+// itself, so callers treat it as authoritative rather than as one heuristic
+// vote among many.
+func detectBOMCharset(data []byte) string {
+	if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+		return "utf-8"
+	}
+	if len(data) >= 2 && data[0] == 0xFE && data[1] == 0xFF {
+		return "utf-16be"
+	}
+	if len(data) >= 2 && data[0] == 0xFF && data[1] == 0xFE {
+		return "utf-16le"
+	}
+	return ""
+}
+
 // DetectCharsetBasic performs basic charset detection (BOM, meta tags, UTF-8 validation)
 // Optimized with fast path for pure ASCII/UTF-8 content to avoid string allocation.
 func (ed *EncodingDetector) DetectCharsetBasic(data []byte) string {
@@ -311,19 +342,11 @@ func (ed *EncodingDetector) DetectCharsetBasic(data []byte) string {
 		return "utf-8"
 	}
 
-	// Check for UTF-8 BOM
-	if dataLen >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
-		return "utf-8"
-	}
-
-	// Check for UTF-16 BE BOM
-	if dataLen >= 2 && data[0] == 0xFE && data[1] == 0xFF {
-		return "utf-16be"
-	}
-
-	// Check for UTF-16 LE BOM
-	if dataLen >= 2 && data[0] == 0xFF && data[1] == 0xFE {
-		return "utf-16le"
+	// Check for a byte-order mark. detectBOMCharset is shared with
+	// DetectCharsetSmart so the two paths cannot disagree on what a BOM
+	// declares.
+	if bom := detectBOMCharset(data); bom != "" {
+		return bom
 	}
 
 	// Pre-compute sample size once
@@ -356,33 +379,21 @@ func (ed *EncodingDetector) DetectCharsetBasic(data []byte) string {
 	// Data has non-ASCII bytes - need full UTF-8 validation
 	isValidUTF8 := utf8.Valid(data)
 
+	if isValidUTF8 {
+		// Non-ASCII valid UTF-8: trust the data over any meta declaration,
+		// which is likely wrong for such files (many documents declare a
+		// legacy charset while actually being UTF-8). Pure ASCII never
+		// reaches here — it returned above — so the !isPureASCII guard this
+		// block used to carry was a tautology, and the meta scan inside it
+		// had no observable effect: both its early return and this one
+		// produced "utf-8". Returning here also skips the sample string
+		// copy below on the hottest path.
+		return "utf-8"
+	}
+
 	// Safe conversion: create a string copy only when needed
 	// This is necessary because the original data slice may be modified by the caller
 	htmlStart := string(sample)
-
-	// IMPORTANT: Check if data is valid UTF-8 BEFORE trusting meta tags.
-	// Many HTML files incorrectly declare charset in meta tags while actually being UTF-8.
-	// If the data is valid UTF-8, we should trust it over the meta tag declaration.
-	if isValidUTF8 {
-		// Data appears to be valid UTF-8, but let's check the meta tag anyway
-		// to avoid false positives (e.g., ASCII-only Windows-1252 files are also valid UTF-8)
-
-		// Use fast string-based extraction first
-		if declaredCharset := extractCharsetFromHTML(htmlStart); declaredCharset != "" {
-			normalized := normalizeCharset(declaredCharset)
-			if normalized == "utf-8" {
-				return "utf-8"
-			}
-		}
-
-		// If data is valid UTF-8 with non-ASCII characters, trust the data over meta tag
-		// (meta tag is likely wrong). Only do this for files with actual UTF-8 sequences.
-		// Optimization: Use cached !isPureASCII instead of calling hasUTF8Sequences
-		// since we already computed isPureASCII above
-		if !isPureASCII {
-			return "utf-8"
-		}
-	}
 
 	// Try to detect from meta tags using fast string-based extraction
 	if declaredCharset := extractCharsetFromHTML(htmlStart); declaredCharset != "" {
@@ -397,14 +408,10 @@ func (ed *EncodingDetector) DetectCharsetBasic(data []byte) string {
 		return normalizeCharset(matches[1])
 	}
 
-	// If no charset declared and data appears to be valid UTF-8, assume UTF-8
-	// Note: We reuse isValidUTF8 computed earlier instead of calling utf8.Valid(sample) again
-	// since sample is a subslice of data, and isValidUTF8 already validated the full data
-	if isValidUTF8 {
-		return "utf-8"
-	}
-
-	// Default to windows-1252 for HTML (most common fallback for Western content)
+	// Default to windows-1252 for HTML (most common fallback for Western content).
+	// (isValidUTF8 need not be re-tested here: when it held, the valid-UTF-8
+	// block above already returned, because non-ASCII bytes are guaranteed at
+	// this point.)
 	return "windows-1252"
 }
 
@@ -436,6 +443,23 @@ func (ed *EncodingDetector) DetectCharsetSmart(data []byte) EncodingMatch {
 		}
 	}
 
+	// A byte-order mark is a deterministic encoding declaration embedded in the
+	// data itself, not a heuristic; treat it as authoritative. Previously the
+	// BOM-derived charset still had to survive the statistical gate below
+	// (score >= 90), and a single stray control byte in a UTF-16 document's
+	// sample dropped it to 89 — at which point step 2, whose candidate list has
+	// no UTF-16 entry, let an 8-bit charset win (its decode of the
+	// NUL-interleaved bytes scored as printable text) and the document came
+	// back as complete mojibake with a nil error.
+	if bomCharset := detectBOMCharset(data); bomCharset != "" {
+		return EncodingMatch{
+			Charset:    bomCharset,
+			Confidence: 100,
+			Score:      100,
+			Valid:      true,
+		}
+	}
+
 	// First, try basic detection
 	basicCharset := ed.DetectCharsetBasic(data)
 
@@ -454,7 +478,19 @@ func (ed *EncodingDetector) DetectCharsetSmart(data []byte) EncodingMatch {
 	}
 	score := ed.scoreEncodingMatch(scoringSample, basicCharset)
 
-	// Check if basic detection came from meta tag
+	if score >= 90 {
+		return EncodingMatch{
+			Charset:    basicCharset,
+			Confidence: 95,
+			Score:      score,
+			Valid:      true,
+		}
+	}
+
+	// Check if basic detection came from meta tag. Evaluated after the
+	// score >= 90 branch so the confidence scale is uniform: a utf-8 meta
+	// declaration with a 90+ score previously reported 90 while any other
+	// charset at the same score reported 95.
 	if basicCharset == "utf-8" && score >= 70 {
 		// Meta tag declared UTF-8 with good score - trust it
 		return EncodingMatch{
@@ -465,19 +501,13 @@ func (ed *EncodingDetector) DetectCharsetSmart(data []byte) EncodingMatch {
 		}
 	}
 
-	if score >= 90 {
-		return EncodingMatch{
-			Charset:    basicCharset,
-			Confidence: 95,
-			Score:      score,
-			Valid:      true,
-		}
-	}
-
 	// Step 2: Try multiple encodings and pick the best match
 	matches := ed.tryAllEncodings(data)
 
-	// Boost score for basicCharset if it's from meta tag
+	// Boost the basic-detection charset: it may come from a meta declaration,
+	// a BOM, or the windows-1252 default fallback, so this is a mild prior in
+	// favor of the cheap pass's answer rather than a provenance-specific
+	// boost (basicCharset does not track where it came from).
 	for i := range matches {
 		if matches[i].Charset == basicCharset {
 			matches[i].Score += 10
@@ -513,6 +543,20 @@ func (ed *EncodingDetector) DetectCharsetSmart(data []byte) EncodingMatch {
 	return bestMatch
 }
 
+// stripUTF8BOM removes a leading UTF-8 byte-order mark (0xEF 0xBB 0xBF, the
+// U+FEFF encoding) from data. Browsers strip it during decoding; leaving it
+// in lets U+FEFF survive into the parsed document as a stray text node and
+// from there into extracted text. Shared by ToUTF8 (declared/forced utf-8
+// branch) and the valid-UTF-8 fast path of detectAndConvertToUTF8StringCore,
+// which previously only the former reached — the same bytes came back
+// different depending on which path handled them.
+func stripUTF8BOM(data []byte) []byte {
+	if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+		return data[3:]
+	}
+	return data
+}
+
 // ToUTF8 converts the given data from the detected charset to UTF-8
 func (ed *EncodingDetector) ToUTF8(data []byte, charset string) ([]byte, error) {
 	charset = normalizeCharset(charset)
@@ -521,7 +565,17 @@ func (ed *EncodingDetector) ToUTF8(data []byte, charset string) ([]byte, error) 
 	// normalized to "utf-8" by normalizeCharset above, so only the canonical
 	// form can reach this point.)
 	if charset == "utf-8" {
-		return data, nil
+		// A declared or forced "utf-8" must not silently pass invalid bytes
+		// through: a lying <meta charset="utf-8"> or ForcedEncoding on
+		// non-UTF-8 data used to return undecodable bytes with a nil error,
+		// violating this function's contract. Mirror the unknown-encoding
+		// branch's honesty below.
+		if !utf8.Valid(data) {
+			return nil, fmt.Errorf("declared charset %q but data is not valid UTF-8", charset)
+		}
+		// Browsers strip a UTF-8 BOM during decoding; do the same so it does
+		// not survive into the parsed document as a stray U+FEFF text node.
+		return stripUTF8BOM(data), nil
 	}
 
 	// Get the appropriate encoding
@@ -573,6 +627,19 @@ func (ed *EncodingDetector) DetectAndConvert(data []byte) ([]byte, string, error
 // bypass the cache and pay only the cheap slow-path normalization.
 const maxCachedCharsetLen = 40
 
+// maxCachedCharsetEntries bounds the number of DISTINCT keys the cache may
+// hold. The length bound alone does not stop growth: keys come from untrusted
+// <meta charset> values, and an attacker sending unique ≤40-character names
+// inserted a new entry per request — exactly the unbounded growth the length
+// bound's comment claims to prevent. Real charset names number ~50, so 256 is
+// ample headroom while capping retention; uncached names pay only the cheap
+// slow-path normalization.
+const maxCachedCharsetEntries = 256
+
+// charsetNormCacheEntries counts entries inserted into charsetNormCache so
+// the cardinality bound above can be enforced without locking.
+var charsetNormCacheEntries atomic.Int64
+
 // normalizeCharset normalizes charset names to a standard form.
 // Uses a sync.Map cache to avoid repeated string operations for common charset names.
 func normalizeCharset(charset string) string {
@@ -586,9 +653,20 @@ func normalizeCharset(charset string) string {
 		}
 	}
 
-	// Cache miss - compute and store
+	// Cache miss - compute and store (bounded; see maxCachedCharsetEntries).
 	normalized := normalizeCharsetSlow(charset)
-	charsetNormCache.Store(charset, normalized)
+	if charsetNormCacheEntries.Load() < maxCachedCharsetEntries {
+		// LoadOrStore is atomic per key, so exactly one of the goroutines
+		// simultaneously missing a given key performs the insert, and only
+		// that goroutine counts. A plain Store let every concurrent misser
+		// Add(1) for the same key, inflating the counter and permanently
+		// capping the cache below its advertised cardinality. The cardinality
+		// check itself stays a soft bound: simultaneous misses of distinct
+		// keys may briefly overshoot it by a few entries, never unboundedly.
+		if _, loaded := charsetNormCache.LoadOrStore(charset, normalized); !loaded {
+			charsetNormCacheEntries.Add(1)
+		}
+	}
 	return normalized
 }
 
@@ -608,9 +686,32 @@ func normalizeCharsetSlow(charset string) string {
 		charset = strings.TrimPrefix(charset, prefix)
 	}
 
-	// Handle latin prefix specially (don't use TrimPrefix as it would match "latin1" -> "1")
-	if strings.HasPrefix(charset, "latin") && len(charset) > 5 {
+	// The latin-N family maps each member to its own ISO-8859 set (IANA
+	// registered names). Collapsing the whole family to iso-8859-1 decoded
+	// every Central-European, Turkish, and Nordic page with the wrong table
+	// (latin2 text came out with mojibake accents). latin1/latin-1 are also
+	// covered by charsetAliases below; the family stays in one switch here.
+	switch charset {
+	case "latin1", "latin-1":
 		return "iso-8859-1"
+	case "latin2", "latin-2":
+		return "iso-8859-2"
+	case "latin3", "latin-3":
+		return "iso-8859-3"
+	case "latin4", "latin-4":
+		return "iso-8859-4"
+	case "latin5", "latin-5":
+		return "iso-8859-9"
+	case "latin6", "latin-6":
+		return "iso-8859-10"
+	case "latin7", "latin-7":
+		return "iso-8859-13"
+	case "latin8", "latin-8":
+		return "iso-8859-14"
+	case "latin9", "latin-9":
+		return "iso-8859-15"
+	case "latin10", "latin-10":
+		return "iso-8859-16"
 	}
 
 	// Look up canonical name in alias map
@@ -709,7 +810,25 @@ func detectAndConvertToUTF8StringCore(data []byte, forcedEncoding string, safeCo
 			return BytesToString(data), "utf-8", nil
 		}
 		if utf8.Valid(data) {
-			result = string(data)
+			// BOM-prefixed input is valid UTF-8 (the BOM is a legal U+FEFF
+			// encoding), so without this strip the fast path would hand the
+			// BOM straight to the parser as a stray text node. ToUTF8 — the
+			// slow path — already strips it; mirror it here so both paths
+			// agree on the same input.
+			data = stripUTF8BOM(data)
+			if safeCopy {
+				result = string(data)
+			} else {
+				// Zero-copy: the bytes are valid UTF-8, so they are directly
+				// usable as a string. This extends the pure-ASCII sharing below
+				// to every valid-UTF-8 input, removing one full-document copy
+				// per extraction of non-ASCII (e.g. CJK) content. The NFC pass
+				// that follows returns the string unchanged when no rune needs
+				// normalization (norm.Form.String's quickSpan), so the aliasing
+				// survives to the caller — permitted by this (unsafe) variant's
+				// documented contract. The Safe variant keeps string(data).
+				result = BytesToString(data)
+			}
 			charset = "utf-8"
 		}
 	}
@@ -742,10 +861,11 @@ func detectAndConvertToUTF8StringCore(data []byte, forcedEncoding string, safeCo
 // If forcedEncoding is not empty, it will use that encoding instead of auto-detection.
 // Returns a UTF-8 string and the detected/used encoding.
 //
-// SECURITY WARNING: When the input is pure ASCII and forcedEncoding is empty,
-// the returned string shares memory with the input []byte slice. The caller MUST
-// NOT modify the input slice after calling this function if the returned string
-// will be used. For memory-isolated usage, use DetectAndConvertToUTF8StringSafe.
+// SECURITY WARNING: When the input is pure ASCII or valid UTF-8 and
+// forcedEncoding is empty, the returned string shares memory with the input
+// []byte slice. The caller MUST NOT modify the input slice after calling this
+// function if the returned string will be used. For memory-isolated usage, use
+// DetectAndConvertToUTF8StringSafe.
 func DetectAndConvertToUTF8String(data []byte, forcedEncoding string) (string, string, error) {
 	return detectAndConvertToUTF8StringCore(data, forcedEncoding, false)
 }

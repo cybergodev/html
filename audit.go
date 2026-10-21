@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"strings"
 	"sync"
@@ -73,7 +74,10 @@ type AuditEntry struct {
 	Depth int `json:"depth,omitempty"`
 	// MaxDepth is the configured maximum depth for depth-violation events.
 	MaxDepth int `json:"max_depth,omitempty"`
-	// Path is the file path for path-traversal events (sanitized to base filename).
+	// Path is the file path for path-traversal events, sanitized to the base
+	// filename so filesystem layouts never reach audit sinks. The full raw
+	// path remains available via RawValue when AuditConfig.IncludeRawValues
+	// is enabled (centrally sanitized and length-capped by Record).
 	Path string `json:"path,omitempty"`
 	// RawValue is the raw attribute or URL value that triggered the event.
 	// Only populated when AuditConfig.IncludeRawValues is true.
@@ -131,6 +135,8 @@ type AuditConfig struct {
 	IncludeRawValues bool `json:"include_raw_values"`
 
 	// MaxRawValueLength limits the length of raw values logged.
+	// 0 uses DefaultMaxRawValueLength (200). Negative values are rejected by
+	// Config.Validate.
 	MaxRawValueLength int `json:"max_raw_value_length"`
 
 	// MaxEntries caps how many audit entries GetAuditLog retains in memory.
@@ -158,7 +164,7 @@ func DefaultAuditConfig() AuditConfig {
 		LogEncodingIssues:  true,
 		LogPathTraversal:   true,
 		IncludeRawValues:   false,
-		MaxRawValueLength:  200,
+		MaxRawValueLength:  DefaultMaxRawValueLength,
 		MaxEntries:         DefaultMaxAuditEntries,
 	}
 }
@@ -185,11 +191,12 @@ func HighSecurityAuditConfig() AuditConfig {
 // auditCollector collects audit entries during processing.
 // It is designed to be thread-safe for concurrent use.
 type auditCollector struct {
-	mu         sync.Mutex
-	entries    []AuditEntry
-	config     AuditConfig
-	sink       AuditSink
-	maxEntries int // clamped (>= 0) copy of config.MaxEntries used for eviction
+	mu                sync.Mutex
+	entries           []AuditEntry
+	config            AuditConfig
+	sink              AuditSink
+	maxEntries        int // clamped (>= 0) copy of config.MaxEntries used for eviction
+	maxRawValueLength int // resolved (non-zero) copy of config.MaxRawValueLength used for truncation
 }
 
 // newAuditCollector creates a new audit collector with the given configuration.
@@ -205,13 +212,41 @@ func newAuditCollector(config AuditConfig) *auditCollector {
 	if maxEntries == 0 {
 		maxEntries = DefaultMaxAuditEntries
 	}
+	// A zero MaxRawValueLength mirrors the MaxEntries policy: fall back to
+	// the default cap rather than silently disabling raw-value truncation.
+	// A hand-built AuditConfig{Enabled: true, IncludeRawValues: true} literal
+	// (exactly the pattern the tests use) would otherwise pass every length
+	// check at zero and retain attacker-sized raw values in full.
+	maxRawValueLength := config.MaxRawValueLength
+	if maxRawValueLength == 0 {
+		maxRawValueLength = DefaultMaxRawValueLength
+	}
 	// entries is allocated lazily on the first Record: a disabled or quiet
 	// collector (the common case) never appends and carries no slice at all.
 	return &auditCollector{
-		config:     config,
-		sink:       sink,
-		maxEntries: maxEntries,
+		config:            config,
+		sink:              sink,
+		maxEntries:        maxEntries,
+		maxRawValueLength: maxRawValueLength,
 	}
+}
+
+// maxAuditFieldLength caps the attacker-controlled non-URL string fields of
+// an audit entry, mirroring the URL cap's order of magnitude.
+const maxAuditFieldLength = 256
+
+// truncateAuditField caps s at maxAuditFieldLength bytes with a rune-safe
+// cut (never splitting a multi-byte UTF-8 sequence), appending "..." when it
+// truncates. See Record.
+func truncateAuditField(s string) string {
+	if len(s) <= maxAuditFieldLength {
+		return s
+	}
+	cut := maxAuditFieldLength
+	for cut > 0 && s[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return s[:cut] + "..."
 }
 
 // Record adds an audit entry to the collector.
@@ -230,6 +265,18 @@ func (c *auditCollector) Record(entry AuditEntry) {
 	// using the same policy as the sanitizer call sites.
 	entry.URL = internal.TruncateAuditURL(entry.URL)
 
+	// SECURITY: the same flooding concern applies to the other attacker-
+	// controlled fields. The sanitizer blocks on*-prefixed attribute names of
+	// unbounded length, and every Record* site formats the raw value into
+	// Message as well — one hostile attribute could previously retain
+	// megabytes twice over (Attribute + Message) per entry, across the
+	// in-memory log and every sink. Cap them here with the same last-line-of-
+	// defense posture as the URL truncation above.
+	entry.Attribute = truncateAuditField(entry.Attribute)
+	entry.Tag = truncateAuditField(entry.Tag)
+	entry.Path = truncateAuditField(entry.Path)
+	entry.Message = truncateAuditField(entry.Message)
+
 	// Remove raw values if not configured to include them
 	if !c.config.IncludeRawValues {
 		entry.RawValue = ""
@@ -238,9 +285,10 @@ func (c *auditCollector) Record(entry AuditEntry) {
 		// logged bytes, then back the cut point off so it neither splits a
 		// multi-byte UTF-8 rune nor lands inside an HTML escape sequence
 		// sanitizeRawValue introduced (a cut inside "&amp;" would persist a
-		// broken entity).
+		// broken entity). maxRawValueLength is resolved non-zero by
+		// newAuditCollector (0 falls back to the default cap).
 		entry.RawValue = sanitizeRawValue(entry.RawValue)
-		if maxLen := c.config.MaxRawValueLength; maxLen > 0 && len(entry.RawValue) > maxLen {
+		if maxLen := c.maxRawValueLength; len(entry.RawValue) > maxLen {
 			cut := maxLen
 			// A cut at index cut is rune-safe when the byte there starts a
 			// rune rather than a UTF-8 continuation byte (0b10xxxxxx).
@@ -263,8 +311,10 @@ func (c *auditCollector) Record(entry AuditEntry) {
 	// attributes/URLs) cannot grow the in-memory log without bound on a
 	// long-lived processor. When full, drop the oldest half in one move —
 	// evicting one per append would make every post-cap Record an O(n) copy,
-	// exactly the workload an attacker controls. maxEntries == 0 disables
-	// retention entirely (entries still go to the sink).
+	// exactly the workload an attacker controls. maxEntries <= 0 disables
+	// retention entirely (entries still go to the sink); through New it is
+	// unreachable, since newAuditCollector maps 0 to the default cap and
+	// Config.Validate rejects negatives.
 	if c.maxEntries > 0 {
 		if len(c.entries) >= c.maxEntries {
 			keep := c.maxEntries / 2
@@ -310,9 +360,17 @@ func (c *auditCollector) Wait() {
 	}
 }
 
+// want reports whether the collector is enabled and the per-event flag admits
+// an entry, so the eight Record* methods share one gate instead of a
+// hand-copied three-clause guard (a future clause — rate limiting, sampling —
+// lands here once).
+func (c *auditCollector) want(logged bool) bool {
+	return c.config.Enabled && logged
+}
+
 // RecordBlockedTag records a blocked tag event.
 func (c *auditCollector) RecordBlockedTag(tag string) {
-	if c == nil || !c.config.Enabled || !c.config.LogBlockedTags {
+	if c == nil || !c.want(c.config.LogBlockedTags) {
 		return
 	}
 	c.Record(AuditEntry{
@@ -325,7 +383,7 @@ func (c *auditCollector) RecordBlockedTag(tag string) {
 
 // RecordBlockedAttr records a blocked attribute event.
 func (c *auditCollector) RecordBlockedAttr(attr, value string) {
-	if c == nil || !c.config.Enabled || !c.config.LogBlockedAttrs {
+	if c == nil || !c.want(c.config.LogBlockedAttrs) {
 		return
 	}
 	c.Record(AuditEntry{
@@ -339,7 +397,7 @@ func (c *auditCollector) RecordBlockedAttr(attr, value string) {
 
 // RecordBlockedURL records a blocked URL event.
 func (c *auditCollector) RecordBlockedURL(url, reason string) {
-	if c == nil || !c.config.Enabled || !c.config.LogBlockedURLs {
+	if c == nil || !c.want(c.config.LogBlockedURLs) {
 		return
 	}
 	c.Record(AuditEntry{
@@ -353,7 +411,7 @@ func (c *auditCollector) RecordBlockedURL(url, reason string) {
 
 // RecordInputViolation records an input validation violation.
 func (c *auditCollector) RecordInputViolation(size, maxSize int, violationType string) {
-	if c == nil || !c.config.Enabled || !c.config.LogInputViolations {
+	if c == nil || !c.want(c.config.LogInputViolations) {
 		return
 	}
 	c.Record(AuditEntry{
@@ -367,7 +425,7 @@ func (c *auditCollector) RecordInputViolation(size, maxSize int, violationType s
 
 // RecordDepthViolation records a depth limit violation.
 func (c *auditCollector) RecordDepthViolation(depth, maxDepth int) {
-	if c == nil || !c.config.Enabled || !c.config.LogDepthViolations {
+	if c == nil || !c.want(c.config.LogDepthViolations) {
 		return
 	}
 	c.Record(AuditEntry{
@@ -381,7 +439,7 @@ func (c *auditCollector) RecordDepthViolation(depth, maxDepth int) {
 
 // RecordTimeout records a processing timeout event.
 func (c *auditCollector) RecordTimeout(timeout time.Duration) {
-	if c == nil || !c.config.Enabled || !c.config.LogTimeouts {
+	if c == nil || !c.want(c.config.LogTimeouts) {
 		return
 	}
 	c.Record(AuditEntry{
@@ -393,7 +451,7 @@ func (c *auditCollector) RecordTimeout(timeout time.Duration) {
 
 // RecordEncodingIssue records an encoding detection issue.
 func (c *auditCollector) RecordEncodingIssue(encoding, message string) {
-	if c == nil || !c.config.Enabled || !c.config.LogEncodingIssues {
+	if c == nil || !c.want(c.config.LogEncodingIssues) {
 		return
 	}
 	c.Record(AuditEntry{
@@ -405,15 +463,21 @@ func (c *auditCollector) RecordEncodingIssue(encoding, message string) {
 }
 
 // RecordPathTraversal records a path traversal attempt.
+//
+// SECURITY: Path is stored as the base filename only (per AuditEntry.Path's
+// documented contract) — full filesystem paths from caller input must not
+// flow into audit sinks that applications forward to logs and SIEMs. The
+// unmodified path is preserved in RawValue for forensics, subject to
+// AuditConfig.IncludeRawValues and Record's central sanitization.
 func (c *auditCollector) RecordPathTraversal(path string) {
-	if c == nil || !c.config.Enabled || !c.config.LogPathTraversal {
+	if c == nil || !c.want(c.config.LogPathTraversal) {
 		return
 	}
 	c.Record(AuditEntry{
 		EventType: AuditEventPathTraversal,
 		Level:     AuditLevelCritical,
 		Message:   "Path traversal attempt detected",
-		Path:      path,
+		Path:      safeBaseName(path),
 		RawValue:  path,
 	})
 }
@@ -427,6 +491,16 @@ func (c *auditCollector) GetEntries() []AuditEntry {
 	defer c.mu.Unlock()
 	result := make([]AuditEntry, len(c.entries))
 	copy(result, c.entries)
+	// Metadata maps are reference types: without a per-entry copy, a caller
+	// mutating result[i].Metadata would write through to the retained
+	// entries and to every later GetEntries call.
+	for i := range result {
+		if md := result[i].Metadata; md != nil {
+			cp := make(map[string]any, len(md))
+			maps.Copy(cp, md)
+			result[i].Metadata = cp
+		}
+	}
 	return result
 }
 
@@ -492,8 +566,13 @@ func NewLoggerAuditSinkWithWriter(w io.Writer) *LoggerAuditSink {
 }
 
 // Write writes an audit entry to the logger.
+//
+// A nil logger is treated as "no destination" rather than dereferenced: the
+// exported type can be built as a zero value from outside the package
+// (`var s html.LoggerAuditSink`), and a logging call in that state must not
+// panic the caller's process (SEC-003).
 func (s *LoggerAuditSink) Write(entry AuditEntry) {
-	if s == nil {
+	if s == nil || s.logger == nil {
 		return
 	}
 	data, err := json.Marshal(entry)
@@ -519,15 +598,31 @@ type ChannelAuditSink struct {
 	dropped  atomic.Int64
 }
 
+// maxChannelAuditSinkBuffer bounds the channel buffer NewChannelAuditSink will
+// allocate. A channel is charged its full capacity up front (AuditEntry is
+// ~192 B), so an unchecked size is a one-line out-of-memory abort:
+// make(chan, 1<<40) asks for ~200 TB and the runtime aborts the process, which
+// recover cannot intercept (a fatal allocation failure is not a panic).
+// The ceiling is the audit subsystem's own retention cap (maxConfigAuditEntries):
+// a backlog larger than the number of entries the library itself will ever
+// retain is not a buffer, it is an allocation accident.
+const maxChannelAuditSinkBuffer = maxConfigAuditEntries
+
 // NewChannelAuditSink creates a new sink that sends entries to a channel.
-// The channel must be consumed by the caller to prevent blocking.
+// The channel should be consumed promptly: when the buffer is full, further
+// entries are dropped and counted (see DroppedCount) rather than blocking.
 //
-// A negative bufferSize is clamped to 0 (an unbuffered channel): make would
-// panic on a negative size, and this constructor is public API, which must not
-// panic on caller input.
+// A negative bufferSize is clamped to 0 (an unbuffered channel), and a size
+// above maxChannelAuditSinkBuffer is clamped to that ceiling: make would panic
+// on a negative size and abort the process on an allocation that cannot be
+// satisfied, and this constructor is public API, which must not panic on
+// caller input.
 func NewChannelAuditSink(bufferSize int) *ChannelAuditSink {
 	if bufferSize < 0 {
 		bufferSize = 0
+	}
+	if bufferSize > maxChannelAuditSinkBuffer {
+		bufferSize = maxChannelAuditSinkBuffer
 	}
 	return &ChannelAuditSink{
 		ch: make(chan AuditEntry, bufferSize),
@@ -572,8 +667,12 @@ func (s *ChannelAuditSink) DroppedCount() int64 {
 
 // Close closes the channel.
 // Safe to call multiple times - only the first call will close the channel.
+//
+// A zero-value sink has no channel to close, so Close is a no-op there rather
+// than a panic ("close of nil channel"): the exported type may be built as a
+// zero value from outside the package (SEC-003).
 func (s *ChannelAuditSink) Close() error {
-	if s == nil {
+	if s == nil || s.ch == nil {
 		return nil
 	}
 	s.closeMu.Lock()
@@ -612,6 +711,10 @@ func (s *WriterAuditSink) Write(entry AuditEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, err := s.writer.Write(data); err != nil {
+		// A failed data write drops the entry entirely; say so, mirroring the
+		// marshal branch above — a silent return hid real delivery failures
+		// (disk full, closed file, broken pipe).
+		log.Printf("Failed to write audit entry: %v", err)
 		return
 	}
 	_, _ = s.writer.Write([]byte("\n")) // best-effort newline after successful data write
@@ -698,8 +801,12 @@ type LevelFilteredSink struct {
 }
 
 // NewLevelFilteredSink creates a new sink that filters by level.
+// NewLevelFilteredSink wraps sink and forwards only entries at minLevel or
+// above. minLevel is lowercased so a hand-written "Critical" ranks the same
+// as the AuditLevelCritical constant instead of falling into the unknown-level
+// rank 0, which passes every entry.
 func NewLevelFilteredSink(sink AuditSink, minLevel AuditLevel) *LevelFilteredSink {
-	return &LevelFilteredSink{sink: sink, minLevel: minLevel}
+	return &LevelFilteredSink{sink: sink, minLevel: AuditLevel(strings.ToLower(string(minLevel)))}
 }
 
 // Write writes an audit entry if it meets the minimum level.
@@ -743,31 +850,7 @@ func sanitizeRawValue(s string) string {
 	return s
 }
 
-// auditRecorderAdapter adapts AuditCollector to internal.AuditRecorder interface.
-type auditRecorderAdapter struct {
-	collector *auditCollector
-}
-
-// RecordBlockedTag records a blocked tag event.
-func (a *auditRecorderAdapter) RecordBlockedTag(tag string) {
-	if a.collector != nil {
-		a.collector.RecordBlockedTag(tag)
-	}
-}
-
-// RecordBlockedAttr records a blocked attribute event.
-func (a *auditRecorderAdapter) RecordBlockedAttr(attr, value string) {
-	if a.collector != nil {
-		a.collector.RecordBlockedAttr(attr, value)
-	}
-}
-
-// RecordBlockedURL records a blocked URL event.
-func (a *auditRecorderAdapter) RecordBlockedURL(url, reason string) {
-	if a.collector != nil {
-		a.collector.RecordBlockedURL(url, reason)
-	}
-}
-
-// Ensure auditRecorderAdapter implements internal.AuditRecorder.
-var _ internal.AuditRecorder = (*auditRecorderAdapter)(nil)
+// *auditCollector implements internal.AuditRecorder directly: its methods are
+// nil-receiver safe and match the interface's signatures one for one. A former
+// 28-line forwarding adapter added only a redundant nil check on top.
+var _ internal.AuditRecorder = (*auditCollector)(nil)

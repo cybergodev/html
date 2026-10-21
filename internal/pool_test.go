@@ -9,469 +9,6 @@ import (
 	"golang.org/x/net/html"
 )
 
-// TestGetBuilder tests getting a strings.Builder from the pool.
-func TestGetBuilder(t *testing.T) {
-	t.Parallel()
-
-	sb := GetBuilder()
-	if sb == nil {
-		t.Fatal("GetBuilder() returned nil")
-	}
-
-	// Verify the builder is usable
-	_, err := sb.WriteString("test")
-	if err != nil {
-		t.Errorf("WriteString() failed: %v", err)
-	}
-
-	if sb.String() != "test" {
-		t.Errorf("Expected 'test', got '%s'", sb.String())
-	}
-}
-
-// TestPutBuilder tests returning a strings.Builder to the pool.
-func TestPutBuilder(t *testing.T) {
-	t.Parallel()
-
-	sb := GetBuilder()
-	sb.WriteString("content")
-
-	// Put the builder back
-	PutBuilder(sb)
-
-	// Get another builder - it should be reset
-	sb2 := GetBuilder()
-	if sb2.Len() != 0 {
-		t.Errorf("Builder should be reset, got length %d", sb2.Len())
-	}
-
-	PutBuilder(sb2)
-}
-
-// TestPutBuilderNil tests that PutBuilder handles nil safely.
-func TestPutBuilderNil(t *testing.T) {
-	t.Parallel()
-
-	// Should not panic
-	PutBuilder(nil)
-}
-
-// TestBuilderPoolConcurrent tests concurrent access to BuilderPool.
-func TestBuilderPoolConcurrent(t *testing.T) {
-	t.Parallel()
-
-	const numGoroutines = 100
-	const numOperations = 50
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
-				sb := GetBuilder()
-				sb.WriteString("test string")
-				_ = sb.String()
-				PutBuilder(sb)
-			}
-		}()
-	}
-
-	wg.Wait()
-}
-
-// TestGetBuffer tests getting a bytes.Buffer from the pool.
-func TestGetBuffer(t *testing.T) {
-	t.Parallel()
-
-	buf := GetBuffer()
-	if buf == nil {
-		t.Fatal("GetBuffer() returned nil")
-	}
-
-	// Verify the buffer is usable
-	_, err := buf.Write([]byte("test"))
-	if err != nil {
-		t.Errorf("Write() failed: %v", err)
-	}
-
-	if !bytes.Equal(buf.Bytes(), []byte("test")) {
-		t.Errorf("Expected 'test', got '%s'", buf.Bytes())
-	}
-}
-
-// TestPutBuffer tests returning a bytes.Buffer to the pool.
-func TestPutBuffer(t *testing.T) {
-	t.Parallel()
-
-	buf := GetBuffer()
-	buf.Write([]byte("content"))
-
-	// Put the buffer back
-	PutBuffer(buf)
-
-	// Get another buffer - it should be reset
-	buf2 := GetBuffer()
-	if buf2.Len() != 0 {
-		t.Errorf("Buffer should be reset, got length %d", buf2.Len())
-	}
-
-	PutBuffer(buf2)
-}
-
-// TestPutBufferNil tests that PutBuffer handles nil safely.
-func TestPutBufferNil(t *testing.T) {
-	t.Parallel()
-
-	// Should not panic
-	PutBuffer(nil)
-}
-
-// TestBufferPoolConcurrent tests concurrent access to BufferPool.
-func TestBufferPoolConcurrent(t *testing.T) {
-	t.Parallel()
-
-	const numGoroutines = 100
-	const numOperations = 50
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
-				buf := GetBuffer()
-				buf.Write([]byte("test bytes"))
-				_ = buf.Bytes()
-				PutBuffer(buf)
-			}
-		}()
-	}
-
-	wg.Wait()
-}
-
-// TestGetTransformBuffer tests getting a transform buffer from the pool.
-func TestGetTransformBuffer(t *testing.T) {
-	t.Parallel()
-
-	bufPtr := GetTransformBuffer()
-	if bufPtr == nil {
-		t.Fatal("GetTransformBuffer() returned nil")
-	}
-
-	buf := *bufPtr
-	if buf == nil {
-		t.Fatal("Transform buffer is nil")
-	}
-
-	// Verify the buffer is usable
-	buf = append(buf, []byte("test")...)
-	if len(buf) != 4 {
-		t.Errorf("Expected length 4, got %d", len(buf))
-	}
-}
-
-// TestPutTransformBuffer tests returning a transform buffer to the pool.
-func TestPutTransformBuffer(t *testing.T) {
-	t.Parallel()
-
-	bufPtr := GetTransformBuffer()
-	*bufPtr = append(*bufPtr, []byte("content")...)
-
-	// Put the buffer back
-	PutTransformBuffer(bufPtr)
-
-	// Get another buffer - it should be reset to zero length
-	bufPtr2 := GetTransformBuffer()
-	if len(*bufPtr2) != 0 {
-		t.Errorf("Transform buffer should be reset to zero length, got %d", len(*bufPtr2))
-	}
-
-	// But it should retain capacity
-	if cap(*bufPtr2) == 0 {
-		t.Error("Transform buffer should retain capacity")
-	}
-
-	PutTransformBuffer(bufPtr2)
-}
-
-// TestTransformBufferPoolConcurrent tests concurrent access to TransformBufferPool.
-func TestTransformBufferPoolConcurrent(t *testing.T) {
-	t.Parallel()
-
-	const numGoroutines = 100
-	const numOperations = 50
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
-				bufPtr := GetTransformBuffer()
-				*bufPtr = append(*bufPtr, []byte("test bytes")...)
-				_ = *bufPtr
-				PutTransformBuffer(bufPtr)
-			}
-		}()
-	}
-
-	wg.Wait()
-}
-
-// TestBuilderPoolInitialSize verifies that builders from the pool can grow efficiently.
-// Note: After Reset(), strings.Builder capacity becomes 0, but the pool's New function
-// calls Grow() to pre-allocate space for fresh builders.
-func TestBuilderPoolInitialSize(t *testing.T) {
-	t.Parallel()
-
-	// Get a fresh builder from the pool (may be newly created or reused)
-	sb := GetBuilder()
-	defer PutBuilder(sb)
-
-	// The builder may have capacity 0 after Reset(), but should be usable
-	// The important thing is that it can be written to
-	_, err := sb.WriteString("test content")
-	if err != nil {
-		t.Errorf("WriteString() failed: %v", err)
-	}
-
-	// Verify the content was written
-	if sb.String() != "test content" {
-		t.Errorf("Expected 'test content', got '%s'", sb.String())
-	}
-}
-
-// TestBufferPoolInitialCapacity verifies that pooled buffers have initial capacity.
-func TestBufferPoolInitialCapacity(t *testing.T) {
-	t.Parallel()
-
-	buf := GetBuffer()
-	defer PutBuffer(buf)
-
-	// The buffer should have been created with bufferPoolInitialCapacity
-	if buf.Cap() < bufferPoolInitialCapacity {
-		t.Errorf("Expected capacity >= %d, got %d", bufferPoolInitialCapacity, buf.Cap())
-	}
-}
-
-// BenchmarkGetBuilder benchmarks GetBuilder performance.
-func BenchmarkGetBuilder(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		sb := GetBuilder()
-		PutBuilder(sb)
-	}
-}
-
-// BenchmarkGetBuffer benchmarks GetBuffer performance.
-func BenchmarkGetBuffer(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		buf := GetBuffer()
-		PutBuffer(buf)
-	}
-}
-
-// BenchmarkGetTransformBuffer benchmarks GetTransformBuffer performance.
-func BenchmarkGetTransformBuffer(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		buf := GetTransformBuffer()
-		PutTransformBuffer(buf)
-	}
-}
-
-// BenchmarkBuilderWithWork benchmarks builder with actual work.
-func BenchmarkBuilderWithWork(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		sb := GetBuilder()
-		sb.WriteString("test string content")
-		_ = sb.String()
-		PutBuilder(sb)
-	}
-}
-
-// BenchmarkBufferWithWork benchmarks buffer with actual work.
-func BenchmarkBufferWithWork(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		buf := GetBuffer()
-		buf.Write([]byte("test byte content"))
-		_ = buf.Bytes()
-		PutBuffer(buf)
-	}
-}
-
-// TestGetBuilderPoolCorruption tests that GetBuilder handles corrupted pool gracefully.
-// This simulates a scenario where something external puts a wrong type in the pool.
-func TestGetBuilderPoolCorruption(t *testing.T) {
-	// Not parallel: the corruption fallback is only deterministic when no
-	// other test interleaves sync.Pool Get/Put calls on the same P.
-
-	// Put a wrong type in the pool to simulate corruption
-	var wrongBuilder any = "not a builder" // deliberately non-pointer: tests pool corruption fallback
-	BuilderPool.Put(wrongBuilder)
-
-	// GetBuilder should still return a valid builder (fallback to new)
-	sb := GetBuilder()
-	if sb == nil {
-		t.Fatal("GetBuilder() returned nil even with pool corruption")
-	}
-
-	// Verify the builder is usable
-	_, err := sb.WriteString("test")
-	if err != nil {
-		t.Errorf("WriteString() failed: %v", err)
-	}
-
-	if sb.String() != "test" {
-		t.Errorf("Expected 'test', got '%s'", sb.String())
-	}
-
-	PutBuilder(sb)
-}
-
-// TestGetBufferPoolCorruption tests that GetBuffer handles corrupted pool gracefully.
-func TestGetBufferPoolCorruption(t *testing.T) {
-	t.Parallel()
-
-	// Put a wrong type in the pool to simulate corruption
-	var wrongBuffer any = "not a buffer" // deliberately non-pointer: tests pool corruption fallback
-	BufferPool.Put(wrongBuffer)
-
-	// GetBuffer should still return a valid buffer (fallback to new)
-	buf := GetBuffer()
-	if buf == nil {
-		t.Fatal("GetBuffer() returned nil even with pool corruption")
-	}
-
-	// Verify the buffer is usable
-	_, err := buf.Write([]byte("test"))
-	if err != nil {
-		t.Errorf("Write() failed: %v", err)
-	}
-
-	if !bytes.Equal(buf.Bytes(), []byte("test")) {
-		t.Errorf("Expected 'test', got '%s'", buf.Bytes())
-	}
-
-	PutBuffer(buf)
-}
-
-// TestGetTransformBufferPoolCorruption tests that GetTransformBuffer handles corrupted pool gracefully.
-func TestGetTransformBufferPoolCorruption(t *testing.T) {
-	t.Parallel()
-
-	// Put a wrong type in the pool to simulate corruption
-	var wrongTransform any = "not a buffer" // deliberately non-pointer: tests pool corruption fallback
-	TransformBufferPool.Put(wrongTransform)
-
-	// GetTransformBuffer should still return a valid buffer (fallback to new)
-	bufPtr := GetTransformBuffer()
-	if bufPtr == nil {
-		t.Fatal("GetTransformBuffer() returned nil even with pool corruption")
-	}
-
-	buf := *bufPtr
-	if buf == nil {
-		t.Fatal("Transform buffer is nil")
-	}
-
-	// Verify the buffer is usable
-	buf = append(buf, []byte("test")...)
-	if len(buf) != 4 {
-		t.Errorf("Expected length 4, got %d", len(buf))
-	}
-
-	PutTransformBuffer(bufPtr)
-}
-
-// TestPutBuilderSecureClear tests that poolSecureClear drops the builder so its
-// buffer is never reused. Unlike the other pooled types, strings.Builder has no
-// mutable buffer accessor, so in-place zeroing is not possible; secure-clear
-// mode therefore drops the builder (no repooling) rather than scrubbing it.
-func TestPutBuilderSecureClear(t *testing.T) {
-	t.Parallel()
-
-	// Enable secure clear
-	SetPoolSecureClear(true)
-	defer SetPoolSecureClear(false)
-
-	// Create a builder with sensitive content
-	sb := GetBuilder()
-	sensitiveData := "SENSITIVE_PASSWORD_12345"
-	sb.WriteString(sensitiveData)
-
-	// Verify data was written
-	if sb.String() != sensitiveData {
-		t.Fatalf("Expected '%s', got '%s'", sensitiveData, sb.String())
-	}
-
-	// Return to pool - in secure-clear mode the builder is dropped, not repooled.
-	PutBuilder(sb)
-
-	// Note: strings.Builder exposes no mutable accessor for its buffer, so the
-	// buffer cannot be zeroed in place; the guarantee is instead that the
-	// dropped builder is never handed back out by GetBuilder. This test
-	// primarily verifies the code path executes without panic.
-}
-
-// TestPutBufferSecureClear tests that poolSecureClear properly zeros buffer.
-func TestPutBufferSecureClear(t *testing.T) {
-	t.Parallel()
-
-	// Enable secure clear
-	SetPoolSecureClear(true)
-	defer SetPoolSecureClear(false)
-
-	// Create a buffer with sensitive content
-	buf := GetBuffer()
-	sensitiveData := []byte("SENSITIVE_API_KEY_12345")
-	buf.Write(sensitiveData)
-
-	// Verify data was written
-	if !bytes.Equal(buf.Bytes(), sensitiveData) {
-		t.Fatalf("Expected '%s', got '%s'", sensitiveData, buf.Bytes())
-	}
-
-	// Return to pool - should zero the buffer
-	PutBuffer(buf)
-
-	// Note: We can't directly verify the buffer was zeroed since
-	// the buffer has been reset and returned to pool.
-	// This test primarily verifies the code path executes without panic.
-}
-
-// TestPutTransformBufferSecureClear tests that poolSecureClear properly zeros transform buffer.
-func TestPutTransformBufferSecureClear(t *testing.T) {
-	t.Parallel()
-
-	// Enable secure clear
-	SetPoolSecureClear(true)
-	defer SetPoolSecureClear(false)
-
-	// Create a buffer with sensitive content
-	bufPtr := GetTransformBuffer()
-	sensitiveData := []byte("SENSITIVE_TOKEN_12345")
-	*bufPtr = append(*bufPtr, sensitiveData...)
-
-	// Verify data was written
-	if !bytes.Equal(*bufPtr, sensitiveData) {
-		t.Fatalf("Expected '%s', got '%s'", *bufPtr, sensitiveData)
-	}
-
-	// Return to pool - should zero the buffer
-	PutTransformBuffer(bufPtr)
-
-	// This test primarily verifies the code path executes without panic
-}
-
 // TestPutNodeSliceSecureClear tests that poolSecureClear properly zeros node slice.
 func TestPutNodeSliceSecureClear(t *testing.T) {
 	t.Parallel()
@@ -514,16 +51,20 @@ func TestSetPoolDebug(t *testing.T) {
 	// sync.Pool may evict its per-P local cache at any GC (documented behavior).
 	// The race detector is allocation-heavy, so GC fires often and a single
 	// Put→Get round-trip no longer reliably surfaces the corrupted item: Get()
-	// can fall through to New() and return a valid *bytes.Buffer, skipping the
+	// can fall through to New() and return a valid *[]*html.Node, skipping the
 	// type-assertion failure that calls logPoolCorruption. Retry until the
-	// logger fires — each attempt hits the corruption path ~70% of the time
+	// logger fires — each attempt hits the corruption path most of the time
 	// under -race, so 100 attempts makes a miss astronomically unlikely while
 	// remaining instant when the cache survives (the common case without -race).
+	//
+	// NodeSlicePool is used as the corruption vehicle because it is the pool
+	// whose Get performs a checked type assertion and therefore routes a
+	// corrupted entry through logPoolCorruption.
 	const maxCorruptAttempts = 100
 	wasCalled := false
 	for i := 0; i < maxCorruptAttempts; i++ {
-		BufferPool.Put("not a buffer") //nolint:SA6002 // intentionally using non-pointer to test pool corruption handling
-		_ = GetBuffer()                // type-assertion fallback invokes logPoolCorruption
+		NodeSlicePool.Put("not a node slice") //nolint:SA6002 // intentionally wrong type: exercises the corruption path
+		_ = GetNodeSlice()                    // type-assertion fallback invokes logPoolCorruption
 		mu.Lock()
 		if called {
 			wasCalled = true
@@ -547,8 +88,8 @@ func TestSetPoolDebug(t *testing.T) {
 	mu.Unlock()
 
 	for i := 0; i < maxCorruptAttempts; i++ {
-		BufferPool.Put("not a buffer") //nolint:SA6002 // intentionally using non-pointer to test pool corruption handling
-		_ = GetBuffer()
+		NodeSlicePool.Put("not a node slice") //nolint:SA6002 // intentionally wrong type: exercises the corruption path
+		_ = GetNodeSlice()
 	}
 	mu.Lock()
 	invokedAfterDisable := called
@@ -593,26 +134,6 @@ func TestPutByteBuf_Boundaries(t *testing.T) {
 	checkByteBufPut(t, "PutByteBuf", GetByteBuf, PutByteBuf)
 }
 
-func TestPutTransformBuffer_Boundaries(t *testing.T) {
-	t.Parallel()
-	checkByteBufPut(t, "PutTransformBuffer", GetTransformBuffer, PutTransformBuffer)
-}
-
-func TestPutBuffer_Boundaries(t *testing.T) {
-	t.Parallel()
-
-	PutBuffer(nil) // no-op
-
-	// Oversized bytes.Buffer is dropped.
-	big := bytes.NewBuffer(make([]byte, maxPooledByteCap+1024))
-	PutBuffer(big)
-	fresh := GetBuffer()
-	if cap(fresh.Bytes()) > maxPooledByteCap {
-		t.Errorf("PutBuffer: oversized buffer retained, cap=%d", cap(fresh.Bytes()))
-	}
-	PutBuffer(fresh)
-}
-
 func TestPutNodeSlice_Boundaries(t *testing.T) {
 	t.Parallel()
 
@@ -647,6 +168,52 @@ func TestPutByteBufSecureClear(t *testing.T) {
 
 	// Return to pool - the secure-clear path zeroes then resets (no panic).
 	PutByteBuf(bp)
+}
+
+// TestByteBufPoolConcurrent tests concurrent access to the shared []byte pool.
+// This is the concurrency coverage for the pool that serves the
+// text-extraction hot path (GetByteBuf backs GetTextContent and CleanTextBytes).
+func TestByteBufPoolConcurrent(t *testing.T) {
+	t.Parallel()
+
+	const numGoroutines = 100
+	const numOperations = 50
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				bp := GetByteBuf()
+				*bp = append(*bp, "test bytes"...)
+				_ = string(*bp)
+				PutByteBuf(bp)
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// BenchmarkGetByteBuf benchmarks the []byte pool round trip.
+func BenchmarkGetByteBuf(b *testing.B) {
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		PutByteBuf(GetByteBuf())
+	}
+}
+
+// BenchmarkByteBufWithWork benchmarks a pooled buffer with actual work.
+func BenchmarkByteBufWithWork(b *testing.B) {
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bp := GetByteBuf()
+		*bp = append(*bp, "test byte content"...)
+		_ = string(*bp)
+		PutByteBuf(bp)
+	}
 }
 
 // --- TrackedBuilder pool tests (GetTrackedBuilder / PutTrackedBuilder) ---
@@ -756,4 +323,30 @@ func TestGetNodeSlicePoolCorruption(t *testing.T) {
 func TestPutNodeSliceNil(t *testing.T) {
 	t.Parallel()
 	PutNodeSlice(nil) // must not panic
+}
+
+// TestSlicePoolPutOversizedDropped covers SlicePool.Put's oversized-drop branch
+// (pool.go:241, previously 83.3%): a scratch slice grown past
+// maxPooledResultScratchElems must be discarded, not retained for a later Get.
+func TestSlicePoolPutOversizedDropped(t *testing.T) {
+	t.Parallel()
+
+	sp := NewSlicePool[int](8)
+
+	// Grow a scratch past the retention ceiling and return it.
+	scratch := sp.Get()
+	*scratch = make([]int, maxPooledResultScratchElems+16)
+	sp.Put(scratch)
+
+	// A subsequent Get must hand back a fresh slice within the ceiling, not the
+	// oversized backing array we just discarded.
+	next := sp.Get()
+	if cap(*next) > maxPooledResultScratchElems {
+		t.Errorf("oversized scratch retained: got cap=%d > maxPooledResultScratchElems=%d",
+			cap(*next), maxPooledResultScratchElems)
+	}
+	sp.Put(next)
+
+	// Nil Put is a documented no-op.
+	sp.Put(nil)
 }

@@ -108,8 +108,26 @@ func DefaultScoringConfig() *ScoringConfig {
 
 // DefaultScorer is the default implementation of the Scorer interface.
 type DefaultScorer struct {
-	config          *ScoringConfig
-	patternPrefixes map[byte][]patternScore // Pre-computed prefix index for fast pattern matching
+	config *ScoringConfig
+	// patternIndex buckets every scoring pattern by its (case-folded) first
+	// byte for fast pattern matching. An array rather than a map: the scorer
+	// consults it per present character of every class/id attribute, and the
+	// profiler showed the map lookups (hashing plus bucket search) as a major
+	// cost on class-heavy pages.
+	patternIndex [256][]patternScore
+	// removeScanClass maps each byte to a dense bucket id (1+) for the
+	// RemovePatterns buckets (built by buildRemoveWordIndex at construction),
+	// or 0 when no removal pattern begins with that byte.
+	// matchesRemovalPatterns consults this one-byte table per input byte
+	// so the whole pattern set is evaluated in a single pass over the value —
+	// the same idiom as mediaScanClass in media.go — instead of one
+	// strings.Index scan per pattern plus a 256-bucket loop per attribute.
+	// removeSubstrPatterns lists SubstringRemovePatterns flat. Both replace
+	// per-attribute map iteration in ShouldRemove with deterministic,
+	// prefix-filtered scans.
+	removeScanClass      [256]uint8
+	removeScanBuckets    [][]string
+	removeSubstrPatterns []string
 }
 
 // patternScore holds a pattern and its score for prefix-based filtering.
@@ -122,10 +140,7 @@ type patternScore struct {
 // For repeated use, prefer SharedDefaultScorer() to avoid repeated allocation.
 func NewDefaultScorer() *DefaultScorer {
 	config := DefaultScoringConfig()
-	return &DefaultScorer{
-		config:          config,
-		patternPrefixes: buildPatternPrefixIndex(config),
-	}
+	return newDefaultScorerWithConfig(config)
 }
 
 // SharedDefaultScorer returns a shared singleton DefaultScorer.
@@ -137,27 +152,31 @@ func SharedDefaultScorer() *DefaultScorer {
 }
 
 // buildPatternPrefixIndex creates a prefix-based index for fast pattern matching.
-// Patterns are grouped by their first character to enable early filtering.
-func buildPatternPrefixIndex(config *ScoringConfig) map[byte][]patternScore {
-	// Estimate capacity: most patterns start with unique characters
-	index := make(map[byte][]patternScore)
-
-	// Add all pattern categories to the index
-	addPatternsToIndex(index, config.PositiveStrongPatterns)
-	addPatternsToIndex(index, config.PositiveMediumPatterns)
-	addPatternsToIndex(index, config.NegativeStrongPatterns)
-	addPatternsToIndex(index, config.NegativeMediumPatterns)
-	addPatternsToIndex(index, config.NegativeWeakPatterns)
-
-	return index
-}
-
-// addPatternsToIndex adds patterns to the prefix index grouped by their first character.
-func addPatternsToIndex(index map[byte][]patternScore, patterns map[string]int) {
-	for pattern, score := range patterns {
-		if len(pattern) == 0 {
-			continue
+// Patterns are grouped by their (case-folded) first character to enable early
+// filtering. The five scoring categories are merged into one index: a pattern
+// appearing in several categories of a custom config would have been matched
+// once per category by the old per-category passes, each adding its own score,
+// so the merged entry carries the categories' pre-summed score and a single
+// match adds the same total.
+func buildPatternPrefixIndex(config *ScoringConfig) [256][]patternScore {
+	// Sum scores across the categories first.
+	sums := make(map[string]int, 64)
+	for _, patterns := range []map[string]int{
+		config.PositiveStrongPatterns,
+		config.PositiveMediumPatterns,
+		config.NegativeStrongPatterns,
+		config.NegativeMediumPatterns,
+		config.NegativeWeakPatterns,
+	} {
+		for pattern, score := range patterns {
+			if len(pattern) > 0 {
+				sums[pattern] += score
+			}
 		}
+	}
+
+	var index [256][]patternScore
+	for pattern, score := range sums {
 		firstChar := pattern[0]
 		// Convert to lowercase for case-insensitive matching
 		if firstChar >= 'A' && firstChar <= 'Z' {
@@ -168,6 +187,38 @@ func addPatternsToIndex(index map[byte][]patternScore, patterns map[string]int) 
 			score:   score,
 		})
 	}
+	return index
+}
+
+// buildRemoveWordIndex buckets RemovePatterns by their (case-folded) first
+// character so ShouldRemove checks only the patterns that could possibly occur
+// in the attribute value (a pattern whose first byte is absent from the value
+// can never be found by hasWordBoundary).
+func buildRemoveWordIndex(config *ScoringConfig) [256][]string {
+	var index [256][]string
+	for pattern := range config.RemovePatterns {
+		if len(pattern) == 0 {
+			continue
+		}
+		firstChar := pattern[0]
+		if firstChar >= 'A' && firstChar <= 'Z' {
+			firstChar += 32
+		}
+		index[firstChar] = append(index[firstChar], pattern)
+	}
+	return index
+}
+
+// buildRemoveSubstrPatterns flattens SubstringRemovePatterns into a slice for
+// deterministic iteration without map overhead (the set is tiny by contract).
+func buildRemoveSubstrPatterns(config *ScoringConfig) []string {
+	patterns := make([]string, 0, len(config.SubstringRemovePatterns))
+	for pattern := range config.SubstringRemovePatterns {
+		if len(pattern) > 0 {
+			patterns = append(patterns, pattern)
+		}
+	}
+	return patterns
 }
 
 // NewDefaultScorerWithConfig creates a new DefaultScorer with custom configuration.
@@ -176,10 +227,36 @@ func NewDefaultScorerWithConfig(config *ScoringConfig) *DefaultScorer {
 	if config == nil {
 		config = DefaultScoringConfig()
 	}
+	return newDefaultScorerWithConfig(config)
+}
+
+// newDefaultScorerWithConfig assembles a DefaultScorer from a non-nil config,
+// including the derived scan tables, so every construction path produces the
+// same indexed state.
+func newDefaultScorerWithConfig(config *ScoringConfig) *DefaultScorer {
+	removeWordIndex := buildRemoveWordIndex(config)
+	removeScanClass, removeScanBuckets := densifyFirstByteIndex(removeWordIndex)
 	return &DefaultScorer{
-		config:          config,
-		patternPrefixes: buildPatternPrefixIndex(config),
+		config:               config,
+		patternIndex:         buildPatternPrefixIndex(config),
+		removeScanClass:      removeScanClass,
+		removeScanBuckets:    removeScanBuckets,
+		removeSubstrPatterns: buildRemoveSubstrPatterns(config),
 	}
+}
+
+// densifyFirstByteIndex converts a sparse [256][]string first-byte index into a
+// one-byte class table plus a dense bucket slice, mirroring mediaScanClass /
+// mediaScanBuckets in media.go: the scanning hot path pays one table load per
+// input byte instead of iterating all 256 (mostly empty) buckets per call.
+func densifyFirstByteIndex(index [256][]string) (cls [256]uint8, buckets [][]string) {
+	for b, bucket := range &index {
+		if len(bucket) > 0 {
+			cls[b] = uint8(len(buckets) + 1)
+			buckets = append(buckets, bucket)
+		}
+	}
+	return cls, buckets
 }
 
 // Score calculates a relevance score for a content node.
@@ -213,6 +290,21 @@ func (s *DefaultScorer) scoreWithMetrics(node *html.Node, metrics contentMetrics
 	// isPrimaryContentContainer overrides, so layout wrappers like
 	// content-sidebar and semantic <article>/<main> are still eligible.
 	if s.ShouldRemove(node) {
+		return 0
+	}
+
+	return s.applyScoringRules(node, metrics)
+}
+
+// applyScoringRules is scoreWithMetrics without the ShouldRemove guard. Both
+// call sites have already excluded removed nodes by the time they get here —
+// scoreWithMetrics checks it directly, and foldAndScore folds it into isSkip —
+// so skipping the (pattern-matching, per-attribute) removal pass here avoids
+// evaluating ShouldRemove twice per element on the article-scoring walk. The
+// remaining guards are cheap string comparisons and are kept so a direct call
+// cannot score an ineligible node.
+func (s *DefaultScorer) applyScoringRules(node *html.Node, metrics contentMetrics) int {
+	if node == nil || node.Type != html.ElementNode || IsNonContentElement(node.Data) || node.Data == "p" {
 		return 0
 	}
 
@@ -290,8 +382,10 @@ type candidateCollector struct {
 }
 
 // record stores (or tracks) a scored candidate. Ties in the best-node path
-// prefer the existing node (first-wins), matching SelectBestCandidate's behavior
-// when the map iteration encounters the equal-scoring node first.
+// prefer the existing node (first-wins), so this path picks a candidate
+// deterministically; SelectBestCandidate instead resolves ties by map
+// iteration order (nondeterministic), and the two paths can legitimately
+// disagree on exact ties.
 func (c *candidateCollector) record(node *html.Node, score int) {
 	if c.candidates != nil {
 		c.candidates[node] = score
@@ -374,7 +468,6 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, cc *candi
 			m.paragraphCount += cm.paragraphCount
 			m.headingCount += cm.headingCount
 			m.textLength += cm.textLength
-			m.totalTextLength += cm.totalTextLength
 			m.linkTextLength += cm.linkTextLength
 			m.commaCount += cm.commaCount
 		}
@@ -383,15 +476,18 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, cc *candi
 	if node.Type == html.TextNode {
 		// Mirrors collectContentMetrics' text-node handling verbatim so the two
 		// paths cannot diverge (guarded by TestScoreArticleCandidatesMatchesNaiveLoop).
+		// The NBSP literal is spelled with the \u00a0 escape: a raw U+00A0 byte
+		// in source is visually indistinguishable from a plain space, and an
+		// earlier version of this block used the ASCII string "00a0" — which
+		// rewrote ordinary text such as "#00a0ff" and made the folded metrics
+		// disagree with collectContentMetrics on any document containing it.
 		data := node.Data
-		hasNBSP := strings.Contains(data, " ")
-		if hasNBSP {
-			data = strings.ReplaceAll(data, " ", " ")
+		if strings.Contains(data, "\u00a0") {
+			data = strings.ReplaceAll(data, "\u00a0", " ")
 		}
 		if text := strings.TrimSpace(data); text != "" {
 			textLen := len(text)
 			m.textLength += textLen
-			m.totalTextLength += textLen
 			m.commaCount += strings.Count(text, ",") + strings.Count(text, "，")
 			if insideLink {
 				m.linkTextLength += textLen
@@ -400,8 +496,11 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, cc *candi
 	}
 
 	// m now holds node's complete subtree metrics; score it if it is a candidate.
-	if node.Type == html.ElementNode && !isSkip && !IsInlineElement(node.Data) {
-		if score := s.scoreWithMetrics(node, m); score > 0 {
+	// The "p" guard mirrors scoreWithMetrics' (a <p> always scores 0); calling
+	// applyScoringRules instead skips the redundant ShouldRemove pass that
+	// isSkip has already evaluated for this node.
+	if node.Type == html.ElementNode && !isSkip && !IsInlineElement(node.Data) && node.Data != "p" {
+		if score := s.applyScoringRules(node, m); score > 0 {
 			cc.record(node, score)
 		}
 	}
@@ -409,25 +508,62 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, cc *candi
 	return m
 }
 
-// contentAreaSignals lists class/id tokens that, when present alongside a
+// contentAreaSignalList lists class/id tokens that, when present alongside a
 // removal pattern in the same attribute value, indicate a CSS layout wrapper
 // (e.g. foolcom-grid-content-sidebar, article-with-sidebar) rather than the
 // non-content region itself. Only patterns that unambiguously denote a
 // primary-content area are included; patterns such as "main", "post", and
 // "text" are excluded because they also appear in non-content class names
 // (main-nav, post-nav, nav-text) where an override would be harmful.
-var contentAreaSignals = map[string]bool{
-	"content": true,
-	"article": true,
+// A fixed slice rather than a map: ShouldRemove consults it per class/id
+// attribute, and map iteration carries hashing and random-order overhead the
+// deterministic scan does not.
+var contentAreaSignalList = [...]string{
+	"content",
+	"article",
 }
 
 // hasContentAreaSignal reports whether value (a lowercased class or id
-// attribute) contains any contentAreaSignals pattern as a word-bounded match.
-// ShouldRemove uses this to exempt layout wrappers from the class/id-based
+// attribute) contains any contentAreaSignalList pattern as a word-bounded
+// match. ShouldRemove uses this to exempt layout wrappers from the class/id-based
 // removal heuristic so the main content nested inside them is not discarded.
 func hasContentAreaSignal(value string) bool {
-	for pattern := range contentAreaSignals {
+	for _, pattern := range &contentAreaSignalList {
 		if hasWordBoundary(value, pattern, boundaryStandard) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesRemovalPatterns reports whether lowerVal (a lowercased class or id
+// attribute value) matches any configured removal pattern: word-bounded
+// RemovePatterns via the first-byte scan tables, and SubstringRemovePatterns
+// via plain substring scans.
+//
+// The word-bounded check is a single forward pass over lowerVal: at each byte,
+// the class table dispatches to the (few) patterns whose first byte matches,
+// and hasWordBoundaryAt checks whether one occurs at exactly that position with
+// valid boundary characters. An occurrence can only start where the pattern's
+// first byte equals the value's byte, so this visits the same (position,
+// pattern) occurrence pairs the previous implementation — one strings.Index
+// scan per pattern across the whole value, plus a 256-bucket presence loop per
+// attribute — tested, and returns the same boolean. The profiler attributed
+// ~10% of class-heavy-document CPU to those per-pattern scans.
+func (s *DefaultScorer) matchesRemovalPatterns(lowerVal string) bool {
+	for i := 0; i < len(lowerVal); i++ {
+		class := s.removeScanClass[lowerVal[i]]
+		if class == 0 {
+			continue
+		}
+		for _, pattern := range s.removeScanBuckets[class-1] {
+			if hasWordBoundaryAt(lowerVal, i, pattern) {
+				return true
+			}
+		}
+	}
+	for _, pattern := range s.removeSubstrPatterns {
+		if strings.Contains(lowerVal, pattern) {
 			return true
 		}
 	}
@@ -478,15 +614,8 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 			if hasContentAreaSignal(lowerVal) {
 				continue
 			}
-			for pattern := range s.config.RemovePatterns {
-				if hasWordBoundary(lowerVal, pattern, boundaryStandard) {
-					return true
-				}
-			}
-			for pattern := range s.config.SubstringRemovePatterns {
-				if strings.Contains(lowerVal, pattern) {
-					return true
-				}
+			if s.matchesRemovalPatterns(lowerVal) {
+				return true
 			}
 		case "style":
 			if isHiddenByStyle(attr.Val) {
@@ -531,6 +660,11 @@ func isHiddenByStyle(style string) bool {
 		}
 		prop := decodeCSSEcapeInline(raw[:colon])
 		val := asciiTrimSpaceLower(raw[colon+1:])
+		// "!important" is a CSS priority marker, not part of the value, and
+		// "display:none !important" is the most common spelling in SPA/CMS
+		// markup for hidden elements. Strip it so the exact comparisons below
+		// still recognize the declaration as hiding the element.
+		val = strings.TrimSpace(strings.TrimSuffix(val, "!important"))
 		switch {
 		case prop == "display" && val == "none":
 			return true
@@ -659,12 +793,6 @@ func (s *DefaultScorer) getTagScore(tag string) int {
 	return 0
 }
 
-// ScoreAttributes calculates a score based on element attributes.
-// This is the public version for external use.
-func (s *DefaultScorer) ScoreAttributes(n *html.Node) int {
-	return s.scoreAttributes(n)
-}
-
 // scoreAttributes calculates a score based on element attributes.
 func (s *DefaultScorer) scoreAttributes(n *html.Node) int {
 	if n == nil || s == nil || s.config == nil {
@@ -676,11 +804,7 @@ func (s *DefaultScorer) scoreAttributes(n *html.Node) int {
 		switch attr.Key {
 		case "class", "id":
 			lowerVal := strings.ToLower(attr.Val)
-			score += s.calculatePatternScore(lowerVal, s.config.PositiveStrongPatterns)
-			score += s.calculatePatternScore(lowerVal, s.config.PositiveMediumPatterns)
-			score += s.calculatePatternScore(lowerVal, s.config.NegativeStrongPatterns)
-			score += s.calculatePatternScore(lowerVal, s.config.NegativeMediumPatterns)
-			score += s.calculatePatternScore(lowerVal, s.config.NegativeWeakPatterns)
+			score += s.calculatePatternScore(lowerVal)
 		case "role":
 			lowerVal := strings.ToLower(attr.Val)
 			switch lowerVal {
@@ -694,12 +818,15 @@ func (s *DefaultScorer) scoreAttributes(n *html.Node) int {
 	return score
 }
 
-// calculatePatternScore calculates score based on pattern matching.
-// Optimized with sparse character tracking instead of fixed array iteration,
-// and prefix filtering to only check patterns whose first character appears in value.
-// Uses fixed-size array to avoid heap allocation.
-func (s *DefaultScorer) calculatePatternScore(value string, patterns map[string]int) int {
-	if len(value) == 0 || len(patterns) == 0 {
+// calculatePatternScore calculates score based on pattern matching against the
+// merged, prefix-bucketed pattern index. One pass over the value's distinct
+// (alphanumeric, case-folded) characters replaces the five per-category passes
+// this function used to make: every pattern's score is pre-summed across the
+// categories at scorer construction, so a single match adds the same total the
+// per-category matches would have added together. Uses fixed-size arrays to
+// avoid heap allocation.
+func (s *DefaultScorer) calculatePatternScore(value string) int {
+	if len(value) == 0 {
 		return 0
 	}
 
@@ -733,15 +860,9 @@ func (s *DefaultScorer) calculatePatternScore(value string, patterns map[string]
 	// Only check patterns whose first character appears in value
 	// Iterate only through present characters, not all 128
 	for i := 0; i < charCount; i++ {
-		char := presentChars[i]
-		if candidates, ok := s.patternPrefixes[char]; ok {
-			for _, ps := range candidates {
-				// Only check patterns that belong to the input patterns map
-				if _, exists := patterns[ps.pattern]; exists {
-					if hasWordBoundary(value, ps.pattern, boundaryStandard) {
-						score += ps.score
-					}
-				}
+		for _, ps := range s.patternIndex[presentChars[i]] {
+			if hasWordBoundary(value, ps.pattern, boundaryStandard) {
+				score += ps.score
 			}
 		}
 	}
