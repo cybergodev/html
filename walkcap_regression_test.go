@@ -1,14 +1,13 @@
 package html
 
 // walkcap_regression_test.go — regression for the D-002 P0 fix:
-// extractImagesAndLinks used the maxWalkNodes (50,000)-capped WalkNodes
+// extractImagesAndLinks once used the maxWalkNodes (50,000)-capped WalkNodes
 // while the placeholder text pass (extractTextWithStructure) recursed
 // uncapped. On documents past the cap the collector silently dropped every
 // img/a past node 50,000, but the text pass kept emitting [IMAGE:n]/
 // [LINK:n] placeholders for them — the unmatched image tokens leaked into
-// Text verbatim and the link URLs were silently discarded. The collector
-// now walks uncapped (internal.WalkAllNodes), restoring the documented
-// lockstep between the two passes.
+// Text verbatim and the link URLs were silently discarded. WalkNodes is now
+// uncapped, so the two passes stay in lockstep on every document.
 
 import (
 	"strings"

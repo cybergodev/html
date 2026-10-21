@@ -566,8 +566,13 @@ func NewLoggerAuditSinkWithWriter(w io.Writer) *LoggerAuditSink {
 }
 
 // Write writes an audit entry to the logger.
+//
+// A nil logger is treated as "no destination" rather than dereferenced: the
+// exported type can be built as a zero value from outside the package
+// (`var s html.LoggerAuditSink`), and a logging call in that state must not
+// panic the caller's process (SEC-003).
 func (s *LoggerAuditSink) Write(entry AuditEntry) {
-	if s == nil {
+	if s == nil || s.logger == nil {
 		return
 	}
 	data, err := json.Marshal(entry)
@@ -593,16 +598,31 @@ type ChannelAuditSink struct {
 	dropped  atomic.Int64
 }
 
+// maxChannelAuditSinkBuffer bounds the channel buffer NewChannelAuditSink will
+// allocate. A channel is charged its full capacity up front (AuditEntry is
+// ~192 B), so an unchecked size is a one-line out-of-memory abort:
+// make(chan, 1<<40) asks for ~200 TB and the runtime aborts the process, which
+// recover cannot intercept (a fatal allocation failure is not a panic).
+// The ceiling is the audit subsystem's own retention cap (maxConfigAuditEntries):
+// a backlog larger than the number of entries the library itself will ever
+// retain is not a buffer, it is an allocation accident.
+const maxChannelAuditSinkBuffer = maxConfigAuditEntries
+
 // NewChannelAuditSink creates a new sink that sends entries to a channel.
 // The channel should be consumed promptly: when the buffer is full, further
 // entries are dropped and counted (see DroppedCount) rather than blocking.
 //
-// A negative bufferSize is clamped to 0 (an unbuffered channel): make would
-// panic on a negative size, and this constructor is public API, which must not
-// panic on caller input.
+// A negative bufferSize is clamped to 0 (an unbuffered channel), and a size
+// above maxChannelAuditSinkBuffer is clamped to that ceiling: make would panic
+// on a negative size and abort the process on an allocation that cannot be
+// satisfied, and this constructor is public API, which must not panic on
+// caller input.
 func NewChannelAuditSink(bufferSize int) *ChannelAuditSink {
 	if bufferSize < 0 {
 		bufferSize = 0
+	}
+	if bufferSize > maxChannelAuditSinkBuffer {
+		bufferSize = maxChannelAuditSinkBuffer
 	}
 	return &ChannelAuditSink{
 		ch: make(chan AuditEntry, bufferSize),
@@ -647,8 +667,12 @@ func (s *ChannelAuditSink) DroppedCount() int64 {
 
 // Close closes the channel.
 // Safe to call multiple times - only the first call will close the channel.
+//
+// A zero-value sink has no channel to close, so Close is a no-op there rather
+// than a panic ("close of nil channel"): the exported type may be built as a
+// zero value from outside the package (SEC-003).
 func (s *ChannelAuditSink) Close() error {
-	if s == nil {
+	if s == nil || s.ch == nil {
 		return nil
 	}
 	s.closeMu.Lock()

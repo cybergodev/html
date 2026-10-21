@@ -391,8 +391,26 @@ func (p *Processor) errFileTooLarge(regular bool, size int64) error {
 // detectEncoding detects the character encoding and converts HTML bytes to UTF-8.
 // This is a helper method used by multiple extraction methods to avoid code duplication.
 // It records encoding issues to the audit log if enabled.
+//
+// It asks for a copy whenever a processing timeout is configured. That is
+// exactly when runWithTimeout runs the document work on another goroutine and
+// returns to the caller as soon as the deadline fires, leaving that goroutine
+// parsing until its next cooperative cancellation check. The fast (unsafe)
+// converter returns a string that ALIASES htmlBytes for ASCII/valid-UTF-8 input,
+// which is free and safe on the synchronous path, but a straggler holding that
+// view would read memory the caller is entitled to reuse the moment Extract
+// returns — an unsupervised data race the library cannot synchronize. Copying at
+// decode time gives the goroutine its own bytes. With ProcessingTimeout == 0
+// runWithTimeout calls fn directly, nothing outlives the call, and the zero-copy
+// view is kept.
 func (p *Processor) detectEncoding(htmlBytes []byte) (string, error) {
-	utf8String, _, convErr := internal.DetectAndConvertToUTF8String(htmlBytes, p.config.Encoding)
+	var utf8String string
+	var convErr error
+	if p.config.ProcessingTimeout > 0 {
+		utf8String, _, convErr = internal.DetectAndConvertToUTF8StringSafe(htmlBytes, p.config.Encoding)
+	} else {
+		utf8String, _, convErr = internal.DetectAndConvertToUTF8String(htmlBytes, p.config.Encoding)
+	}
 	if convErr != nil {
 		if p.audit != nil {
 			p.audit.RecordEncodingIssue(p.config.Encoding, convErr.Error())

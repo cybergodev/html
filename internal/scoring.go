@@ -6,23 +6,11 @@ import (
 	"golang.org/x/net/html"
 )
 
-// ScoreContentNode calculates a relevance score for content extraction.
-// Higher scores indicate more likely main content. Negative scores suggest non-content elements.
-// Exported for testing only.
-func ScoreContentNode(node *html.Node) int {
-	return getDefaultScorer().Score(node)
-}
-
-// ShouldRemoveElement determines if a node should be removed from the content tree.
-// This function delegates to the default Scorer implementation.
+// ShouldRemoveElement determines if a node should be removed from the content
+// tree, delegating to the shared default Scorer. CleanContentNode calls it for
+// every element, so it is production surface rather than a test entry point.
 func ShouldRemoveElement(n *html.Node) bool {
 	return getDefaultScorer().ShouldRemove(n)
-}
-
-// ScoreAttributes calculates a score based on element attributes.
-// Exported for testing only.
-func ScoreAttributes(n *html.Node) int {
-	return getDefaultScorer().ScoreAttributes(n)
 }
 
 // contentMetrics holds all metrics collected during a single DOM traversal.
@@ -141,53 +129,4 @@ func calculateLinkDensityFromMetrics(m contentMetrics) float64 {
 		return 0.0
 	}
 	return float64(m.linkTextLength) / float64(m.textLength)
-}
-
-// MatchesPattern checks if value contains any pattern from the map with word boundaries.
-// This is exported for testing purposes.
-func MatchesPattern(value string, patterns map[string]bool) bool {
-	for pattern := range patterns {
-		if hasWordBoundary(value, pattern, boundaryStandard) {
-			return true
-		}
-	}
-	return false
-}
-
-// CalculateContentDensity calculates text-to-tag ratio.
-// Exported for testing only.
-func CalculateContentDensity(n *html.Node) float64 {
-	if n == nil {
-		return 0
-	}
-	metrics := collectContentMetrics(n)
-	return calculateDensityFromMetrics(metrics)
-}
-
-// CountTags counts all element nodes in the subtree.
-// Exported for testing only.
-func CountTags(n *html.Node) int {
-	count := 0
-	WalkNodes(n, func(node *html.Node) bool {
-		if node.Type == html.ElementNode {
-			count++
-		}
-		return true
-	})
-	return count
-}
-
-// CountDescendantElements counts DESCENDANT elements of the given tag type at any
-// depth below n (n itself excluded), despite the historical name — it walks
-// the whole subtree, not just direct children.
-// Exported for testing only.
-func CountDescendantElements(n *html.Node, tag string) int {
-	count := 0
-	WalkNodes(n, func(node *html.Node) bool {
-		if node != n && node.Type == html.ElementNode && node.Data == tag {
-			count++
-		}
-		return true
-	})
-	return count
 }

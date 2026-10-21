@@ -9,8 +9,8 @@ package html_test
 // three times across those files and keeping the strongest assertion of each.
 //
 // Two extraction code paths are deliberately kept orthogonal:
-//   - default config (PreserveVideos=PreserveAudios=true) → extractAllMedia
-//   - video-only / audio-only config → extractVideos / extractAudios
+//   - default config (PreserveVideos=PreserveAudios=true) → both kinds
+//   - video-only / audio-only config → extractMedia with one want flag set
 //     (see extract.go; only reachable when the flags are set asymmetrically)
 
 import (
@@ -37,8 +37,7 @@ func buildPaddedHTML(inner string) string {
 }
 
 // newVideoOnlyProcessor returns a processor configured for video-only extraction
-// (PreserveAudios=false), which routes through extractVideos instead of
-// extractAllMedia.
+// (PreserveAudios=false), which routes through extractMedia with wantAudios=false.
 func newVideoOnlyProcessor(t *testing.T) *html.Processor {
 	t.Helper()
 	cfg := html.DefaultConfig()
@@ -52,8 +51,7 @@ func newVideoOnlyProcessor(t *testing.T) *html.Processor {
 }
 
 // newAudioOnlyProcessor returns a processor configured for audio-only extraction
-// (PreserveVideos=false), which routes through extractAudios instead of
-// extractAllMedia.
+// (PreserveVideos=false), which routes through extractMedia with wantVideos=false.
 func newAudioOnlyProcessor(t *testing.T) *html.Processor {
 	t.Helper()
 	cfg := html.DefaultConfig()
@@ -115,7 +113,7 @@ func assertVideo(t *testing.T, got html.VideoInfo, want wantVideo) {
 }
 
 // TestImageExtraction covers <img> attribute extraction through the default
-// extractAllMedia path: plain images, full attribute sets, <picture> fallbacks
+// combined media path: plain images, full attribute sets, <picture> fallbacks
 // and srcset handling.
 func TestImageExtraction(t *testing.T) {
 	t.Parallel()
@@ -222,7 +220,7 @@ func TestImageExtraction(t *testing.T) {
 }
 
 // TestVideoExtraction covers <video> element extraction through the default
-// extractAllMedia path, table-driven over tag shapes and attribute sets.
+// combined media path, table-driven over tag shapes and attribute sets.
 func TestVideoExtraction(t *testing.T) {
 	t.Parallel()
 
@@ -515,9 +513,9 @@ func TestParseEmbedNodeDOMPath(t *testing.T) {
 	})
 }
 
-// TestExtractVideosOnly covers Processor.extractVideos by disabling
-// PreserveAudios so the single-type media extraction path is taken instead of
-// the combined extractAllMedia path.
+// TestExtractVideosOnly covers the video-only configuration (PreserveAudios
+// off, so extractMedia is called with wantAudios=false and the audio branches
+// and audio raw-HTML scan are skipped).
 func TestExtractVideosOnly(t *testing.T) {
 	t.Parallel()
 

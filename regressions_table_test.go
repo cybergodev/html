@@ -1,18 +1,51 @@
 package html
 
-// tableformat_case_regression_test.go — end-to-end regression for the D-002
-// P0 fix: Config.Validate accepts TableFormat case-insensitively while New
-// normalized only the inline formats, so TableFormat: "HTML" flowed raw into
-// the table pipeline. extractTableData lowercased only its local copy (HTML
-// data path: colspan kept, structure rows kept) while getRenderer switched
-// on the exact lowercased name and fell back to the Markdown renderer —
-// producing a Markdown pipe table with unexpanded colspans and leaked
-// width-definition rows.
+// regressions_table_test.go — regressions for the D-002 table-rendering fixes,
+// gathered from the former single-topic files:
+//
+//   - a <caption> child is now emitted as its own line ahead of the table, in
+//     both the Markdown and HTML table formats;
+//   - Config.Validate accepts TableFormat case-insensitively and the pipeline
+//     honors it end-to-end, so "HTML"/"Markdown" render as their lowercase
+//     canonical forms.
 
 import (
 	"strings"
 	"testing"
 )
+
+const captionDoc = "<html><body>" +
+	"<table><caption>Quarterly Results</caption>" +
+	"<tr><th>Region</th><th>Revenue</th></tr>" +
+	"<tr><td>EMEA</td><td>42</td></tr>" +
+	"</table></body></html>"
+
+func TestTableCaptionEmitted(t *testing.T) {
+	t.Parallel()
+
+	res, err := Extract([]byte(captionDoc))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if !strings.Contains(res.Text, "Quarterly Results") {
+		t.Errorf("caption text lost from Text: %q", res.Text)
+	}
+	// The table itself must still render after the caption line.
+	if !strings.Contains(res.Text, "|") {
+		t.Errorf("table rows lost from Text: %q", res.Text)
+	}
+
+	// Same guarantee for the HTML table format.
+	cfg := DefaultConfig()
+	cfg.TableFormat = "html"
+	res2, err := Extract([]byte(captionDoc), cfg)
+	if err != nil {
+		t.Fatalf("Extract(html): %v", err)
+	}
+	if !strings.Contains(res2.Text, "Quarterly Results") {
+		t.Errorf("caption text lost from HTML-format output: %q", res2.Text)
+	}
+}
 
 const mixedCaseTableDoc = "<html><body><h1>Report</h1>" +
 	"<table><tr><th colspan=\"2\">H1</th></tr><tr><td>a</td><td>b</td></tr></table>" +

@@ -297,6 +297,70 @@ func TestGetRowSpan(t *testing.T) {
 	}
 }
 
+// TestGetCellSpan covers getCellSpan's nil-node, clamp, and absent-attribute
+// branches directly. getColSpan and getRowSpan share it, and the ordinary
+// attribute-value branches are covered by their table-driven tests above.
+func TestGetCellSpan(t *testing.T) {
+	t.Parallel()
+
+	if got := getCellSpan(nil, "colspan"); got != 1 {
+		t.Errorf("getCellSpan(nil) = %d, want 1", got)
+	}
+
+	doc, _ := stdxhtml.Parse(strings.NewReader(`<table><tr><td colspan="2000" rowspan="1500">x</td></tr></table>`))
+	var td *stdxhtml.Node
+	WalkNodes(doc, func(n *stdxhtml.Node) bool {
+		if n.Type == stdxhtml.ElementNode && n.Data == "td" {
+			td = n
+			return false
+		}
+		return true
+	})
+	if td == nil {
+		t.Fatal("td not found")
+	}
+	if got := getCellSpan(td, "colspan"); got != maxCellSpan {
+		t.Errorf("getCellSpan(colspan=2000) = %d, want clamp %d", got, maxCellSpan)
+	}
+	if got := getCellSpan(td, "rowspan"); got != maxCellSpan {
+		t.Errorf("getCellSpan(rowspan=1500) = %d, want clamp %d", got, maxCellSpan)
+	}
+	if got := getCellSpan(td, "data-x"); got != 1 {
+		t.Errorf("getCellSpan(absent attr) = %d, want 1", got)
+	}
+}
+
+// TestASCIIFoldIndexWord pins the CSS-boundary word search used by getCellWidth
+// to reject "width:" inside "border-width:", "max-width:", and "min-width:".
+func TestASCIIFoldIndexWord(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		s      string
+		substr string
+		want   int
+	}{
+		{"empty substr matches at start", "width:100px", "", 0},
+		{"match at start", "width:100px", "width:", 0},
+		{"case-folded match", "WIDTH:100px", "width:", 0},
+		{"match after css boundary", "border:0;width:100px", "width:", 9},
+		{"substr rejected inside border-width", "border-width:3px", "width:", -1},
+		{"substr rejected inside max-width", "max-width:3px", "width:", -1},
+		{"no match", "height:50px", "width:", -1},
+		{"substr longer than s", "w", "width:", -1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := asciiFoldIndexWord(tt.s, tt.substr); got != tt.want {
+				t.Errorf("asciiFoldIndexWord(%q, %q) = %d, want %d", tt.s, tt.substr, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetCellWidth(t *testing.T) {
 	t.Parallel()
 

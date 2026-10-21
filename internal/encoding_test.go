@@ -2,10 +2,13 @@ package internal
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -126,6 +129,56 @@ func TestNormalizeCharset(t *testing.T) {
 				t.Errorf("normalizeCharset(%q) = %v, want %v", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+// TestNormalizeCharsetSlowFallback covers normalizeCharsetSlow's fallback and
+// edge branches that the cache-backed normalizeCharset path reaches only
+// incidentally: the text/ and text- and codepage- and ibm- prefix strips, the
+// latin-N family members not enumerated by the table-driven TestNormalizeCharset
+// or TestNormalizeCharsetLatinFamily, alias entries those tests skip, and the
+// unknown-charset passthrough.
+func TestNormalizeCharsetSlowFallback(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"text/ prefix stripped", "text/utf-8", "utf-8"},
+		{"text- prefix stripped", "text-utf-8", "utf-8"},
+		{"codepage- prefix stripped", "codepage-1252", "windows-1252"},
+		{"ibm- prefix stripped", "ibm-1252", "windows-1252"},
+		{"latin-3 family member", "latin-3", "iso-8859-3"},
+		{"latin-5 family member", "latin-5", "iso-8859-9"},
+		{"latin-8 family member", "latin-8", "iso-8859-14"},
+		{"utf_16 underscore alias", "utf_16", "utf-16le"},
+		{"euc_jp underscore alias", "euc_jp", "euc-jp"},
+		{"euckr alias", "euckr", "euc-kr"},
+		{"unknown charset passes through", "x-unknown-charset", "x-unknown-charset"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := normalizeCharsetSlow(tt.in); got != tt.want {
+				t.Errorf("normalizeCharsetSlow(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNormalizeCharsetLongInputBypassesCache pins that a charset name longer
+// than maxCachedCharsetLen skips the cache and still normalizes via the slow
+// path (lowercased and prefix-stripped) without polluting the cache.
+func TestNormalizeCharsetLongInputBypassesCache(t *testing.T) {
+	t.Parallel()
+
+	long := "Windows-" + strings.Repeat("x", 45)
+	want := strings.Repeat("x", 45)
+	if got := normalizeCharset(long); got != want {
+		t.Errorf("normalizeCharset(long) = %q, want %q", got, want)
 	}
 }
 
@@ -1029,5 +1082,109 @@ func TestNormalizeCharsetConcurrentNoOvercount(t *testing.T) {
 	after := charsetNormCacheEntries.Load()
 	if grew := after - before; grew > distinctKeys {
 		t.Errorf("charsetNormCacheEntries grew by %d for %d distinct keys; concurrent duplicate misses must not overcount (before=%d, after=%d)", grew, distinctKeys, before, after)
+	}
+}
+func TestBOMCharsetAuthoritative(t *testing.T) {
+	t.Parallel()
+
+	u16 := utf16.Encode([]rune("<html><body><p>hello \x0c world</p></body></html>"))
+	le := make([]byte, 2+2*len(u16))
+	le[0], le[1] = 0xFF, 0xFE
+	for i, r := range u16 {
+		binary.LittleEndian.PutUint16(le[2+2*i:], r)
+	}
+
+	ed := NewEncodingDetector()
+	if match := ed.DetectCharsetSmart(le); match.Charset != "utf-16le" {
+		t.Errorf("DetectCharsetSmart(BOM+ctrl) = %q (confidence %d), want utf-16le", match.Charset, match.Confidence)
+	}
+	if got := ed.DetectCharset(le); got != "utf-16le" {
+		t.Errorf("DetectCharset(BOM+ctrl) = %q, want utf-16le", got)
+	}
+	out, _, err := ed.DetectAndConvert(le)
+	if err != nil {
+		t.Fatalf("DetectAndConvert: %v", err)
+	}
+	if !strings.Contains(string(out), "hello") {
+		t.Errorf("decoded output lost text: %q", string(out))
+	}
+}
+
+// TestBOMCharsetAuthoritativeBE covers the big-endian variant.
+func TestBOMCharsetAuthoritativeBE(t *testing.T) {
+	t.Parallel()
+
+	u16 := utf16.Encode([]rune("<html><body><p>hi there</p></body></html>"))
+	be := make([]byte, 2+2*len(u16))
+	be[0], be[1] = 0xFE, 0xFF
+	for i, r := range u16 {
+		binary.BigEndian.PutUint16(be[2+2*i:], r)
+	}
+
+	ed := NewEncodingDetector()
+	if match := ed.DetectCharsetSmart(be); match.Charset != "utf-16be" {
+		t.Errorf("DetectCharsetSmart(UTF-16BE BOM) = %q (confidence %d), want utf-16be", match.Charset, match.Confidence)
+	}
+}
+
+// TestBOMCharsetHelper pins the shared helper's mapping for every BOM it
+// recognizes, plus the no-BOM case.
+func TestBOMCharsetHelper(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"utf-8 BOM", []byte{0xEF, 0xBB, 0xBF, 'x'}, "utf-8"},
+		{"utf-16be BOM", []byte{0xFE, 0xFF, 0x00, 'x'}, "utf-16be"},
+		{"utf-16le BOM", []byte{0xFF, 0xFE, 'x', 0x00}, "utf-16le"},
+		{"no BOM", []byte("<html>"), ""},
+		{"empty", nil, ""},
+		{"too short", []byte{0xFF}, ""},
+	}
+	for _, c := range cases {
+		if got := detectBOMCharset(c.data); got != c.want {
+			t.Errorf("detectBOMCharset(%s) = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestUTF8BOMStrippedOnFastPath pins the fix for a UTF-8 BOM surviving the
+// valid-UTF-8 fast path: BOM-prefixed input passes utf8.Valid (the BOM is a
+// legal U+FEFF encoding), so detectAndConvertToUTF8StringCore used to convert
+// it verbatim and U+FEFF flowed into the parsed document and the extracted
+// text — while the slow path (ToUTF8) stripped it, so identical bytes came
+// back different depending on which path handled them.
+func TestUTF8BOMStrippedOnFastPath(t *testing.T) {
+	t.Parallel()
+
+	bom := []byte{0xEF, 0xBB, 0xBF}
+
+	// BOM + ASCII body: not pure ASCII (the BOM bytes are >= 0x80) but valid
+	// UTF-8, so it takes the fast path under review.
+	ascii := append(append([]byte{}, bom...),
+		[]byte("<html><body><p>hello world</p></body></html>")...)
+	if got, _, err := DetectAndConvertToUTF8String(ascii, ""); err != nil {
+		t.Fatalf("DetectAndConvertToUTF8String: %v", err)
+	} else if strings.ContainsRune(got, rune(0xFEFF)) {
+		t.Errorf("fast path leaked UTF-8 BOM into output: %q", got)
+	}
+
+	// BOM + CJK body: same fast path, exercising the zero-copy sharing
+	// branch on non-ASCII content.
+	cjk := append(append([]byte{}, bom...),
+		[]byte("<html><body><p>你好世界</p></body></html>")...)
+	if got, _, err := DetectAndConvertToUTF8String(cjk, ""); err != nil {
+		t.Fatalf("DetectAndConvertToUTF8String(CJK): %v", err)
+	} else if strings.ContainsRune(got, rune(0xFEFF)) {
+		t.Errorf("fast path leaked UTF-8 BOM into CJK output: %q", got)
+	}
+
+	// The memory-safe (copying) variant shares the core and must strip too.
+	if got, _, err := DetectAndConvertToUTF8StringSafe(ascii, ""); err != nil {
+		t.Fatalf("DetectAndConvertToUTF8StringSafe: %v", err)
+	} else if strings.ContainsRune(got, rune(0xFEFF)) {
+		t.Errorf("safe variant leaked UTF-8 BOM: %q", got)
 	}
 }

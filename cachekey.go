@@ -20,12 +20,13 @@ var cacheKeySeed = maphash.MakeSeed()
 // processed under different forced-encoding settings do not collide.
 //
 // Uses hash/maphash which leverages AES-NI instructions on amd64 for high
-// throughput. Uses multi-point sampling for large documents to bound the hash
-// cost while maintaining collision resistance.
+// throughput. The whole input is hashed: sampling a subset of a large document
+// made the key blind to the unsampled bytes and served one document's cached
+// result for another (see the call site in generateCacheKey).
 //
-// SECURITY: Uses 5-point sampling for better collision resistance against
-// hash-flooding attacks. The sampling strategy ensures that modifications
-// anywhere in the document are likely to change the hash.
+// SECURITY: The random per-process seed makes key collisions infeasible to
+// target, and hashing every byte ensures any modification — anywhere in the
+// document — changes the key.
 //
 // Returns the 128-bit key as a stack value ([16]byte) rather than a heap string.
 // The cache is keyed by this value type, so generating a key allocates nothing —
@@ -65,65 +66,21 @@ func (p *Processor) generateCacheKey(data []byte) [16]byte {
 	// is deterministic for the same bytes.
 	_, _ = h.WriteString(p.config.Encoding)
 
-	dataLen := len(data)
-	if dataLen <= maxCacheKeySize {
-		// Hash the entire input directly
-		_, _ = h.Write(data)
-	} else {
-		// SECURITY: Multi-point sampling for large documents.
-		// Using 5 sampling points for better collision resistance.
-		const sampleCount = 5
-		sampleSize := cacheKeySample / sampleCount
-		if sampleSize < 256 {
-			sampleSize = 256
-		}
-
-		for i := 0; i < sampleCount; i++ {
-			var start, end int
-			switch i {
-			case sampleCount - 1:
-				end = dataLen
-				start = dataLen - sampleSize
-				if start < 0 {
-					start = 0
-				}
-			case 0:
-				start = 0
-				end = sampleSize
-				if end > dataLen {
-					end = dataLen
-				}
-			default:
-				offset := (dataLen * i) / (sampleCount - 1)
-				start = offset - sampleSize/2
-				if start < 0 {
-					start = 0
-				}
-				end = start + sampleSize
-				if end > dataLen {
-					end = dataLen
-					start = end - sampleSize
-					if start < 0 {
-						start = 0
-					}
-				}
-			}
-
-			if start < end {
-				_, _ = h.Write(data[start:end])
-			}
-		}
-
-		// Mix content length for additional uniqueness
-		var lenBuf [8]byte
-		binary.LittleEndian.PutUint64(lenBuf[:], uint64(dataLen))
-		_, _ = h.Write(lenBuf[:])
-	}
+	// Hash the entire input. An earlier version sampled five windows (about
+	// 4KB) of documents larger than 64KB, which made the key blind to every
+	// byte outside those windows: two same-length documents differing only in
+	// the unsampled middle produced the same key, so the second extraction was
+	// served the first document's cached Result. maphash runs on AES-NI at
+	// roughly 11-13 GB/s (measured), so even a 10MB document costs under a
+	// millisecond — small against the parse and tree traversal it gates, and
+	// correctness wins over the saved scan.
+	_, _ = h.Write(data)
 
 	// Produce a 128-bit key from the 64-bit maphash output. The second half
-	// is derived via a splitmix64-style finalizer for additional diffusion,
-	// giving effective collision resistance far beyond 2^64 without a second
-	// hash pass.
+	// is derived via a splitmix64-style finalizer for additional diffusion.
+	// The key is 128 bits wide but derived from a single 64-bit hash, so its
+	// effective collision resistance is ~64 bits: the finalizer separates the
+	// output space but does not double the collision entropy.
 	sum := h.Sum64()
 	var key [16]byte
 	binary.LittleEndian.PutUint64(key[:8], sum)

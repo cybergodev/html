@@ -401,6 +401,13 @@ func matchMediaURLAt(s string, p int, exts [256][]string) string {
 // every document byte, while the pattern's shape — a fold-case literal prefix,
 // a bounded run over an explicit byte set, and a fixed-length suffix — admits a
 // direct scan that touches only candidate bytes.
+//
+// CONCURRENCY: html may alias a caller-owned byte slice. extractMedia passes the
+// zero-copy decoded document straight from detectAndConvertToUTF8StringCore,
+// whose (unsafe) contract permits that aliasing, so onURL receives substrings
+// that share memory with that slice. A caller that retains a match past the
+// scan must copy it before the slice is reused or mutated (appendUniqueVideoURLs
+// and addVideo/addAudio in the html package copy at the append site).
 func ScanMediaURLs(html string, video bool, maxMatches int, onURL func(string) bool) {
 	if maxMatches <= 0 || onURL == nil {
 		return

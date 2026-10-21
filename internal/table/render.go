@@ -150,8 +150,8 @@ func spannedFill(text string) CellData {
 // count. Computing maxCols from raw counts (the old behavior) made
 // applyRowspanGrid drop those shifted cells at its "col >= maxCols" guard,
 // silently losing trailing cells. colspan is already expanded into separate
-// one-column entries by expandColspanCells, so each cell occupies exactly one
-// column here.
+// one-column entries by the inline expansion in extractTableData, so each cell
+// occupies exactly one column here.
 // maxGridCells bounds the rendering grid (numRows x maxCols) the Markdown
 // renderer allocates: padTableColumns, applyRowspanGrid, and the per-column
 // slices all size off that product, and maxCols can be dominated by synthetic
@@ -490,7 +490,13 @@ func renderMarkdownRow(tb *TrackedBuilder, row []CellData, newToOldCol []int,
 		}
 
 		maxWidth := colMaxWidths[newJ]
-		textLen := utf8.RuneCountInString(cellText)
+		// The rendered width must count the escapes writeMarkdownCellText
+		// emits, exactly as calculateMaxColumnWidths does. Without the
+		// adjustment a cell containing a pipe or a backslash rendered one
+		// character wider per escapable byte than its column, which knocked
+		// the padding of every cell in that row out of alignment.
+		textLen := utf8.RuneCountInString(cellText) +
+			strings.Count(cellText, "\\") + strings.Count(cellText, "|")
 		pad := maxWidth - textLen
 
 		// Apply alignment-based padding. Cell text is written through

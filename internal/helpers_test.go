@@ -297,41 +297,6 @@ func TestCleanText(t *testing.T) {
 	})
 }
 
-func TestReplaceHTMLEntities(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"&nbsp;", " "},
-		{"&amp;", "&"},
-		{"&lt;", "<"},
-		{"&gt;", ">"},
-		{"&quot;", "\""},
-		{"&apos;", "'"},
-		{"&mdash;", "—"},
-		{"&ndash;", "–"},
-		{"&#8212;", "—"},
-		{"&#x2014;", "—"},
-		{"&#160;", " "},
-		{"&#xa0;", " "},
-		{"&hellip;", "…"},
-		{"&copy;", "©"},
-		{"no entities", "no entities"},
-		{"", ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			result := ReplaceHTMLEntities(tt.input)
-			if result != tt.want {
-				t.Errorf("ReplaceHTMLEntities(%q) = %q, want %q", tt.input, result, tt.want)
-			}
-		})
-	}
-}
-
 func TestIsExternalURL(t *testing.T) {
 	t.Parallel()
 
@@ -687,78 +652,6 @@ func TestGetListPrefix(t *testing.T) {
 	}
 }
 
-// TestReplaceNumericEntity covers decimal/hex decoding, the NBSP special case,
-// surrogate pairs, out-of-range code points, and every rejection path (no '#',
-// no semicolon, empty entity, oversized entity, invalid hex/decimal digits,
-// empty hex payload, truncated input).
-func TestReplaceNumericEntity(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name         string
-		text         string
-		start        int
-		wantRepl     string
-		wantConsumed int
-	}{
-		{"decimal A", "&#65;", 0, "A", 5},
-		{"hex A lowercase", "&#x41;", 0, "A", 6},
-		{"hex A uppercase X", "&#X41;", 0, "A", 6},
-		{"nbsp becomes space", "&#160;", 0, " ", 6},
-		{"tab", "&#9;", 0, "\t", 4},
-		{"surrogate -> REPLACEMENT", "&#xD800;", 0, "�", 8},
-		{"out of range preserved as-is", "&#1114112;", 0, "&#1114112;", 10},
-		{"empty entity preserved", "&#;", 0, "&#;", 3},
-		{"hex with no digits preserved", "&#x;", 0, "&#x;", 4},
-		{"oversized entity preserved", "&#12345678901234;", 0, "&#12345678901234;", 17},
-		{"invalid hex digit preserved", "&#xZZ;", 0, "&#xZZ;", 6},
-		{"invalid decimal digit preserved", "&#12a;", 0, "&#12a;", 6},
-		{"no semicolon", "&#65", 0, "&", 1},
-		{"not a numeric entity", "&amp;", 0, "&", 1},
-		{"lone ampersand", "&", 0, "&", 1},
-		{"truncated after hash", "&#", 0, "&", 1},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			repl, consumed := replaceNumericEntity(tt.text, tt.start)
-			if repl != tt.wantRepl || consumed != tt.wantConsumed {
-				t.Errorf("replaceNumericEntity(%q, %d) = (%q, %d), want (%q, %d)",
-					tt.text, tt.start, repl, consumed, tt.wantRepl, tt.wantConsumed)
-			}
-		})
-	}
-}
-
-// TestIsValidEntityName covers empty, alphanumeric-valid, and several invalid
-// character cases (separator, dash, non-ASCII).
-func TestIsValidEntityName(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		in   string
-		want bool
-	}{
-		{"empty", "", false},
-		{"lowercase", "amp", true},
-		{"uppercase", "AMP", true},
-		{"alphanumeric", "amp123", true},
-		{"digits only", "123", true},
-		{"semicolon invalid", "amp;", false},
-		{"dash invalid", "amp-lt", false},
-		{"non-ascii invalid", "café", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := isValidEntityName(tt.in); got != tt.want {
-				t.Errorf("isValidEntityName(%q) = %v, want %v", tt.in, got, tt.want)
-			}
-		})
-	}
-}
-
 // TestExtractPaddingLeft covers nil/non-element rejection, missing/empty style,
 // no padding-left rule, and integer parsing with truncation.
 func TestExtractPaddingLeft(t *testing.T) {
@@ -810,7 +703,7 @@ func TestNormalizeText(t *testing.T) {
 		{"newline to space", "line1\nline2", "line1 line2"},
 		{"carriage return dropped", "a\rb", "ab"},
 		{"cr lf pair", "a\r\nb", "a b"},
-		{"nbsp to space", "a b", "a b"},
+		{"nbsp to space", "a\u00a0b", "a b"},
 		{"ampersand passthrough", "a&amp;b", "a&amp;b"},
 		{"combined entity and newline", "x&amp;\ny", "x&amp; y"},
 	}
@@ -849,10 +742,10 @@ func TestCleanTextClassificationRewrite(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct{ name, in, want string }{
-		{"nbsp alone", "a b", "a b"},
-		{"nbsp then space becomes a pair", "x  y", "x y"},
-		{"space then nbsp becomes a pair", "x  y", "x y"},
-		{"nbsp across lines", "l1\n \nl2", "l1\n\nl2"},
+		{"nbsp alone", "a\u00a0b", "a b"},
+		{"nbsp then space becomes a pair", "x\u00a0 y", "x y"},
+		{"space then nbsp becomes a pair", "x\u00a0 y", "x y"},
+		{"nbsp across lines", "l1\n\u00a0\nl2", "l1\n\nl2"},
 		{"ampersand only", "Tom & Jerry", "Tom & Jerry"},
 		{"entity with newlines", "a &amp;\nb", "a &amp;\nb"},
 		{"checkbox glyphs", "a☒b☐c☑d", "a[X]b[ ]c[X]d"},
@@ -866,6 +759,70 @@ func TestCleanTextClassificationRewrite(t *testing.T) {
 			t.Parallel()
 			if got := CleanText(tt.in); got != tt.want {
 				t.Errorf("CleanText(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+func TestGetTextContentSkipsScriptStyle(t *testing.T) {
+	t.Parallel()
+
+	doc, err := html.Parse(strings.NewReader(
+		`<html><body><a href="x"><script>evil()</script>click me<noscript>noscript text</noscript></a></body></html>`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	a := FindElementByTag(doc, "a")
+	if a == nil {
+		t.Fatal("<a> not found")
+	}
+	if got := GetTextContent(a); got != "click me" {
+		t.Errorf("GetTextContent = %q, want %q", got, "click me")
+	}
+
+	// Mixed content: text around a style block still joins per the source's
+	// own whitespace (a space is emitted only where the source had one).
+	doc2, err := html.Parse(strings.NewReader(
+		`<html><body><a href="x">alpha <style>.s{}</style> beta</a></body></html>`))
+	if err != nil {
+		t.Fatalf("Parse(2): %v", err)
+	}
+	a2 := FindElementByTag(doc2, "a")
+	if got := GetTextContent(a2); got != "alpha beta" {
+		t.Errorf("GetTextContent(2) = %q, want %q", got, "alpha beta")
+	}
+}
+
+// TestIsBoundaryChar pins the two boundary character sets at their edges: the
+// digits-included standard set (menu3 must still match the "menu" pattern) and
+// the CSS-specific set, plus the unrecognized-set default.
+func TestIsBoundaryChar(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		c    byte
+		set  boundaryCharSet
+		want bool
+	}{
+		{"standard hyphen", '-', boundaryStandard, true},
+		{"standard underscore", '_', boundaryStandard, true},
+		{"standard space", ' ', boundaryStandard, true},
+		{"standard tab", '\t', boundaryStandard, true},
+		{"standard digit", '3', boundaryStandard, true},
+		{"standard letter is not a boundary", 'a', boundaryStandard, false},
+		{"css semicolon", ';', boundaryCSS, true},
+		{"css colon", ':', boundaryCSS, true},
+		{"css brace open", '{', boundaryCSS, true},
+		{"css quote", '"', boundaryCSS, true},
+		{"css hyphen is not a css boundary", '-', boundaryCSS, false},
+		{"unknown set defaults to false", '-', boundaryCharSet(99), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isBoundaryChar(tt.c, tt.set); got != tt.want {
+				t.Errorf("isBoundaryChar(%q, %d) = %v, want %v", tt.c, tt.set, got, tt.want)
 			}
 		})
 	}

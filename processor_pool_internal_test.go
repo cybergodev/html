@@ -108,3 +108,24 @@ func TestPackageFunctionsSurvivePoolPanic(t *testing.T) {
 		}
 	})
 }
+
+// TestGetPooledProcessorTypeFallback covers getPooledProcessor's type-corruption
+// fallback branch (processor_pool.go:50, previously uncovered). A wrong type in
+// the pool must not crash the caller: Get falls back to building a fresh,
+// fully-initialized Processor via New(poolCfg).
+func TestGetPooledProcessorTypeFallback(t *testing.T) {
+	// Not parallel: this corrupts the shared processorPool, so it must not
+	// overlap with other tests (or the package-level convenience functions)
+	// that Get from the same pool.
+	processorPool.Put("not a processor") //nolint:staticcheck // intentionally wrong type: exercises the corruption path
+
+	p := getPooledProcessor()
+	if p == nil {
+		t.Fatal("getPooledProcessor returned nil after pool corruption")
+	}
+	// A fallback Processor must be fully usable, not a half-built struct.
+	if _, err := p.Extract([]byte("<html><body><p>hi</p></body></html>")); err != nil {
+		t.Fatalf("fallback processor unusable: %v", err)
+	}
+	_ = p.Close()
+}

@@ -278,7 +278,15 @@ type jsonResult struct {
 // Result will lose duration fields (ProcessingTime, ReadingTime) because the JSON keys
 // differ from the struct field names. This is intentional — the JSON format is designed
 // for external consumption, not round-tripping.
+//
+// A nil receiver marshals to null instead of panicking, matching what
+// encoding/json itself does for a nil *Result. encoding/json short-circuits
+// nil pointers before calling this method, but MarshalJSON is exported and can
+// be called directly (SEC-003: public API must not panic).
 func (r *Result) MarshalJSON() ([]byte, error) {
+	if r == nil {
+		return []byte("null"), nil
+	}
 	jr := jsonResult{
 		Text:             r.Text,
 		Title:            r.Title,

@@ -354,6 +354,56 @@ func TestWriterAuditSinkWriteError(t *testing.T) {
 	}
 }
 
+// errWriter returns an error from every Write, exercising the write-failure
+// branch of WriterAuditSink.Write (the `s.writer.Write(data)` error path logs
+// and drops the entry rather than swallowing the delivery failure).
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
+
+// TestWriterAuditSinkWriteIOError covers the underlying-writer failure branch:
+// a writer whose Write returns an error must not panic, and must drop the entry.
+func TestWriterAuditSinkWriteIOError(t *testing.T) {
+	t.Parallel()
+
+	sink := NewWriterAuditSink(errWriter{})
+	defer func() { _ = sink.Close() }()
+
+	sink.Write(AuditEntry{EventType: AuditEventBlockedTag, Message: "x"}) // must not panic
+}
+
+// closeErrSink is a sink whose Close returns a fixed error, for the
+// MultiSink.Close aggregation branch.
+type closeErrSink struct{ err error }
+
+func (c *closeErrSink) Write(AuditEntry) {}
+func (c *closeErrSink) Close() error     { return c.err }
+
+// TestMultiSinkCloseAggregatesErrors covers MultiSink.Close's errors.Join path:
+// a sink that fails to close must surface its error instead of being dropped.
+func TestMultiSinkCloseAggregatesErrors(t *testing.T) {
+	t.Parallel()
+
+	boom := errors.New("sink close failed")
+	multi := NewMultiSink(
+		&closeErrSink{err: boom},
+		&closeErrSink{}, // closes cleanly
+	)
+	if err := multi.Close(); !errors.Is(err, boom) {
+		t.Fatalf("MultiSink.Close() = %v, want it to wrap %v", err, boom)
+	}
+
+	// Nil receiver and a nil inner sink are both safe no-ops.
+	var nilMulti *MultiSink
+	if err := nilMulti.Close(); err != nil {
+		t.Errorf("(*MultiSink)(nil).Close() = %v, want nil", err)
+	}
+	empty := NewMultiSink(nil)
+	if err := empty.Close(); err != nil {
+		t.Errorf("MultiSink with a nil inner sink = %v, want nil", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // AuditCollector — integration: RecordBlockedTag/Attr/URL via sanitization
 // ---------------------------------------------------------------------------

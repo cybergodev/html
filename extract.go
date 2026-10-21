@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cybergodev/html/internal"
+	"github.com/cybergodev/html/internal/table"
 	stdxhtml "golang.org/x/net/html"
 )
 
@@ -797,74 +798,72 @@ func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string) 
 	imageFormat := p.imageFormat
 	linkFormat := p.linkFormat
 
-	// Use placeholder path if either image or link format is not "none"
-	if imageFormat != "none" || linkFormat != "none" {
-		images, links := p.extractImagesAndLinks(contentNode, true, true)
+	// A "none" format has no formatter, so it needs neither the placeholder
+	// tokens nor the resource list behind them.
+	needsImageTokens := imageFormat != "none"
+	needsLinkTokens := linkFormat != "none"
 
-		if p.config.PreserveImages {
-			result.Images = images
-		}
-		if p.config.PreserveLinks {
-			result.Links = links
-		}
+	// Collect images and links once, in a single traversal. A list is needed
+	// when the caller asked for it (PreserveImages/PreserveLinks) or when a
+	// formatter must substitute placeholders with it; requesting a list solely
+	// because a formatter consumes it would otherwise drop the entries the
+	// caller asked for when that format is "none".
+	images, links := p.extractImagesAndLinks(contentNode,
+		p.config.PreserveImages || needsImageTokens,
+		p.config.PreserveLinks || needsLinkTokens)
+	if p.config.PreserveImages {
+		result.Images = images
+	}
+	if p.config.PreserveLinks {
+		result.Links = links
+	}
 
+	if needsImageTokens || needsLinkTokens {
 		tb := internal.GetTrackedBuilder()
 		var imageCounter, linkCounter int
 		var imgCounter, linkCounterPtr *int
-		// Only emit the placeholder kinds a formatter will consume. A "none"
+		// Only emit the placeholder kinds a formatter will consume: a "none"
 		// format has no formatter, so its tokens would survive both formatting
-		// passes verbatim and leak into Text as literal [IMAGE:n]/[LINK:n]
-		// text when just one of the two formats is enabled. ("placeholder"
-		// keeps [IMAGE:n] visible by design and still needs the numbering.)
-		// Positions in result.Images/result.Links come from the independent
-		// counters in extractImagesAndLinks and are unaffected by this.
-		if imageFormat != "none" {
+		// passes verbatim and leak into Text as literal [IMAGE:n]/[LINK:n] text
+		// when just one of the two formats is enabled. ("placeholder" keeps
+		// [IMAGE:n] visible by design and still needs the numbering.) Positions
+		// in result.Images/result.Links come from the independent counters in
+		// extractImagesAndLinks and are unaffected by this.
+		if needsImageTokens {
 			imgCounter = &imageCounter
 		}
-		if linkFormat != "none" {
+		if needsLinkTokens {
 			linkCounterPtr = &linkCounter
 		}
 		internal.ExtractTextWithStructureAndImages(contentNode, tb, imgCounter, linkCounterPtr, p.config.TableFormat)
 		// CleanTextBytes reads the builder's buffer directly, skipping the
 		// tb.String() intermediate copy the string entry point would make.
-		textWithPlaceholders := internal.CleanTextBytes(tb.Bytes())
+		text := internal.CleanTextBytes(tb.Bytes())
 		internal.PutTrackedBuilder(tb)
 
-		// Apply formatters in order: images first, then links
-		result.Text = p.formatInlineImages(textWithPlaceholders, images, imageFormat)
-		result.Text = p.formatInlineLinks(result.Text, links, linkFormat)
+		// Apply formatters in order: images first, then links. A "none"
+		// formatter returns its input unchanged.
+		result.Text = p.formatInlineLinks(p.formatInlineImages(text, images, imageFormat), links, linkFormat)
 	} else {
 		result.Text = p.extractTextContent(contentNode, p.config.TableFormat)
-
-		images, links := p.extractImagesAndLinks(contentNode, p.config.PreserveImages, p.config.PreserveLinks)
-		if p.config.PreserveImages {
-			result.Images = images
-		}
-		if p.config.PreserveLinks {
-			result.Links = links
-		}
 	}
 
 	result.WordCount = p.countWords(result.Text)
 	result.ReadingTime = p.calculateReadingTime(result.WordCount)
 
-	// Compute the media-reference gate once for both extractors. HasMediaReference
-	// scans the whole document, and the video and audio gates evaluate the same
-	// content-only condition, so computing it here (only when at least one media
-	// type is preserved) halves the scan versus each extractor computing its own.
+	// HasMediaReference is a necessary condition for the raw-HTML media scans,
+	// and it is the same content-only test for both media kinds, so it is
+	// computed once here rather than per extractor.
 	if p.config.PreserveVideos || p.config.PreserveAudios {
 		canContainMedia := len(htmlContent) > 0 &&
 			len(htmlContent) <= maxHTMLForRegex &&
 			internal.HasMediaReference(htmlContent)
-		// When both media types are preserved (the default), extract them in a
-		// single DOM walk instead of two separate WalkNodes traversals.
-		if p.config.PreserveVideos && p.config.PreserveAudios {
-			result.Videos, result.Audios = p.extractAllMedia(doc, htmlContent, canContainMedia)
-		} else if p.config.PreserveVideos {
-			result.Videos = p.extractVideos(doc, htmlContent, canContainMedia)
-		} else {
-			result.Audios = p.extractAudios(doc, htmlContent, canContainMedia)
-		}
+		// One call handles all three preserve combinations; the want flags keep
+		// a disabled kind from costing a walk branch or a raw-HTML scan.
+		videos, audios := p.extractMedia(doc, htmlContent, canContainMedia,
+			p.config.PreserveVideos, p.config.PreserveAudios)
+		result.Videos = videos
+		result.Audios = audios
 	}
 	return result, nil
 }
@@ -965,6 +964,46 @@ func (p *Processor) extractTextContent(node *stdxhtml.Node, tableFormat string) 
 	return result
 }
 
+// writeMarkdownInline writes a Markdown inline link — or, when image is true,
+// the image form of the same construct (a leading '!') — escaping the label
+// and destination exactly as both inline formatters require. It is the single
+// place those rules live: images and links previously assembled the identical
+// construct in two different ways, so an escaping fix could land in one and
+// miss the other.
+func writeMarkdownInline(tb *table.TrackedBuilder, image bool, label, url string) {
+	if image {
+		_ = tb.WriteByte('!')
+	}
+	_ = tb.WriteByte('[')
+	_, _ = tb.WriteString(escapeMarkdownText(label))
+	_, _ = tb.WriteString("](")
+	_, _ = tb.WriteString(escapeMarkdownURLDest(url))
+	_ = tb.WriteByte(')')
+}
+
+// writeHTMLAttr writes a quoted HTML attribute, escaping the value so it
+// cannot break out of the attribute. Both inline HTML formatters emit
+// attributes this way.
+func writeHTMLAttr(tb *table.TrackedBuilder, name, value string) {
+	_ = tb.WriteByte(' ')
+	_, _ = tb.WriteString(name)
+	_, _ = tb.WriteString(`="`)
+	_, _ = tb.WriteString(htmlstd.EscapeString(value))
+	_ = tb.WriteByte('"')
+}
+
+// writeHTMLAnchor writes an inline HTML anchor around text.
+func writeHTMLAnchor(tb *table.TrackedBuilder, href, title, text string) {
+	_, _ = tb.WriteString("<a")
+	writeHTMLAttr(tb, "href", href)
+	if title != "" {
+		writeHTMLAttr(tb, "title", title)
+	}
+	_, _ = tb.WriteString(">")
+	_, _ = tb.WriteString(htmlstd.EscapeString(text))
+	_, _ = tb.WriteString("</a>")
+}
+
 func (p *Processor) formatInlineImages(textWithPlaceholders string, images []ImageInfo, format string) string {
 	if len(images) == 0 || format == "placeholder" || format == "none" {
 		return textWithPlaceholders
@@ -972,19 +1011,24 @@ func (p *Processor) formatInlineImages(textWithPlaceholders string, images []Ima
 
 	switch format {
 	case "markdown":
-		// Build replacements and use direct string replacement
+		// Build replacements and use direct string replacement. The pooled
+		// builder holds one rendered image at a time and String() copies it out,
+		// so the replacement list owns its strings.
+		md := internal.GetTrackedBuilder()
+		defer internal.PutTrackedBuilder(md)
 		replacements := make([]string, 0, len(images)*2)
 		for i := range images {
 			if images[i].Position == 0 {
 				continue
 			}
-			placeholder := "[IMAGE:" + strconv.Itoa(images[i].Position) + "]"
 			altText := images[i].Alt
 			if altText == "" {
 				altText = "Image " + strconv.Itoa(images[i].Position)
 			}
-			markdown := "![" + escapeMarkdownText(altText) + "](" + escapeMarkdownURLDest(images[i].URL) + ")"
-			replacements = append(replacements, placeholder, markdown)
+			md.Reset()
+			writeMarkdownInline(md, true, altText, images[i].URL)
+			replacements = append(replacements,
+				"[IMAGE:"+strconv.Itoa(images[i].Position)+"]", md.String())
 		}
 		if len(replacements) > 0 {
 			replacer := strings.NewReplacer(replacements...)
@@ -1002,34 +1046,25 @@ func (p *Processor) formatInlineImages(textWithPlaceholders string, images []Ima
 			if images[i].Position == 0 {
 				continue
 			}
-			placeholder := "[IMAGE:" + strconv.Itoa(images[i].Position) + "]"
 			htmlImg.Reset()
 			htmlImg.Grow(len(images[i].URL) + len(images[i].Alt) + len(images[i].Width) + len(images[i].Height) + imageHTMLBufExtra)
-			_, _ = htmlImg.WriteString(`<img src="`)
-			_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].URL))
-			_, _ = htmlImg.WriteString(`" alt="`)
-			_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].Alt))
-			_, _ = htmlImg.WriteString(`"`)
-			// Mirror formatInlineLinks' html branch: the advisory title is a
-			// native HTML attribute, and ImageInfo.Title was collected but
-			// never rendered in either inline format.
+			_, _ = htmlImg.WriteString("<img")
+			writeHTMLAttr(htmlImg, "src", images[i].URL)
+			writeHTMLAttr(htmlImg, "alt", images[i].Alt)
+			// The advisory title is a native HTML attribute; ImageInfo.Title was
+			// collected but never rendered in either inline format.
 			if images[i].Title != "" {
-				_, _ = htmlImg.WriteString(` title="`)
-				_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].Title))
-				_, _ = htmlImg.WriteString(`"`)
+				writeHTMLAttr(htmlImg, "title", images[i].Title)
 			}
 			if images[i].Width != "" {
-				_, _ = htmlImg.WriteString(` width="`)
-				_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].Width))
-				_, _ = htmlImg.WriteString(`"`)
+				writeHTMLAttr(htmlImg, "width", images[i].Width)
 			}
 			if images[i].Height != "" {
-				_, _ = htmlImg.WriteString(` height="`)
-				_, _ = htmlImg.WriteString(htmlstd.EscapeString(images[i].Height))
-				_, _ = htmlImg.WriteString(`"`)
+				writeHTMLAttr(htmlImg, "height", images[i].Height)
 			}
 			_, _ = htmlImg.WriteString(">")
-			replacements = append(replacements, placeholder, htmlImg.String())
+			replacements = append(replacements,
+				"[IMAGE:"+strconv.Itoa(images[i].Position)+"]", htmlImg.String())
 		}
 		if len(replacements) > 0 {
 			replacer := strings.NewReplacer(replacements...)
@@ -1111,23 +1146,9 @@ func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkI
 								}
 								switch format {
 								case "markdown":
-									_ = tb.WriteByte('[')
-									_, _ = tb.WriteString(escapeMarkdownText(linkText))
-									_, _ = tb.WriteString("](")
-									_, _ = tb.WriteString(escapeMarkdownURLDest(link.URL))
-									_ = tb.WriteByte(')')
+									writeMarkdownInline(tb, false, linkText, link.URL)
 								case "html":
-									_, _ = tb.WriteString(`<a href="`)
-									_, _ = tb.WriteString(htmlstd.EscapeString(link.URL))
-									_, _ = tb.WriteString(`"`)
-									if link.Title != "" {
-										_, _ = tb.WriteString(` title="`)
-										_, _ = tb.WriteString(htmlstd.EscapeString(link.Title))
-										_, _ = tb.WriteString(`"`)
-									}
-									_, _ = tb.WriteString(`>`)
-									_, _ = tb.WriteString(htmlstd.EscapeString(linkText))
-									_, _ = tb.WriteString("</a>")
+									writeHTMLAnchor(tb, link.URL, link.Title, linkText)
 								default:
 									_, _ = tb.WriteString(linkText)
 								}
@@ -1209,16 +1230,10 @@ func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantL
 	}
 
 	imgPos, linkPos := 0, 0
-	// WalkAllNodes, not WalkNodes: this collector must observe exactly the
-	// same node set as the text pass (extractTextWithStructure), which
-	// recurses uncapped. WalkNodes stops silently at maxWalkNodes (50,000),
-	// so on larger documents the collector dropped every img/a past the cap
-	// while the text pass kept emitting [IMAGE:n]/[LINK:n] placeholders for
-	// them — unmatched tokens then leaked into Text verbatim and their URLs
-	// were silently dropped. MaxInputSize bounds the input bytes and the
-	// parse plus the text pass already visit every node, so the uncapped
-	// walk adds no asymptotic work.
-	internal.WalkAllNodes(node, func(n *stdxhtml.Node) bool {
+	// This collector observes exactly the same node set as the text pass
+	// (extractTextWithStructure): unmatched [IMAGE:n]/[LINK:n] tokens would
+	// otherwise leak into Text and their URLs would be dropped.
+	internal.WalkNodes(node, func(n *stdxhtml.Node) bool {
 		if n.Type != stdxhtml.ElementNode {
 			return true
 		}

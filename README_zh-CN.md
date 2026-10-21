@@ -5,7 +5,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Security](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
 [![Thread Safe](https://img.shields.io/badge/thread%20safe-yes-brightgreen.svg)](#-线程安全)
-[![CI](https://github.com/cybergodev/html/actions/workflows/ci.yaml/badge.svg)](https://github.com/cybergodev/html/actions/workflows/ci.yaml)
 
 **一个高性能的 Go 库，用于智能 HTML 内容提取**，基于 `golang.org/x/net/html` 构建。
 
@@ -689,7 +688,7 @@ processor, _ := html.New(config)
 | `NewLoggerAuditSink()` | 写入 stderr，带 `[AUDIT]` 前缀 |
 | `NewLoggerAuditSinkWithWriter(w)` | 写入自定义 io.Writer |
 | `NewWriterAuditSink(w)` | 以 JSON 行格式写入 io.Writer |
-| `NewChannelAuditSink(bufferSize)` | 发送到通道供外部处理 |
+| `NewChannelAuditSink(bufferSize)` | 发送到通道供外部处理（`bufferSize` 会被限制在 `[0, 100000]`） |
 | `NewMultiSink(sinks...)` | 组合多个输出目标 |
 | `NewFilteredSink(sink, filter)` | 写入前过滤条目 |
 | `NewLevelFilteredSink(sink, level)` | 仅输出指定级别及以上的条目 |

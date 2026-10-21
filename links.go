@@ -294,6 +294,7 @@ func (p *Processor) detectBaseURL(doc *stdxhtml.Node) string {
 	}
 
 	var canonicalURL, canonicalLink, firstAbsoluteURL string
+	// The walk short-circuits once all three candidates are found.
 	internal.WalkNodes(doc, func(n *stdxhtml.Node) bool {
 		if n.Type != stdxhtml.ElementNode {
 			return true

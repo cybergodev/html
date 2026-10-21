@@ -2,7 +2,6 @@
 package internal
 
 import (
-	"bytes"
 	"sync"
 	"sync/atomic"
 
@@ -13,10 +12,8 @@ import (
 
 // Pool configuration constants
 const (
-	// bufferPoolInitialCapacity is the initial capacity for pooled bytes.Buffer
-	bufferPoolInitialCapacity = 1024
 
-	// maxPooledByteCap is the largest []byte/bytes.Buffer capacity that is returned
+	// maxPooledByteCap is the largest []byte capacity that is returned
 	// to a pool. Buffers that grew beyond this (e.g. a multi-MB extraction result)
 	// are dropped on Put so the pool does not retain them indefinitely — the
 	// classic sync.Pool retention footgun, where one oversized buffer is handed
@@ -88,86 +85,6 @@ func logPoolCorruption(poolName, expectedType string, got any) {
 	if poolLogger.logger != nil {
 		poolLogger.logger("POOL CORRUPTION: %s expected type %s but got %T", poolName, expectedType, got)
 	}
-}
-
-// BufferPool is a sync.Pool for bytes.Buffer instances.
-// Use this for functions that work with byte slices to reduce allocations.
-//
-// For most use cases, prefer the helper functions GetBuffer() and PutBuffer():
-//
-//	buf := internal.GetBuffer()
-//	defer internal.PutBuffer(buf)
-//	buf.Grow(estimatedSize)
-//	// ... use buf ...
-//	return buf.Bytes()
-//
-// Direct pool access is also available for advanced use cases:
-//
-//	bufPtr := internal.BufferPool.Get().(*bytes.Buffer)
-//	buf := *bufPtr
-//	defer func() {
-//	    buf.Reset()
-//	    internal.BufferPool.Put(bufPtr)
-//	}()
-var BufferPool = sync.Pool{
-	New: func() any {
-		return bytes.NewBuffer(make([]byte, 0, bufferPoolInitialCapacity))
-	},
-}
-
-// GetBuffer gets a bytes.Buffer from the pool.
-// The returned buffer has been reset and is ready for use.
-// Call PutBuffer when done to return it to the pool.
-//
-// IMPORTANT: Callers MUST ensure PutBuffer is called even on error paths.
-// Use defer immediately after GetBuffer to guarantee cleanup:
-//
-//	buf := internal.GetBuffer()
-//	defer internal.PutBuffer(buf)
-//	// ... use buf ...
-//
-// Failure to return the buffer to the pool will not cause memory leaks
-// (the GC will collect it), but will reduce the effectiveness of the pool.
-func GetBuffer() *bytes.Buffer {
-	v := BufferPool.Get()
-	buf, ok := v.(*bytes.Buffer)
-	if !ok {
-		// Log pool corruption if debugging is enabled
-		logPoolCorruption("BufferPool", "*bytes.Buffer", v)
-		// Fallback: return a new buffer if pool is corrupted
-		buf = bytes.NewBuffer(make([]byte, 0, bufferPoolInitialCapacity))
-	}
-	return buf
-}
-
-// PutBuffer returns a bytes.Buffer to the pool.
-// The buffer is reset before being returned to the pool.
-// It is safe to call PutBuffer with a nil pointer (no-op).
-//
-// SECURITY: When poolSecureClear is enabled, the buffer's internal data
-// is zeroed before being returned to prevent data leakage.
-func PutBuffer(buf *bytes.Buffer) {
-	if buf == nil {
-		return
-	}
-	// Drop oversized buffers so the pool does not retain a multi-MB backing array
-	// indefinitely (see maxPooledByteCap rationale). Use Cap(), the full
-	// backing array: cap(Bytes()) shrinks by the consumed prefix once a buffer
-	// has been Read from, which would let a fully-read multi-MB buffer slip
-	// past this check (no current borrower Reads — sanitize writes then
-	// converts via String() — but the guard should enforce its own contract).
-	if buf.Cap() > maxPooledByteCap {
-		return
-	}
-	// SECURITY: Optionally clear sensitive data before returning to pool.
-	// Bytes() is the whole written window for a never-Read buffer (off == 0),
-	// which every borrower is; bytes.Buffer exposes no handle to the consumed
-	// prefix, so this is the widest clear available.
-	if poolSecureClear.Load() {
-		clear(buf.Bytes())
-	}
-	buf.Reset()
-	BufferPool.Put(buf)
 }
 
 // byteBufPool pools reusable []byte scratch buffers.

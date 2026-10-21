@@ -88,6 +88,13 @@ func containsWord(text, word string) bool {
 // getCellAlign extracts the alignment from a table cell node.
 // It first checks the align attribute, then the style attribute for text-align.
 // Optimized to use a single loop through attributes.
+//
+// Attribute keys are compared as-is: the HTML tokenizer lowercases attribute
+// names for HTML-namespace elements (only foreign content such as SVG keeps
+// camelCase, and a <td>/<th> is never foreign), so a strings.ToLower per
+// attribute was dead work on the per-cell hot path. The mixed-case markup case
+// (<td ALIGN="Center">) is covered by the "mixed case alignment attributes"
+// case of TestTableAlignmentPreservation.
 func getCellAlign(n *html.Node) table.CellAlignment {
 	if n == nil {
 		return table.AlignDefault
@@ -97,8 +104,7 @@ func getCellAlign(n *html.Node) table.CellAlignment {
 
 	// Single pass through attributes - collect style and check align
 	for _, attr := range n.Attr {
-		attrKey := strings.ToLower(attr.Key)
-		switch attrKey {
+		switch attr.Key {
 		case "align":
 			alignVal := strings.ToLower(strings.TrimSpace(attr.Val))
 			switch alignVal {
@@ -159,7 +165,7 @@ func getCellSpan(n *html.Node, attrKey string) int {
 		return 1
 	}
 	for _, attr := range n.Attr {
-		if strings.ToLower(attr.Key) == attrKey {
+		if attr.Key == attrKey {
 			if val, err := strconv.Atoi(strings.TrimSpace(attr.Val)); err == nil && val > 0 {
 				if val > maxCellSpan {
 					return maxCellSpan
@@ -207,7 +213,7 @@ func getCellWidth(n *html.Node) string {
 	// presentational hints.
 	var styleAttr string
 	for _, attr := range n.Attr {
-		switch strings.ToLower(attr.Key) {
+		switch attr.Key {
 		case "width":
 			// First non-zero width attribute value wins; a duplicate
 			// attribute is dropped by the parser, and zero widths fall

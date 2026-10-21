@@ -92,9 +92,9 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 
 // maxExpandedCells bounds the AGGREGATE number of colspan placeholder cells a
 // single table may allocate across all rows. maxCellSpan (in the caller's
-// CellAccessor) bounds one cell and the node-walk cap bounds visited DOM
-// nodes — but placeholders are synthetic cells no walk ever sees, so without
-// an aggregate cap a ~1.5MB document of <td colspan="1000"> cells multiplies
+// CellAccessor) bounds one cell, and MaxInputSize bounds the real DOM nodes —
+// but placeholders are synthetic cells no walk ever sees, so without an
+// aggregate cap a ~1.5MB document of <td colspan="1000"> cells multiplies
 // ~50k real cells into tens of millions of CellData. Once the budget is
 // spent, later colspans render as one column each. 10,000 is far above any
 // legitimate table's expansion.
@@ -109,12 +109,13 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 	// Typical tables have several rows; pre-size to avoid the first outer-slice
 	// doublings (16 → 32 → …). Grows naturally for larger tables.
 	tableData := make([][]CellData, 0, 8)
-	// scratch is reused across rows: extractRowCells resets it to [:0] and
-	// appends into it each row, replacing a per-row make([]CellData, 0, 4).
-	var scratch []CellData
+	// rowBuf holds the current row's raw cells; it is reused across rows
+	// (appendRowCells writes into rowBuf[:0]) so the per-row cell extraction
+	// allocates nothing after the first few rows.
+	var rowBuf []CellData
 	// arena holds every stored row of this table in one backing array, replacing
-	// the per-row slices the HTML path (make + copy) and the Markdown path
-	// (expandColspanCells) previously allocated. It is pre-sized to cover a
+	// the per-row slices both the HTML and the Markdown paths previously
+	// allocated. It is pre-sized to cover a
 	// typical table in one allocation: growing from zero doubled the backing
 	// 1→2→4→…, so a 30-cell table paid ~63 slots of cumulative copies (~4% of
 	// per-Extract allocation bytes on a profiled realistic document). Larger
@@ -125,14 +126,22 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 	// Markdown structure rows return before appending, so they leave no residue.
 	arena := make([]CellData, 0, 32)
 
+	// expanded budgets the table's colspan placeholders against
+	// maxExpandedCells. It lives OUTSIDE the row callback: placeholders are
+	// synthetic cells no DOM-node bound can see, and a per-row counter let
+	// every row spend the full budget again — a 2,000-row document of
+	// <td colspan="1000"> expanded to two million cells (~780MB of allocation
+	// for an 88KB input) even though the documented budget is per table.
+	expanded := 0
+
 	p.nodeWalker.Walk(table, func(node *html.Node) bool {
 		if node.Type != html.ElementNode || node.Data != "tr" {
 			return true
 		}
 
-		// Extract cells from this row
-		rawCells := p.extractRowCells(node, &scratch)
-		if len(rawCells) == 0 {
+		// Extract this row's cells into the reusable buffer.
+		rowBuf = p.appendRowCells(rowBuf[:0], node)
+		if len(rowBuf) == 0 {
 			return false
 		}
 
@@ -142,25 +151,22 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 			// HTML keeps colspan as an attribute (no expansion). (Structure rows
 			// are a Markdown concept and are always kept for HTML, matching the
 			// prior behavior.)
-			arena = append(arena, rawCells...)
+			arena = append(arena, rowBuf...)
 		} else {
 			// Markdown: skip structure rows (width definitions only), decided on
 			// the raw cells BEFORE colspan expansion — expanded placeholder cells
 			// carry no width and would defeat the check.
-			if isStructureRow(rawCells) {
+			if isStructureRow(rowBuf) {
 				return false
 			}
 			// Expand colspans into placeholder cells inline as the row is
-			// appended (this inline expansion replaced the historical
-			// expandColspanCells per-row allocation). expanded budgets the
-			// table-wide placeholder count against maxExpandedCells:
-			// placeholders are synthetic cells no node-walk cap can see, so
-			// without this bound the arena grows as cells x maxCellSpan.
-			expanded := 0
-			for i := range rawCells {
-				arena = append(arena, rawCells[i])
-				for k := 1; k < rawCells[i].Colspan && expanded < maxExpandedCells; k++ {
-					arena = append(arena, expandedPlaceholder(rawCells[i]))
+			// appended. Once the table-wide budget is spent, later colspans
+			// render as one column each. The range copies each cell, so writing
+			// into arena cannot disturb the cells still to be read.
+			for _, cell := range rowBuf {
+				arena = append(arena, cell)
+				for k := 1; k < cell.Colspan && expanded < maxExpandedCells; k++ {
+					arena = append(arena, expandedPlaceholder(cell))
 					expanded++
 				}
 			}
@@ -174,9 +180,8 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 }
 
 // expandedPlaceholder builds the placeholder cell that colspan expansion
-// appends after its originating cell, mirroring the CellData shape
-// expandColspanCells produced: one column wide, same alignment/header/rowspan
-// as the origin, empty width, marked IsExpanded.
+// appends after its originating cell: one column wide, same
+// alignment/header/rowspan as the origin, empty width, marked IsExpanded.
 func expandedPlaceholder(origin CellData) CellData {
 	return CellData{
 		Text:            " ",
@@ -190,43 +195,38 @@ func expandedPlaceholder(origin CellData) CellData {
 	}
 }
 
-// extractRowCells extracts all cell data from a single table row (tr element).
-// It appends into the caller-provided scratch buffer (reset to [:0] first) and
-// returns a slice that shares that backing array. Because the next row reuses
-// the same scratch, a caller that retains the returned slice across rows must
-// copy it first; extractTableData immediately copies each row into its arena,
-// so scratch is free to reuse.
-func (p *Processor) extractRowCells(rowNode *html.Node, scratch *[]CellData) []CellData {
-	cells := (*scratch)[:0]
-
+// appendRowCells appends the cell data of a single table row (tr element) to
+// dst and returns the extended slice. Passing a truncated buffer
+// (rowBuf[:0]) reuses its capacity across rows, so a table of N rows performs
+// O(1) allocations rather than one per row.
+//
+// The returned slice belongs to the caller and is the only handle to those
+// cells — there is no shared scratch that a later row could overwrite while
+// the caller is still reading. The previous signature took a *[]CellData and
+// returned a slice aliasing that shared buffer, which required the caller to
+// know it had to finish reading before the next row was extracted.
+func (p *Processor) appendRowCells(dst []CellData, rowNode *html.Node) []CellData {
 	for child := rowNode.FirstChild; child != nil; child = child.NextSibling {
 		if child.Type != html.ElementNode || (child.Data != "td" && child.Data != "th") {
 			continue
 		}
 
-		cellText := sanitizeCellText(p.cellAccessor.GetTextContent(child))
-
 		colspan := p.cellAccessor.GetColSpan(child)
 		if colspan < 1 {
 			colspan = 1
 		}
-		rowspan := p.cellAccessor.GetRowSpan(child)
 
-		cells = append(cells, CellData{
-			Text:            cellText,
+		dst = append(dst, CellData{
+			Text:            sanitizeCellText(p.cellAccessor.GetTextContent(child)),
 			Align:           p.cellAccessor.GetAlignment(child),
 			Colspan:         colspan,
-			Rowspan:         rowspan,
+			Rowspan:         p.cellAccessor.GetRowSpan(child),
 			IsHeader:        child.Data == "th",
 			Width:           p.cellAccessor.GetWidth(child),
 			OriginalColspan: colspan,
 		})
 	}
-
-	// Propagate any capacity growth back to the scratch holder so later rows
-	// benefit from it rather than re-growing from the original cap.
-	*scratch = cells
-	return cells
+	return dst
 }
 
 // sanitizeCellText cleans and normalizes cell text content.

@@ -65,13 +65,6 @@ const (
 	// excessive memory allocation on HTML with many media URLs.
 	maxRegexMatches = 1000
 
-	// maxCacheKeySize limits the content size used for cache key generation.
-	// For content larger than 64KB, multi-point sampling is used instead.
-	maxCacheKeySize = 64 * 1024
-
-	// cacheKeySample is the sample size for cache key generation on large content.
-	cacheKeySample = 4096
-
 	// Buffer size estimates for pre-allocation
 	initialSliceCap   = 16 // Initial capacity for result slices
 	initialMapCap     = 8  // Initial capacity for result maps
@@ -353,6 +346,13 @@ type ImageInfo struct {
 }
 
 // LinkInfo holds information about an extracted link.
+//
+// A fragment-only ("#top") or query-only ("?page=2") href is page-internal
+// navigation rather than a link to a document, so it produces no LinkInfo.
+// Links with a scheme the validator rejects (javascript:, vbscript:, file:,
+// unsafe data: URLs) are excluded for the same reason, and their position
+// number is still consumed so the [LINK:n] placeholders stay aligned with
+// Result.Text.
 type LinkInfo struct {
 	// URL is the link destination (the href attribute).
 	URL string `json:"url"`
@@ -375,7 +375,12 @@ type LinkInfo struct {
 type VideoInfo struct {
 	// URL is the video source URL.
 	URL string `json:"url"`
-	// Type is the detected video type (the file container, or "embed" for iframe embeds).
+	// Type is the video's container: the MIME type derived from the URL's
+	// extension ("video/mp4", "video/webm", …), an explicit <source type> or
+	// <embed type> value when the markup declares one (which wins, since a
+	// server may serve a different container than the extension suggests), or
+	// "embed" for iframe/embed-host videos. Empty when the URL has no
+	// recognizable media extension and the markup declares no type.
 	Type string `json:"type"`
 	// Poster is the poster-frame URL for <video> elements.
 	Poster string `json:"poster"`
@@ -391,13 +396,22 @@ type VideoInfo struct {
 type AudioInfo struct {
 	// URL is the audio source URL.
 	URL string `json:"url"`
-	// Type is the detected audio type (the file container).
+	// Type is the audio's container: the MIME type derived from the URL's
+	// extension ("audio/mpeg", "audio/ogg", …) or an explicit <source type>
+	// value when the markup declares one. Empty when the extension is not a
+	// recognized audio extension and no type is declared.
 	Type string `json:"type"`
 	// Duration is the duration attribute, as an unparsed string.
 	Duration string `json:"duration"`
 }
 
 // LinkResource represents a link resource extracted from HTML.
+//
+// Only resolvable references are reported. A fragment-only ("#top") or
+// query-only ("?page=2") href is page-internal navigation, not a resource
+// reference, so it produces no LinkResource — parsing it as a path would
+// silently resolve it against the document base and invent a URL that was
+// never in the markup. The same rule applies to Result.Links.
 type LinkResource struct {
 	// URL is the resource URL, resolved against BaseURL when ResolveRelativeURLs is enabled.
 	URL string

@@ -1315,7 +1315,12 @@ func TestScoreArticleCandidatesMatchesNaiveLoop(t *testing.T) {
 		{"plain article", `<html><body><article><h1>Title</h1><p>alpha, beta, gamma.</p><p>second paragraph here.</p></article></body></html>`},
 		{"link dense nav", `<html><body><nav><a href="/a">A</a><a href="/b">B</a><a href="/c">C</a></nav><article><p>real content, here.</p></article></body></html>`},
 		{"candidate inside anchor", `<html><body><a href="/x"><div><p>block inside a link</p><p>more text</p></div></a></body></html>`},
-		{"nbsp text", "<html><body><p>non breaking space</p></body></html>"},
+		{"nbsp text", "<html><body><p>non\u00a0breaking\u00a0space</p></body></html>"},
+		// A literal ASCII "00a0" in visible text (e.g. a hex colour) must not be
+		// treated as an NBSP: foldAndScore once shipped strings.Contains(data,
+		// "00a0"), which rewrote it and made the folded metrics disagree with
+		// collectContentMetrics for any document containing that substring.
+		{"literal 00a0 text", `<html><body><div class="wrap">` + strings.Repeat("00a0 ", 12) + `</div></body></html>`},
 		{"skip tag subtrees with candidates", `<html><head><title>t</title></head><body><script>x</script><style>x</style><nav>n</nav><svg><text>s</text></svg><math><mi>m</mi></math><aside>a</aside><footer>f</footer><article><p>real, comma, content.</p></article></body></html>`},
 		{"comma rich prose", `<html><body><article><p>one, two, three, four, five, six.</p><p>` + "，" + `fullwidth` + "，" + `test。</p></article></body></html>`},
 		{"nested deep", `<html><body><div><div><div><section><p>deep, text.</p></section></div></div></div></body></html>`},
@@ -1450,5 +1455,63 @@ func BenchmarkArticleScoring_Fast(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		_ = ds.ScoreArticleCandidates(doc)
+	}
+}
+
+// TestFindBestArticleNode pins the production article-selection path. The root
+// package calls DefaultScorer.FindBestArticleNode (extract.go extractArticleNode)
+// through the internal.Scorer interface, so cross-package coverage never reaches
+// it from the internal package's own tests. It must agree with
+// ScoreArticleCandidates on the winner, return nil when nothing scores above 0,
+// and resolve exact ties first-wins (the map path resolves ties by map-iteration
+// order, so the two legitimately disagree only on ties).
+func TestFindBestArticleNode(t *testing.T) {
+	ds := SharedDefaultScorer()
+
+	cases := []struct {
+		name    string
+		markup  string
+		wantNil bool
+	}{
+		{"plain article picks article", `<html><body><article><h1>T</h1><p>alpha, beta, gamma.</p><p>second paragraph.</p></article></body></html>`, false},
+		{"link dense nav skipped", `<html><body><nav><a href="/a">A</a><a href="/b">B</a></nav><article><p>real content, here.</p></article></body></html>`, false},
+		{"empty body scores nothing", `<html><body></body></html>`, true},
+		{"comment only scores nothing", `<html><body><!-- no elements --></body></html>`, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := parseMetricsDoc(t, tc.markup)
+			best := ds.FindBestArticleNode(doc)
+			if tc.wantNil {
+				if best != nil {
+					t.Fatalf("FindBestArticleNode = <%s>, want nil", best.Data)
+				}
+				return
+			}
+			if best == nil {
+				t.Fatal("FindBestArticleNode = nil, want a non-nil article node")
+			}
+
+			// Agree with the map path on the winner, and on the winner's score.
+			cands := ds.ScoreArticleCandidates(doc)
+			maxScore := 0
+			var winners []*html.Node
+			for n, sc := range cands {
+				if sc > maxScore {
+					maxScore = sc
+					winners = winners[:0]
+					winners = append(winners, n)
+				} else if sc == maxScore {
+					winners = append(winners, n)
+				}
+			}
+			if len(winners) == 1 && best != winners[0] {
+				t.Errorf("FindBestArticleNode = <%s>, ScoreArticleCandidates winner = <%s>", best.Data, winners[0].Data)
+			}
+			if got := cands[best]; got != maxScore {
+				t.Errorf("FindBestArticleNode picked <%s> with score %d, want the max score %d", best.Data, got, maxScore)
+			}
+		})
 	}
 }

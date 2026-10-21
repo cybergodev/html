@@ -14,12 +14,19 @@ import (
 // DetectVideoType is called once per url: a non-empty result is exactly
 // IsVideoURL's condition (extension or embed-host match), so classifying and
 // re-checking would re-lowercase and re-scan the same URL twice.
+//
+// URLs reach this function as slices of the raw document string, which on the
+// zero-copy decode path is a view of the caller's input []byte (see
+// internal.DetectAndConvertToUTF8String), so the retained value is cloned. This
+// is the only raw-HTML funnel that reaches Result.Videos without passing
+// through a ScanMediaURLs callback, so the clone has to happen here.
 func appendUniqueVideoURLs(urls []string, seen map[string]bool, videos []VideoInfo) []VideoInfo {
 	for _, url := range urls {
 		if !internal.IsValidURL(url) || seen[url] {
 			continue
 		}
 		if mediaType := internal.DetectVideoType(url); mediaType != "" {
+			url = strings.Clone(url)
 			seen[url] = true
 			videos = append(videos, VideoInfo{
 				URL:  url,
@@ -30,15 +37,141 @@ func appendUniqueVideoURLs(urls []string, seen map[string]bool, videos []VideoIn
 	return videos
 }
 
-// extractVideos extracts video sources by delegating to extractAllMedia and
-// discarding the audio result. This avoids maintaining a separate implementation
-// alongside the unified extractAllMedia path — the three previously differed
-// only in which media types they walked, not in how they walked them.
-func (p *Processor) extractVideos(node *stdxhtml.Node, htmlContent string, canContainMedia bool) []VideoInfo {
-	videos, _ := p.extractAllMedia(node, htmlContent, canContainMedia)
-	return videos
+// extractMedia extracts video and audio sources in a single pass. wantVideos
+// and wantAudios gate both the DOM walk branches and the raw-HTML scans, so a
+// caller that preserves only one media kind never pays for the other: the
+// earlier shape always ran the full combined extraction and threw half of it
+// away, including a whole extra ScanMediaURLs pass over the document.
+//
+// Both returned slices are non-nil: an empty but present result is what
+// callers marshal (JSON "videos": [] rather than null) and what the tests
+// assert on.
+func (p *Processor) extractMedia(node *stdxhtml.Node, htmlContent string, canContainMedia, wantVideos, wantAudios bool) (videos []VideoInfo, audios []AudioInfo) {
+	var videoSeen, audioSeen map[string]bool
+
+	// ensure lazily allocates the per-kind slice and dedup set, so a media kind
+	// that yields nothing allocates nothing.
+	ensureVideo := func() {
+		if videoSeen == nil {
+			videoSeen = make(map[string]bool, initialMapCap)
+		}
+		if videos == nil {
+			videos = make([]VideoInfo, 0, initialSliceCap)
+		}
+	}
+	ensureAudio := func() {
+		if audioSeen == nil {
+			audioSeen = make(map[string]bool, initialMapCap)
+		}
+		if audios == nil {
+			audios = make([]AudioInfo, 0, initialSliceCap)
+		}
+	}
+	// addVideo/addAudio are the single funnel for every media result, so the
+	// dedup bookkeeping lives here. They deliberately do NOT clone the URL:
+	// parseVideoNode and friends return values the HTML parser owns (the
+	// tokenizer copies attribute values out of its buffer), and the two raw-HTML
+	// paths that DO hand over slices of the decoded document —
+	// appendUniqueVideoURLs and the ScanMediaURLs callbacks below — clone before
+	// they get here. Cloning unconditionally would add an allocation per DOM
+	// media element, which is the common case.
+	addVideo := func(v VideoInfo) {
+		if v.URL == "" || videoSeen[v.URL] {
+			return
+		}
+		ensureVideo()
+		videoSeen[v.URL] = true
+		videos = append(videos, v)
+	}
+	addAudio := func(a AudioInfo) {
+		if a.URL == "" || audioSeen[a.URL] {
+			return
+		}
+		ensureAudio()
+		audioSeen[a.URL] = true
+		audios = append(audios, a)
+	}
+
+	// Raw-HTML extraction for iframe/embed/object happens first because
+	// sanitization removes those elements from the DOM: parsing the raw markup
+	// is the only way to see them.
+	if canContainMedia && wantVideos {
+		ensureVideo()
+		videos = appendUniqueVideoURLs(
+			p.extractTagAttributes(htmlContent, "iframe", "src"), videoSeen, videos)
+		videos = appendUniqueVideoURLs(
+			p.extractTagAttributes(htmlContent, "embed", "src", "data"), videoSeen, videos)
+		videos = appendUniqueVideoURLs(
+			p.extractTagAttributes(htmlContent, "object", "data"), videoSeen, videos)
+	}
+
+	// One DOM walk serves both kinds.
+	internal.WalkNodes(node, func(n *stdxhtml.Node) bool {
+		if n.Type != stdxhtml.ElementNode {
+			return true
+		}
+		switch n.Data {
+		case "video":
+			if wantVideos {
+				addVideo(p.parseVideoNode(n))
+			}
+		case "iframe":
+			if wantVideos {
+				addVideo(p.parseIframeNode(n))
+			}
+		case "embed", "object":
+			if wantVideos {
+				addVideo(p.parseEmbedNode(n))
+			}
+		case "audio":
+			if wantAudios {
+				addAudio(p.parseAudioNode(n))
+			}
+		}
+		return true
+	})
+
+	// Regex-equivalent scans for media URLs in the raw HTML, which reach
+	// content that never becomes a media element (JSON payloads, comments).
+	// ScanMediaURLs hands back substrings of htmlContent, so the retained URL is
+	// cloned (see appendUniqueVideoURLs for why that matters).
+	if canContainMedia {
+		if wantVideos {
+			ensureVideo()
+			internal.ScanMediaURLs(htmlContent, true, maxRegexMatches, func(url string) bool {
+				if internal.IsValidURL(url) {
+					addVideo(VideoInfo{URL: strings.Clone(url), Type: internal.DetectVideoType(url)})
+				}
+				return true
+			})
+		}
+		if wantAudios {
+			ensureAudio()
+			internal.ScanMediaURLs(htmlContent, false, maxRegexMatches, func(url string) bool {
+				if internal.IsValidURL(url) {
+					addAudio(AudioInfo{URL: strings.Clone(url), Type: internal.DetectAudioType(url)})
+				}
+				return true
+			})
+		}
+	}
+
+	// Normalize only the kinds the caller asked for. A kind that was not
+	// requested stays nil so it is omitted from the JSON result, matching what
+	// the previous split extractors produced by assigning only their own field.
+	if wantVideos && videos == nil {
+		videos = make([]VideoInfo, 0)
+	}
+	if wantAudios && audios == nil {
+		audios = make([]AudioInfo, 0)
+	}
+	return videos, audios
 }
 
+// parseVideoNode reads a <video> element. The URL comes from src, or from the
+// first <source> child when the element declares none, and Type prefers an
+// explicit <source type> (a server may serve a different container than the
+// extension suggests) before falling back to the extension-derived MIME type.
 func (p *Processor) parseVideoNode(n *stdxhtml.Node) VideoInfo {
 	video := VideoInfo{}
 	for _, attr := range n.Attr {
@@ -67,9 +200,22 @@ func (p *Processor) parseVideoNode(n *stdxhtml.Node) VideoInfo {
 		return VideoInfo{}
 	}
 
+	// Fill Type from the URL when no <source type> declared one. Without this
+	// the field was populated only for <source>-based videos and iframes,
+	// leaving the common "<video src=…>" shape (and every video found by the
+	// raw-HTML scan) with an empty Type — so a caller could not tell an mp4
+	// source from a webm one. DetectVideoType returns the container MIME type
+	// ("video/mp4", "video/webm", …) or "" for an unrecognized URL, which is
+	// left empty rather than guessed.
+	if video.Type == "" {
+		video.Type = internal.DetectVideoType(video.URL)
+	}
+
 	return video
 }
 
+// parseIframeNode reads an <iframe>, reporting Type "embed" because the frame
+// itself is not a media container.
 func (p *Processor) parseIframeNode(n *stdxhtml.Node) VideoInfo {
 	var video VideoInfo
 	foundSrc := false
@@ -93,6 +239,8 @@ func (p *Processor) parseIframeNode(n *stdxhtml.Node) VideoInfo {
 	return video
 }
 
+// parseEmbedNode reads an <embed> or <object>, whose source may live in src or
+// data.
 func (p *Processor) parseEmbedNode(n *stdxhtml.Node) VideoInfo {
 	var video VideoInfo
 	foundMedia := false
@@ -114,123 +262,12 @@ func (p *Processor) parseEmbedNode(n *stdxhtml.Node) VideoInfo {
 	if !foundMedia {
 		return VideoInfo{}
 	}
+	// Mirror parseVideoNode: an <embed>/<object> without a type attribute still
+	// reports its container MIME type rather than an empty one.
+	if video.Type == "" {
+		video.Type = internal.DetectVideoType(video.URL)
+	}
 	return video
-}
-
-// extractAudios extracts audio sources by delegating to extractAllMedia and
-// discarding the video result. See extractVideos for the rationale.
-func (p *Processor) extractAudios(node *stdxhtml.Node, htmlContent string, canContainMedia bool) []AudioInfo {
-	_, audios := p.extractAllMedia(node, htmlContent, canContainMedia)
-	return audios
-}
-
-// extractAllMedia extracts both videos and audios in a single DOM walk. When both
-// PreserveVideos and PreserveAudios are enabled (the default), this replaces the
-// two separate WalkNodes calls that extractVideos and extractAudios would each
-// make, saving one full tree traversal per Extract call.
-func (p *Processor) extractAllMedia(node *stdxhtml.Node, htmlContent string, canContainMedia bool) (videos []VideoInfo, audios []AudioInfo) {
-	var videoSeen, audioSeen map[string]bool
-
-	ensureVideoDedup := func() {
-		if videoSeen == nil {
-			videoSeen = make(map[string]bool, initialMapCap)
-		}
-		if videos == nil {
-			videos = make([]VideoInfo, 0, initialSliceCap)
-		}
-	}
-	ensureAudioDedup := func() {
-		if audioSeen == nil {
-			audioSeen = make(map[string]bool, initialMapCap)
-		}
-		if audios == nil {
-			audios = make([]AudioInfo, 0, initialSliceCap)
-		}
-	}
-
-	// Raw HTML extraction for iframe/embed/object (only when canContainMedia).
-	// These may be removed by sanitization, so parse from raw HTML first.
-	if canContainMedia {
-		ensureVideoDedup()
-		videos = appendUniqueVideoURLs(
-			p.extractTagAttributes(htmlContent, "iframe", "src"), videoSeen, videos)
-		videos = appendUniqueVideoURLs(
-			p.extractTagAttributes(htmlContent, "embed", "src", "data"), videoSeen, videos)
-		videos = appendUniqueVideoURLs(
-			p.extractTagAttributes(htmlContent, "object", "data"), videoSeen, videos)
-	}
-
-	// Single DOM walk for video, iframe, embed, object, AND audio elements.
-	internal.WalkNodes(node, func(n *stdxhtml.Node) bool {
-		if n.Type != stdxhtml.ElementNode {
-			return true
-		}
-		switch n.Data {
-		case "video":
-			if video := p.parseVideoNode(n); video.URL != "" && !videoSeen[video.URL] {
-				ensureVideoDedup()
-				videoSeen[video.URL] = true
-				videos = append(videos, video)
-			}
-		case "iframe":
-			if video := p.parseIframeNode(n); video.URL != "" && !videoSeen[video.URL] {
-				ensureVideoDedup()
-				videoSeen[video.URL] = true
-				videos = append(videos, video)
-			}
-		case "embed", "object":
-			if video := p.parseEmbedNode(n); video.URL != "" && !videoSeen[video.URL] {
-				ensureVideoDedup()
-				videoSeen[video.URL] = true
-				videos = append(videos, video)
-			}
-		case "audio":
-			if audio := p.parseAudioNode(n); audio.URL != "" && !audioSeen[audio.URL] {
-				ensureAudioDedup()
-				audioSeen[audio.URL] = true
-				audios = append(audios, audio)
-			}
-		}
-		return true
-	})
-
-	// Regex-equivalent scans for video and audio URLs in raw HTML (only when
-	// canContainMedia). internal.ScanMediaURLs reproduces the matches of the two
-	// media-URL regexes this path previously compiled, at a fraction of the CPU
-	// (the regexp engine stepped over every document byte; see its doc comment).
-	if canContainMedia {
-		ensureVideoDedup()
-		internal.ScanMediaURLs(htmlContent, true, maxRegexMatches, func(url string) bool {
-			if internal.IsValidURL(url) && !videoSeen[url] {
-				videoSeen[url] = true
-				videos = append(videos, VideoInfo{
-					URL:  url,
-					Type: internal.DetectVideoType(url),
-				})
-			}
-			return true
-		})
-		ensureAudioDedup()
-		internal.ScanMediaURLs(htmlContent, false, maxRegexMatches, func(url string) bool {
-			if internal.IsValidURL(url) && !audioSeen[url] {
-				audioSeen[url] = true
-				audios = append(audios, AudioInfo{
-					URL:  url,
-					Type: internal.DetectAudioType(url),
-				})
-			}
-			return true
-		})
-	}
-
-	// Normalize to non-nil empty slices (see extractVideos/extractAudios rationale).
-	if videos == nil {
-		videos = make([]VideoInfo, 0)
-	}
-	if audios == nil {
-		audios = make([]AudioInfo, 0)
-	}
-	return videos, audios
 }
 
 func (p *Processor) parseAudioNode(n *stdxhtml.Node) AudioInfo {
@@ -248,11 +285,19 @@ func (p *Processor) parseAudioNode(n *stdxhtml.Node) AudioInfo {
 	}
 
 	if audio.URL == "" {
+		// A <source> child may declare its own type, which is authoritative.
 		audio.URL, audio.Type = p.findSourceURL(n)
 	}
 
 	if !internal.IsValidURL(audio.URL) {
 		return AudioInfo{}
+	}
+
+	// Fill Type from the URL when no <source type> declared one, matching
+	// parseVideoNode: "<audio src=…>" otherwise reported an empty Type while a
+	// <source>-based audio reported its container MIME type.
+	if audio.Type == "" {
+		audio.Type = internal.DetectAudioType(audio.URL)
 	}
 
 	return audio

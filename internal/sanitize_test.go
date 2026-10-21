@@ -735,6 +735,70 @@ func TestIsSafeURI(t *testing.T) {
 	}
 }
 
+// protocolRelativeC0Cases are the URIs that must be rejected as dangerous
+// protocol-relative references even when preceded by leading TARGET
+// "Remove any leading and trailing C0 control or space" bytes.
+//
+// Regression for D-002 C-5: the "//" test ran on the C0-stripped string but
+// the remainder was sliced from the unstripped one, so exactly two leading
+// control bytes consumed the "//" and left "javascript:…" — which matched no
+// "//javascript:" policy prefix and passed both gates.
+var protocolRelativeC0Cases = []struct {
+	name string
+	uri  string
+}{
+	{"no prefix", "//javascript:alert(1)"},
+	{"one C0 lead", "\x01//javascript:alert(1)"},
+	{"two C0 leads", "\x01\x02//javascript:alert(1)"},
+	{"three C0 leads", "\x01\x02\x03//javascript:alert(1)"},
+	{"space then two C0", " \x01\x02//javascript:alert(1)"},
+	{"two C0 then space", "\x01\x02 //javascript:alert(1)"},
+	{"vbscript two C0", "\x01\x02//vbscript:msgbox(1)"},
+	{"data two C0", "\x01\x02//data:text/html,x"},
+	{"file two C0", "\x01\x02//file:///etc/passwd"},
+	{"uppercase two C0", "\x01\x02//JavaScript:alert(1)"},
+	{"tab after slashes and two C0", "\x01\x02//\tjavascript:alert(1)"},
+}
+
+// TestProtocolRelativeC0Bypass drives both entry points: the DOM sanitizer
+// gate (isSafeURIWithAudit) and the non-sanitizing gate used by
+// ExtractAllLinks and the raw-HTML media scan (containsDangerousScheme).
+func TestProtocolRelativeC0Bypass(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range protocolRelativeC0Cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if isSafeURIWithAudit(tt.uri, NoOpAuditRecorder{}) {
+				t.Errorf("isSafeURIWithAudit(%q) = true, want false", tt.uri)
+			}
+			if !containsDangerousScheme(tt.uri) {
+				t.Errorf("containsDangerousScheme(%q) = false, want true", tt.uri)
+			}
+		})
+	}
+}
+
+// TestProtocolRelativeSafeStillAllowed keeps the fix from over-blocking:
+// ordinary protocol-relative and absolute URLs must still pass both gates.
+func TestProtocolRelativeSafeStillAllowed(t *testing.T) {
+	t.Parallel()
+
+	for _, uri := range []string{
+		"//example.com/a.png",
+		"\x01\x02//example.com/a.png",
+		"https://example.com/a.png",
+		"\x01https://example.com/a.png",
+	} {
+		if !isSafeURIWithAudit(uri, NoOpAuditRecorder{}) {
+			t.Errorf("isSafeURIWithAudit(%q) = false, want true", uri)
+		}
+		if containsDangerousScheme(uri) {
+			t.Errorf("containsDangerousScheme(%q) = true, want false", uri)
+		}
+	}
+}
+
 func TestIsValidDataURL(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -806,10 +870,9 @@ func TestFindBodyElement(t *testing.T) {
 
 	t.Run("document with direct body child returns body node", func(t *testing.T) {
 		t.Parallel()
-		// findBodyElement only walks the DocumentNode's *direct* children, so the
-		// success branch is only reachable when <body> is a top-level child. A full
-		// document parsed via html.Parse nests <body> under <html> (covered by the
-		// no-body case below), so construct this structure directly.
+		// findBodyElement descends the subtree (FindElementByTag), so both this
+		// hand-built direct-child shape and a parser-shaped document
+		// (Document -> html -> body) resolve. Both are covered below.
 		doc := &html.Node{Type: html.DocumentNode}
 		body := &html.Node{Type: html.ElementNode, Data: "body"}
 		doc.AppendChild(body)
@@ -843,6 +906,21 @@ func TestFindBodyElement(t *testing.T) {
 		doc.AppendChild(htmlNode)
 		if got := findBodyElement(doc); got != nil {
 			t.Errorf("findBodyElement on a body-less document returned %v, want nil", got)
+		}
+	})
+
+	t.Run("parser-shaped document finds the nested body", func(t *testing.T) {
+		t.Parallel()
+		// The shape html.Parse actually produces: <body> is a grandchild of the
+		// document node, below <html>. This is the case a direct-children scan
+		// missed for every real document.
+		doc := mustParseHTML(t, `<html><head><title>t</title></head><body><p>x</p></body></html>`)
+		got := findBodyElement(doc)
+		if got == nil {
+			t.Fatal("findBodyElement returned nil for a parser-shaped document")
+		}
+		if got.Parent == nil || got.Parent.Data != "html" {
+			t.Errorf("returned node's parent = %v, want the <html> element", got.Parent)
 		}
 	})
 }

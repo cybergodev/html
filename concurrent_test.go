@@ -460,7 +460,7 @@ func TestConcurrentPoolAccess(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	// Test byteBufPool
+	// Shared []byte scratch pool (backing GetTextContent and CleanTextBytes).
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
 		go func() {
@@ -474,16 +474,16 @@ func TestConcurrentPoolAccess(t *testing.T) {
 		}()
 	}
 
-	// Test BufferPool
+	// Shared traversal-stack pool (backing WalkNodes and SanitizeDOM), which
+	// every extraction walk borrows and returns.
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
-				buf := internal.GetBuffer()
-				buf.Write([]byte("test bytes"))
-				_ = buf.Bytes()
-				internal.PutBuffer(buf)
+				stack := internal.GetNodeSlice()
+				*stack = append(*stack, nil)
+				internal.PutNodeSlice(stack)
 			}
 		}()
 	}

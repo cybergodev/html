@@ -1,9 +1,12 @@
 package internal
 
-// entity_test.go — consolidated HTML entity tests and benchmarks.
-// Merges comprehensive_entity_test.go and entity_benchmark_test.go so all
-// entity-decoding coverage and the benchmarks that guard its performance live
-// in one file.
+// entity_test.go — entity handling coverage for the extraction path.
+//
+// These tests assert on the text the library actually produces: the HTML
+// tokenizer decodes character references once, and GetTextContent /
+// extractTextWithStructure normalize what remains (NBSP to a space, line
+// breaks to spaces). There is no separate entity-decoding pass to test: the
+// former ReplaceHTMLEntities chain had no production caller and was removed.
 
 import (
 	"fmt"
@@ -334,31 +337,6 @@ func TestExtractTextWithStructureHTMLEntities(t *testing.T) {
 	}
 }
 
-// BenchmarkHTMLEntityConversion benchmarks the HTML entity conversion performance.
-func BenchmarkHTMLEntityConversion(b *testing.B) {
-	testCases := []struct {
-		name string
-		html string
-	}{
-		{"simple_nbsp", "Hello&nbsp;World"},
-		{"multiple_entities", "&copy;&euro;&pound;&yen;&reg;&trade;"},
-		{"numeric_entities", "&#169;&#8364;&#163;&#165;&#174;&#8482;"},
-		{"mixed_complex", "A&nbsp;&copy;&nbsp;2025&nbsp;&mdash;&nbsp;Test&nbsp;&euro;100"},
-	}
-
-	for _, bc := range testCases {
-		b.Run(bc.name, func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				result := ReplaceHTMLEntities(bc.html)
-				if result == "" {
-					b.Fatal("ReplaceHTMLEntities returned empty string")
-				}
-			}
-		})
-	}
-}
-
 // ExampleGetTextContent demonstrates the GetTextContent function with HTML entities.
 func ExampleGetTextContent() {
 	html := `<p>&nbsp;&copy; 2025 &mdash; All rights reserved&nbsp;</p>`
@@ -366,89 +344,4 @@ func ExampleGetTextContent() {
 	result := GetTextContent(doc)
 	fmt.Println(result)
 	// Output:  © 2025 — All rights reserved
-}
-
-// ExampleReplaceHTMLEntities demonstrates the ReplaceHTMLEntities function.
-func ExampleReplaceHTMLEntities() {
-	input := "&nbsp;&copy; 2025 &mdash; Test &euro;100"
-	result := ReplaceHTMLEntities(input)
-	fmt.Println(result)
-	// Output:  © 2025 — Test €100
-}
-
-// Benchmarks for entity replacement performance
-
-var (
-	// Text with only common entities (fast path)
-	benchCommonEntities = "This is a test &nbsp; with &amp; common &lt; entities &gt; like &quot; quotes &apos; and &copy; copyright &reg; registered &mdash; dash &ndash; end."
-
-	// Text with mixed common and rare entities
-	benchMixedEntities = "Test &nbsp; text &amp; with &euro; euro &pound; pound &yen; yen &sect; section &para; paragraph &plusmn; plusminus &times; multiply &divide; divide &frac12; half &deg; degree &micro; micro &middot; dot &bull; bullet &dagger; dagger &permil; permille."
-
-	// Text with numeric entities
-	benchNumericEntities = "Text with &#65; &#x41; &#160; &#xa0; &#8212; &#x2014; &#169; &#xa9; numeric &#8364; &#x20ac; entities."
-
-	// Text with no entities (should be very fast)
-	benchNoEntities = "This is just plain text without any HTML entities at all in it. Should be very fast to process."
-
-	// Long text with common entities
-	benchLongCommon = repeatString("Test &nbsp; text &amp; with &lt; entities &gt; and ", 100)
-)
-
-func repeatString(s string, count int) string {
-	result := ""
-	for i := 0; i < count; i++ {
-		result += s
-	}
-	return result
-}
-
-func BenchmarkReplaceHTMLEntities_CommonEntities(b *testing.B) {
-	b.SetBytes(int64(len(benchCommonEntities)))
-	for b.Loop() {
-		ReplaceHTMLEntities(benchCommonEntities)
-	}
-}
-
-func BenchmarkReplaceHTMLEntities_MixedEntities(b *testing.B) {
-	b.SetBytes(int64(len(benchMixedEntities)))
-	for b.Loop() {
-		ReplaceHTMLEntities(benchMixedEntities)
-	}
-}
-
-func BenchmarkReplaceHTMLEntities_NumericEntities(b *testing.B) {
-	b.SetBytes(int64(len(benchNumericEntities)))
-	for b.Loop() {
-		ReplaceHTMLEntities(benchNumericEntities)
-	}
-}
-
-func BenchmarkReplaceHTMLEntities_NoEntities(b *testing.B) {
-	b.SetBytes(int64(len(benchNoEntities)))
-	for b.Loop() {
-		ReplaceHTMLEntities(benchNoEntities)
-	}
-}
-
-func BenchmarkReplaceHTMLEntities_LongText(b *testing.B) {
-	b.SetBytes(int64(len(benchLongCommon)))
-	for b.Loop() {
-		ReplaceHTMLEntities(benchLongCommon)
-	}
-}
-
-// Benchmark fastReplaceCommonEntities directly
-func BenchmarkFastReplaceCommonEntities(b *testing.B) {
-	b.SetBytes(int64(len(benchCommonEntities)))
-	for b.Loop() {
-		fastReplaceCommonEntities(benchCommonEntities)
-	}
-}
-
-func BenchmarkFastReplaceCommonEntities_LongText(b *testing.B) {
-	b.SetBytes(int64(len(benchLongCommon)))
-	for b.Loop() {
-		fastReplaceCommonEntities(benchLongCommon)
-	}
 }

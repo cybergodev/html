@@ -476,12 +476,14 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, cc *candi
 	if node.Type == html.TextNode {
 		// Mirrors collectContentMetrics' text-node handling verbatim so the two
 		// paths cannot diverge (guarded by TestScoreArticleCandidatesMatchesNaiveLoop).
-		// The NBSP literal is spelled with an explicit escape: a raw U+00A0 byte
-		// in source is visually indistinguishable from a plain space.
+		// The NBSP literal is spelled with the \u00a0 escape: a raw U+00A0 byte
+		// in source is visually indistinguishable from a plain space, and an
+		// earlier version of this block used the ASCII string "00a0" — which
+		// rewrote ordinary text such as "#00a0ff" and made the folded metrics
+		// disagree with collectContentMetrics on any document containing it.
 		data := node.Data
-		hasNBSP := strings.Contains(data, "00a0")
-		if hasNBSP {
-			data = strings.ReplaceAll(data, "00a0", " ")
+		if strings.Contains(data, "\u00a0") {
+			data = strings.ReplaceAll(data, "\u00a0", " ")
 		}
 		if text := strings.TrimSpace(data); text != "" {
 			textLen := len(text)
@@ -789,12 +791,6 @@ func (s *DefaultScorer) getTagScore(tag string) int {
 		return score
 	}
 	return 0
-}
-
-// ScoreAttributes calculates a score based on element attributes.
-// This is the public version for external use.
-func (s *DefaultScorer) ScoreAttributes(n *html.Node) int {
-	return s.scoreAttributes(n)
 }
 
 // scoreAttributes calculates a score based on element attributes.

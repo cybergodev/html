@@ -65,7 +65,17 @@ type InputError struct {
 }
 
 // Error returns a formatted error message.
+//
+// A nil *InputError yields a fixed message instead of panicking. Callers reach
+// these methods through the `error` interface, and a typed-nil pointer stored
+// in a non-nil interface (`var e *InputError; var err error = e`) passes the
+// `err != nil` test and then crashes any code that formats it — including
+// `log.Printf("%v", err)` and errors.Is. Public API must not panic (SEC-003),
+// so each error type here is nil-safe.
 func (e *InputError) Error() string {
+	if e == nil {
+		return "html: input error"
+	}
 	if e.InputErr != nil {
 		return fmt.Sprintf("html: %s failed: %v (size=%d, max=%d)", e.Op, e.InputErr, e.Size, e.MaxSize)
 	}
@@ -76,9 +86,10 @@ func (e *InputError) Error() string {
 // When an underlying InputErr is present it is returned alongside
 // ErrInputTooLarge, so errors.Is(err, ErrInputTooLarge) holds for every
 // *InputError — including ones carrying a read failure — matching the
-// type's documented contract.
+// type's documented contract. A nil receiver still unwraps to
+// ErrInputTooLarge so the typed-nil case never panics.
 func (e *InputError) Unwrap() []error {
-	if e.InputErr == nil {
+	if e == nil || e.InputErr == nil {
 		return []error{ErrInputTooLarge}
 	}
 	return []error{e.InputErr, ErrInputTooLarge}
@@ -103,7 +114,13 @@ type ConfigError struct {
 }
 
 // Error returns a formatted error message.
+//
+// A nil *ConfigError yields a fixed message instead of panicking (see
+// InputError.Error for why the typed-nil case reaches public API).
 func (e *ConfigError) Error() string {
+	if e == nil {
+		return "html: invalid config"
+	}
 	return fmt.Sprintf("html: invalid config: %s=%v, %s", e.Field, e.Value, e.Message)
 }
 
@@ -133,7 +150,13 @@ type FileError struct {
 // SECURITY: Path information is truncated to prevent information disclosure
 // in production environments. Use SafePath() for the full path when needed
 // for internal logging or audit purposes.
+//
+// A nil *FileError yields a fixed message instead of panicking (see
+// InputError.Error for why the typed-nil case reaches public API).
 func (e *FileError) Error() string {
+	if e == nil {
+		return "html: file error"
+	}
 	// SECURITY: Truncate path in error message to prevent information disclosure
 	// Only show the base filename, not the full path
 	safePath := e.SafePath()
@@ -149,6 +172,9 @@ func (e *FileError) Error() string {
 // For production use, this truncates the path to just the filename.
 // The full path is still available via the Path field for internal use.
 func (e *FileError) SafePath() string {
+	if e == nil {
+		return ""
+	}
 	return safeBaseName(e.Path)
 }
 
@@ -172,7 +198,7 @@ func safeBaseName(path string) string {
 // sanitizeErrorMessage removes potentially sensitive path information from
 // the underlying error message while preserving error type information.
 func (e *FileError) sanitizeErrorMessage() error {
-	if e.FileErr == nil {
+	if e == nil || e.FileErr == nil {
 		return nil
 	}
 	errStr := e.FileErr.Error()
@@ -217,7 +243,11 @@ func (e *FileError) sanitizeErrorMessage() error {
 }
 
 // Unwrap returns the appropriate sentinel error for errors.Is() support.
+// A nil receiver unwraps to ErrInvalidFilePath rather than panicking.
 func (e *FileError) Unwrap() error {
+	if e == nil {
+		return ErrInvalidFilePath
+	}
 	if errors.Is(e.FileErr, ErrFileNotFound) {
 		return ErrFileNotFound
 	}
@@ -230,7 +260,13 @@ func (e *FileError) Unwrap() error {
 // MarshalJSON implements custom JSON marshaling for FileError.
 // The Path field is sanitized via SafePath() to prevent filesystem path
 // disclosure when errors are serialized to JSON for API responses.
+//
+// A nil receiver marshals to null rather than panicking, matching
+// encoding/json's handling of nil pointers.
 func (e *FileError) MarshalJSON() ([]byte, error) {
+	if e == nil {
+		return []byte("null"), nil
+	}
 	msg := ""
 	if sanitized := e.sanitizeErrorMessage(); sanitized != nil {
 		msg = sanitized.Error()
