@@ -20,6 +20,7 @@
 | 🔍 **Smart Article Detection** | Identifies main content using scoring algorithms |
 | 📋 **Metadata Extraction** | author, published time, description, site name, canonical URL |
 | 🎚️ **Extraction Confidence** | Per-document quality signal (article / listing / fallback / paywall detection) |
+| 📖 **Reader Mode** | Full-page structured reading view — header / navigation / main / aside / footer kept as labeled sections with inline links, for feeding clean pages to LLMs |
 | 🌐 **Auto Encoding Detection** | Handles UTF-8, Windows-1252, GBK, Shift_JIS, etc. |
 | 🔄 **Batch Processing** | Parallel extraction with Worker Pool and Context support |
 | 📦 **Multiple Output Formats** | Text, Markdown, JSON |
@@ -32,6 +33,7 @@
 ## 🌐 Use Cases
 
 - **News Aggregators**: Extract article content from news websites
+- **LLM Pipelines**: Feed clean, structure-labeled pages (navigation, main content, footer separated) to language models
 - **Web Crawlers**: Fetch structured data from HTML pages
 - **Content Management**: Convert HTML to Markdown or other formats
 - **Search Engines**: Index main content, excluding navigation and ads
@@ -153,6 +155,7 @@ func main() {
 
     // Extract with default configuration
     result, _ := processor.Extract(htmlBytes)
+    fmt.Printf("Title: %s\n", result.Title)
 
     // Extract from file
     result, _ = processor.ExtractFromFile("page.html")
@@ -250,6 +253,39 @@ func main() {
 ```go
 text, _ := html.ExtractText(htmlBytes)
 // Returns clean text without navigation/ads
+```
+
+### Reader Mode (Clean Page for LLMs)
+
+Reader mode keeps the whole page as labeled sections instead of selecting one
+article — HTML/CSS/JS markup is removed, hyperlinks stay inline
+(`[text](URL)` by default, or `<a href="...">text</a>` via `InlineLinkFormat`;
+links are always preserved — `"none"` applies to the Extract family only), and
+each region is tagged header / navigation / main / aside / footer. Ads, hidden
+duplicates, and visibly repeated menus are dropped automatically:
+
+```go
+// One call, one prompt-ready Markdown document (with links):
+markdown, _ := html.ReadPageToMarkdown(htmlBytes)
+
+// Same document without links (structure kept, labels as plain words):
+plainText, _ := html.ReadPageToMarkdownText(htmlBytes)
+
+// Or structured — drop the chrome and feed only the main content:
+page, _ := html.ReadPage(htmlBytes)
+for _, sec := range page.Sections {
+    if sec.Kind == html.SectionMain {
+        prompt := sec.Text // main content only
+        _ = prompt
+    }
+}
+// page.Render() flattens with links; page.RenderText() without.
+
+// HTML-anchor link style + absolute URLs:
+cfg := html.DefaultConfig()
+cfg.InlineLinkFormat = "html"
+cfg.BaseURL = "https://example.com/docs/"
+page, _ = html.ReadPage(htmlBytes, cfg)
 ```
 
 ### Extract from File
@@ -401,6 +437,20 @@ html.ExtractWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (*
 html.ExtractFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (*Result, error)
 html.ExtractTextWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error)
 html.ExtractTextFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error)
+
+// Reader mode (full-page structured reading view for LLMs)
+html.ReadPage(htmlBytes []byte, cfg ...Config) (*ReadResult, error)
+html.ReadPageFromFile(filePath string, cfg ...Config) (*ReadResult, error)
+html.ReadPageWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (*ReadResult, error)
+html.ReadPageFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (*ReadResult, error)
+html.ReadPageToMarkdown(htmlBytes []byte, cfg ...Config) (string, error)          // with links
+html.ReadPageToMarkdownText(htmlBytes []byte, cfg ...Config) (string, error)      // without links
+html.ReadPageFromFileToMarkdown(filePath string, cfg ...Config) (string, error)   // with links
+html.ReadPageFromFileToMarkdownText(filePath string, cfg ...Config) (string, error) // without links
+html.ReadPageToMarkdownWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error)
+html.ReadPageToMarkdownTextWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error)
+html.ReadPageFromFileToMarkdownWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error)
+html.ReadPageFromFileToMarkdownTextWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error)
 ```
 
 ### Processor Methods
@@ -442,6 +492,20 @@ processor.ExtractAllLinksFromFile(filePath string) ([]LinkResource, error)
 processor.ExtractAllLinksWithContext(ctx context.Context, htmlBytes []byte) ([]LinkResource, error)
 processor.ExtractAllLinksFromFileWithContext(ctx context.Context, filePath string) ([]LinkResource, error)
 
+// Reader mode (full-page structured reading view for LLMs)
+processor.ReadPage(htmlBytes []byte) (*ReadResult, error)
+processor.ReadPageFromFile(filePath string) (*ReadResult, error)
+processor.ReadPageWithContext(ctx context.Context, htmlBytes []byte) (*ReadResult, error)
+processor.ReadPageFromFileWithContext(ctx context.Context, filePath string) (*ReadResult, error)
+processor.ReadPageToMarkdown(htmlBytes []byte) (string, error)            // with links
+processor.ReadPageToMarkdownText(htmlBytes []byte) (string, error)        // without links
+processor.ReadPageFromFileToMarkdown(filePath string) (string, error)     // with links
+processor.ReadPageFromFileToMarkdownText(filePath string) (string, error) // without links
+processor.ReadPageToMarkdownWithContext(ctx context.Context, htmlBytes []byte) (string, error)
+processor.ReadPageToMarkdownTextWithContext(ctx context.Context, htmlBytes []byte) (string, error)
+processor.ReadPageFromFileToMarkdownWithContext(ctx context.Context, filePath string) (string, error)
+processor.ReadPageFromFileToMarkdownTextWithContext(ctx context.Context, filePath string) (string, error)
+
 // Batch processing
 processor.ExtractBatch(htmlContents [][]byte) *BatchResult
 processor.ExtractBatchWithContext(ctx context.Context, htmlContents [][]byte) *BatchResult
@@ -473,16 +537,24 @@ html.HighSecurityAuditConfig() AuditConfig // Security-optimized audit configura
 
 ```go
 type Result struct {
-    Text           string        `json:"text"`
-    Title          string        `json:"title"`
-    Images         []ImageInfo   `json:"images,omitempty"`
-    Links          []LinkInfo    `json:"links,omitempty"`
-    Videos         []VideoInfo   `json:"videos,omitempty"`
-    Audios         []AudioInfo   `json:"audios,omitempty"`
-    ProcessingTime time.Duration `json:"-"` // Serialized as "processing_time_ms" via MarshalJSON
-    WordCount      int           `json:"word_count"`
-    ReadingTime    time.Duration `json:"-"` // Serialized as "reading_time_ms" via MarshalJSON
+    Text             string        `json:"text"`
+    Title            string        `json:"title"`
+    Images           []ImageInfo   `json:"images,omitempty"`
+    Links            []LinkInfo    `json:"links,omitempty"`
+    Videos           []VideoInfo   `json:"videos,omitempty"`
+    Audios           []AudioInfo   `json:"audios,omitempty"`
+    ProcessingTime   time.Duration `json:"-"` // Serialized as "processing_time_ms" via MarshalJSON
+    WordCount        int           `json:"word_count"`
+    ReadingTime      time.Duration `json:"-"` // Serialized as "reading_time_ms" via MarshalJSON
+    Author           string        `json:"author,omitempty"`         // JSON-LD author or <meta name="author">
+    PublishedTime    time.Time     `json:"published_time,omitzero"`  // zero = unknown
+    Description      string        `json:"description,omitempty"`
+    SiteName         string        `json:"site_name,omitempty"`
+    CanonicalURL     string        `json:"canonical_url,omitempty"`
+    Confidence       float64       `json:"confidence"`               // quality signal in [0, 1]
+    ExtractionMethod string        `json:"extraction_method,omitempty"` // "article" | "listing" | "body"
 }
+// Metadata fields require ExtractMetadata (default: true) — see examples/12_metadata_quality/.
 
 type ImageInfo struct {
     URL          string `json:"url"`
@@ -529,6 +601,27 @@ type NodeAttr struct {
     Value string
 }
 
+type ReadResult struct {
+    Title         string        `json:"title"`
+    Author        string        `json:"author,omitempty"`
+    PublishedTime time.Time     `json:"published_time,omitzero"`
+    Description   string        `json:"description,omitempty"`
+    SiteName      string        `json:"site_name,omitempty"`
+    CanonicalURL  string        `json:"canonical_url,omitempty"`
+    Sections      []PageSection `json:"sections"`
+    ProcessingTime time.Duration `json:"-"`
+}
+// ReadResult.Render() flattens WITH links; RenderText() without.
+
+type PageSection struct {
+    Kind      SectionKind `json:"kind"`       // "header", "navigation", "main", "aside", "footer"
+    Text      string      `json:"text"`       // with inline links per InlineLinkFormat
+    PlainText string      `json:"plain_text,omitempty"` // link-free variant
+    Links     []LinkInfo  `json:"links,omitempty"`
+    Images    []ImageInfo `json:"images,omitempty"` // region images (when PreserveImages)
+    WordCount int         `json:"word_count"` // words in PlainText
+}
+
 type BatchResult struct {
     Results    []*Result
     Errors     []error
@@ -569,8 +662,9 @@ type Config struct {
     Audit              AuditConfig // Security audit logging
 
     // === Content Extraction ===
-    ExtractArticle bool // Enable article detection (default: true)
-    PreserveImages bool // Extract images (default: true)
+    ExtractArticle  bool // Enable article detection (default: true)
+    ExtractMetadata bool // Collect author/published/description/site name/canonical URL metadata (default: true)
+    PreserveImages  bool // Extract images (default: true)
     PreserveLinks  bool // Extract links (default: true)
     PreserveVideos bool // Extract videos (default: true)
     PreserveAudios bool // Extract audios (default: true)
@@ -643,18 +737,10 @@ Enable audit logging for security compliance:
 processor, _ := html.New(html.HighSecurityConfig())
 
 // Method 2: Custom configuration with audit enabled
+// (DefaultAuditConfig already turns on every Log* category)
 config := html.DefaultConfig()
-config.Audit = html.AuditConfig{
-    Enabled:            true,
-    LogBlockedTags:     true,
-    LogBlockedAttrs:    true,
-    LogBlockedURLs:     true,
-    LogInputViolations: true,
-    LogDepthViolations: true,
-    LogTimeouts:        true,
-    LogEncodingIssues:  true,
-    LogPathTraversal:   true,
-}
+config.Audit = html.DefaultAuditConfig()
+config.Audit.Enabled = true
 processor, _ := html.New(config)
 
 // Get audit logs
@@ -720,6 +806,7 @@ go run ./examples/01_quick_start/
 | [10_secure_file_processing](examples/10_secure_file_processing) | AllowedBaseDir sandbox and secure file reads |
 | [11_encoding](examples/11_encoding) | Character encoding detection and override |
 | [12_metadata_quality](examples/12_metadata_quality) | Structured metadata (JSON-LD/OpenGraph) and extraction confidence |
+| [13_page_reader](examples/13_page_reader) | Reader mode: full-page structured reading view for LLMs |
 
 ---
 
@@ -853,9 +940,11 @@ type ContentNode interface {
 
 `Processor` implements `Extractor` and `StatsProvider` at compile time.
 
-> **Note:** For custom `Scorer` implementations, only `Score` is currently consulted
-> (article-node candidate selection). `ShouldRemove` is part of the interface but is
-> not invoked on custom scorers — node removal always follows the built-in scorer's rules.
+> **Note:** For custom `Scorer` implementations, `Score` drives article-node candidate
+> selection; a scorer additionally implementing the optional `ArticleFinder` interface
+> (`FindArticleNode(root ContentNode) ContentNode`) takes over selection in a single
+> pass. `ShouldRemove` is part of the interface but is not invoked on custom scorers —
+> node removal always follows the built-in scorer's rules.
 
 ---
 
@@ -887,6 +976,10 @@ if err != nil {
         // More than one Config provided
     case errors.Is(err, html.ErrInternalPanic):
         // Internal panic recovered
+    case errors.Is(err, html.ErrBatchTooLarge):
+        // Batch exceeds 10,000 items
+    case errors.Is(err, html.ErrTooManyConcurrentOps):
+        // Too many concurrent one-shot (package-level) operations
     }
 }
 ```

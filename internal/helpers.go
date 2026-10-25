@@ -733,16 +733,19 @@ func TextContentLength(node *html.Node) int {
 	return total
 }
 
-// normalizedLength returns len(normalizeText(s)) computed by byte scan:
-// normalizeText maps '\n' to ' ' (1→1), drops '\r' (1→0), and folds the NBSP
-// pair (2→1); every other byte passes through unchanged. textNeedsNormalization
-// tests exactly these triggers, so for trigger-free input this equals len(s).
+// normalizedLength returns the length GetTextContent would produce for the
+// same text, computed by byte scan: GetTextContent maps '\n' AND '\r' to a
+// space (1→1 — normalizeText DROPS '\r', which is why this twin must follow
+// GetTextContent's rules, not normalizeText's) and folds the NBSP pair
+// (2→1); every other byte passes through unchanged. textNeedsNormalization
+// tests the newline and NBSP triggers only, so for trigger-free input this
+// equals len(s).
 func normalizedLength(s string) int {
 	n := 0
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
 		case '\r':
-			// dropped by normalizeText
+			n++ // becomes a space in GetTextContent; normalizeText drops it
 		case 0xC2:
 			if i+1 < len(s) && s[i+1] == 0xA0 {
 				n++ // NBSP pair folds to one space

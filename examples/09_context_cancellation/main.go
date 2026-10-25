@@ -118,6 +118,7 @@ func main() {
 	fmt.Println("  ExtractToMarkdownWithContext(ctx, htmlBytes)")
 	fmt.Println("  ExtractToJSONWithContext(ctx, htmlBytes)")
 	fmt.Println("  ExtractAllLinksWithContext(ctx, htmlBytes)")
+	fmt.Println("  ReadPageWithContext(ctx, htmlBytes)   — reader mode (see 13_page_reader)")
 	fmt.Println("  ExtractFromFileWithContext(ctx, path)")
 	fmt.Println("  ExtractBatchWithContext(ctx, docs)  — see 04_performance / 05_http_integration")
 	fmt.Println()

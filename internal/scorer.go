@@ -197,12 +197,13 @@ func buildPatternPrefixIndex(config *ScoringConfig) [256][]patternScore {
 
 	var index [256][]patternScore
 	for pattern, score := range sums {
-		firstChar := pattern[0]
-		// Convert to lowercase for case-insensitive matching
-		if firstChar >= 'A' && firstChar <= 'Z' {
-			firstChar += 32
-		}
-		index[firstChar] = append(index[firstChar], patternScore{
+		// Lookups run against lowercased attribute values, so patterns are
+		// stored lowercased too: an uppercase-spelled custom pattern used to
+		// bucket under its folded first byte yet never match (hasWordBoundary
+		// compares exactly). DefaultScoringConfig is all-lowercase, so this
+		// only affects calibration configs.
+		pattern = strings.ToLower(pattern)
+		index[pattern[0]] = append(index[pattern[0]], patternScore{
 			pattern: pattern,
 			score:   score,
 		})
@@ -220,11 +221,10 @@ func buildRemoveWordIndex(config *ScoringConfig) [256][]string {
 		if len(pattern) == 0 {
 			continue
 		}
-		firstChar := pattern[0]
-		if firstChar >= 'A' && firstChar <= 'Z' {
-			firstChar += 32
-		}
-		index[firstChar] = append(index[firstChar], pattern)
+		// Stored lowercased to match the lowercased attribute values lookups
+		// compare against (see buildPatternPrefixIndex).
+		pattern = strings.ToLower(pattern)
+		index[pattern[0]] = append(index[pattern[0]], pattern)
 	}
 	return index
 }
@@ -384,7 +384,10 @@ func (s *DefaultScorer) applyScoringRules(node *html.Node, metrics contentMetric
 				score = int(float64(score) * highLinkDensityPenalty)
 			} else if linkDensity > mediumLinkDensityThreshold {
 				score = int(float64(score) * mediumLinkDensityPenalty)
-			} else if linkDensity > lowLinkDensityThreshold {
+			} else {
+				// The outer gate already established
+				// linkDensity > lowLinkDensityThreshold; a third comparison
+				// here was always true when reached.
 				score = int(float64(score) * lowLinkDensityPenalty)
 			}
 		}
@@ -804,6 +807,45 @@ func isAlphaNumericByte(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
+// IsHiddenElement reports whether node is hidden via the hidden attribute,
+// aria-hidden="true", a display:none/visibility:hidden inline style, or a
+// hidden class token (hidden, sr-only, d-none, ...). It is the hidden-detection
+// subset of DefaultScorer.ShouldRemove, factored out so page-chrome cleaning
+// (RemoveHiddenElements) and reader-mode section filtering can strip invisible
+// nodes without applying content-oriented class removal — a nav region's own
+// "nav-menu" class must survive chrome cleaning. Primary-content containers
+// (<article>/<main>, role=main/article) keep their exemption from the
+// class-token test, matching ShouldRemove; an explicit hidden attribute or
+// style still hides them.
+func IsHiddenElement(node *html.Node) bool {
+	if node == nil || node.Type != html.ElementNode {
+		return false
+	}
+	primary := isPrimaryContentContainer(node)
+	for _, attr := range node.Attr {
+		switch attr.Key {
+		case "class", "id":
+			if primary {
+				continue
+			}
+			if matchesHiddenClassToken(strings.ToLower(attr.Val)) {
+				return true
+			}
+		case "style":
+			if isHiddenByStyle(attr.Val) {
+				return true
+			}
+		case "hidden":
+			return true
+		case "aria-hidden":
+			if strings.EqualFold(strings.TrimSpace(attr.Val), "true") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ShouldRemove determines if a node should be removed from the content tree.
 func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 	if node == nil || node.Type != html.ElementNode {
@@ -826,6 +868,14 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 		return true
 	}
 
+	// Hidden elements are removed in every context, independently of the
+	// content-oriented class matching below. IsHiddenElement is the factored
+	// detection so the hidden semantics stay identical wherever they are
+	// consulted (chrome cleaning, reader-mode section filtering).
+	if IsHiddenElement(node) {
+		return true
+	}
+
 	// Semantic main-content containers (<article>, <main>, or an explicit
 	// ARIA role of main/article) unambiguously denote primary content. They
 	// must NOT be stripped by the class/id substring heuristic: a class such
@@ -842,19 +892,6 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 				continue
 			}
 			lowerVal := strings.ToLower(attr.Val)
-			// A hidden-element class token (hidden, sr-only, d-none, ...) marks
-			// content that is visually absent — consent walls, folded "read more"
-			// regions, SEO filler — and must be stripped. On primary-content
-			// containers (<article>/<main>) this class check is skipped by the
-			// guard above; the unambiguous hidden ATTRIBUTE and style cases below
-			// still fire on them. It is independent of the content-area-signal
-			// guard below: a plain content wrapper with an explicit hidden class
-			// is hidden even when its class also carries a content-area signal.
-			// It runs as a substring test (no word boundary) so hyphenated tokens
-			// like "d-none" and camelCase "isHidden" forms are caught.
-			if matchesHiddenClassToken(lowerVal) {
-				return true
-			}
 			// A non-semantic element (div, section, ...) whose class/id
 			// contains both a content-area signal ("content", "article")
 			// and a removal pattern ("sidebar", "nav", ...) describes a CSS
@@ -870,16 +907,6 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 				continue
 			}
 			if s.matchesRemovalPatterns(lowerVal) {
-				return true
-			}
-		case "style":
-			if isHiddenByStyle(attr.Val) {
-				return true
-			}
-		case "hidden":
-			return true
-		case "aria-hidden":
-			if strings.EqualFold(strings.TrimSpace(attr.Val), "true") {
 				return true
 			}
 		}

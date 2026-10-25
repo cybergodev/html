@@ -3,6 +3,7 @@ package html
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -105,5 +106,30 @@ func TestRunBatchWithContextCallerPanicBackstop(t *testing.T) {
 	}
 	if !errors.Is(br.Errors[0], ErrInternalPanic) {
 		t.Errorf("Errors[0] = %v, want ErrInternalPanic identity", br.Errors[0])
+	}
+}
+
+// TestRecoverPanicWrapsAsErrInternalPanic drives the generic recover wrapper
+// directly: the SEC-003 suite injects panicking hooks through public entry
+// points, and the batch path above exercises its own per-item recover — this
+// pins the wrap contract (ErrInternalPanic identity, panic payload preserved
+// in the message, zero value returned) and the untouched normal path.
+func TestRecoverPanicWrapsAsErrInternalPanic(t *testing.T) {
+	t.Parallel()
+
+	got, err := recoverPanic(func() (string, error) { panic("boom") })
+	if got != "" {
+		t.Errorf("zero value expected on panic, got %q", got)
+	}
+	if !errors.Is(err, ErrInternalPanic) {
+		t.Fatalf("error = %v, want ErrInternalPanic identity", err)
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("error message lost the panic payload: %v", err)
+	}
+
+	v, err := recoverPanic(func() (string, error) { return "ok", ErrProcessorClosed })
+	if v != "ok" || !errors.Is(err, ErrProcessorClosed) {
+		t.Errorf("normal path = (%q, %v), want (%q, ErrProcessorClosed)", v, err, "ok")
 	}
 }

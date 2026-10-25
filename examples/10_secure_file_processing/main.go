@@ -78,8 +78,7 @@ func main() {
 	fmt.Println("2. File outside the sandbox")
 	fmt.Println("---------------------------")
 	_, err = processor.ExtractFromFile(outside)
-	var fileErr *html.FileError
-	if errors.As(err, &fileErr) {
+	if fileErr, ok := errors.AsType[*html.FileError](err); ok {
 		fmt.Printf("  ✓ refused: %v\n", fileErr.FileErr)
 		fmt.Printf("    op=%s, reported path=%q (full path is redacted)\n",
 			fileErr.Op, fileErr.SafePath())

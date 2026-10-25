@@ -183,7 +183,7 @@ drain:
 	fmt.Println("  - FilteredSink      - Filters by custom criteria")
 	fmt.Println("  - LevelFilteredSink - Filters by severity level")
 	fmt.Println()
-	fmt.Println("Or use GetAuditLog() to read entries from internal storage.")
+	fmt.Println("Or use GetAuditLog()/ClearAuditLog() to read and reset the internal storage.")
 
 	// ============================================================
 	// 5. Security Configuration

@@ -34,14 +34,47 @@ func ExtractTextWithStructureAndImages(node *html.Node, tb *table.TrackedBuilder
 		return
 	}
 
-	extractTextWithStructure(node, tb, imageCounter, linkCounter, tableFormat, nil, 0, false)
+	extractTextWithStructure(node, tb, imageCounter, linkCounter, tableFormat, nil, 0, false, false)
 }
 
-func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCounter *int, linkCounter *int, tableFormat string, parentBlock *html.Node, depth int, inPre bool) {
+// ExtractChromeTextWithStructure extracts the visible text of a page-chrome
+// region (a nav/header/aside/footer section node) into tb. It differs from
+// ExtractTextWithStructureAndImages in two ways, both required by reader-mode
+// section extraction:
+//
+//   - The section root itself is exempt from the skip check. The root is a
+//     nav/header/footer/aside element, which the content pass's isSkipElement
+//     predicate would reject before emitting anything.
+//   - Descendants use the chrome skip policy: only raw-text elements
+//     (script/style/noscript/template) are skipped. The content pass also
+//     skips nested nav and out-of-article landmarks, but a header's <nav> menu
+//     IS the region's substance and must survive.
+//
+// The [IMAGE:n]/[LINK:n] counters obey the same rules as the content pass, so
+// a collector that prunes only raw-text subtrees (see the root package's
+// extractImagesAndLinks chrome mode) stays in lockstep with the emitted tokens.
+func ExtractChromeTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCounter *int, linkCounter *int, tableFormat string) {
 	if node == nil {
 		return
 	}
-	if isSkipElement(node) {
+	// Children are visited with node as their parent block and depth 1,
+	// matching how the content entry point recurses into the root's children.
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, node, 1, false, true)
+	}
+}
+
+func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCounter *int, linkCounter *int, tableFormat string, parentBlock *html.Node, depth int, inPre bool, chromeMode bool) {
+	if node == nil {
+		return
+	}
+	if chromeMode {
+		// Chrome regions skip only raw-text subtrees; nested nav and landmark
+		// elements are the region's content, not chrome-within-chrome.
+		if node.Type == html.ElementNode && IsRawTextElement(node.Data) {
+			return
+		}
+	} else if isSkipElement(node) {
 		return
 	}
 	if node.Type == html.TextNode {
@@ -157,52 +190,67 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 				// generic block handling below so each nested data table is
 				// dispatched and rendered on its own terms.
 			} else {
-				// Burn placeholder positions for the subtree the table
-				// processor is about to consume. extractImagesAndLinks (root
-				// package) numbers every valid-src <img> and every <a> in the
-				// whole document, table cells included; the dispatch below
-				// returns without walking this table's children, so without
-				// these silent increments the counters fall out of lockstep
-				// and every [IMAGE:n]/[LINK:n] after the table would be
-				// substituted with the wrong entry.
-				if imageCounter != nil || linkCounter != nil {
-					WalkNodes(node, func(c *html.Node) bool {
-						if c.Type != html.ElementNode {
-							return true
-						}
-						switch c.Data {
-						case "img":
-							if imageCounter != nil && imgHasValidSrc(c) {
-								*imageCounter++
-							}
-						case "a":
-							if linkCounter != nil {
-								*linkCounter++
-							}
-						}
-						return true
-					})
+				// With counters active the table's own text carries
+				// [LINK:n]/[IMAGE:n] tokens (tableTokenText below), so table
+				// links keep their URLs through the caller's formatInline*
+				// substitution instead of collapsing to bare labels. The old
+				// silent counter burn is gone — the cells themselves advance
+				// the counters in the same document order the section-wide
+				// collector numbered them.
+				cellText := func(c *html.Node) string {
+					return tableTokenText(c, imageCounter, linkCounter, chromeMode)
 				}
+				useTokens := imageCounter != nil || linkCounter != nil
 				// A <caption> is visible rendered content, but the row-based
 				// table extractor below collects only <tr> subtrees and this
 				// dispatch returns without walking the subtree again —
 				// without this, the caption text vanished from every output
 				// format. Emit it as its own line ahead of the table
-				// (pipe-table Markdown has no caption element).
+				// (pipe-table Markdown has no caption element). Token-aware
+				// when counters are active so caption links survive too, and
+				// their positions line up (a caption precedes the rows in DOM
+				// order, matching the collector's numbering).
+				captionEmitted := false
 				for child := node.FirstChild; child != nil; child = child.NextSibling {
-					if child.Type == html.ElementNode && child.Data == "caption" {
-						if text := GetTextContent(child); text != "" {
+					if child.Type != html.ElementNode || child.Data != "caption" {
+						continue
+					}
+					if !captionEmitted {
+						captionEmitted = true
+						var text string
+						if useTokens {
+							text = cellText(child)
+						} else {
+							text = GetTextContent(child)
+						}
+						if text != "" {
 							if tb.Len() > 0 && tb.LastChar != '\n' {
 								_ = tb.WriteByte('\n')
 							}
 							_, _ = tb.WriteString(text)
 							_ = tb.WriteByte('\n')
 						}
-						break
+						continue
+					}
+					// Only the FIRST <caption> is the table's caption and is
+					// rendered; a second one is a parse artifact the HTML
+					// parser keeps as a sibling (the spec closes the first
+					// caption on a second start tag). The section-wide
+					// collector still numbers its anchors/images, so when
+					// tokens are active walk it with the text discarded — the
+					// same counter-burn idiom appendRowCells uses for
+					// non-cell row children — or every later token in this
+					// section misses by this caption's count.
+					if useTokens {
+						_ = cellText(child)
 					}
 				}
 				// Use the table processor for table extraction
-				TableProcessor().Extract(node, tb, tableFormat)
+				if useTokens {
+					TableProcessor().ExtractWithCellText(node, tb, tableFormat, cellText)
+				} else {
+					TableProcessor().Extract(node, tb, tableFormat)
+				}
 				return
 			}
 		}
@@ -239,7 +287,7 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 
 		childInPre := inPre || node.Data == "pre"
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, node, depth+1, childInPre)
+			extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, node, depth+1, childInPre, chromeMode)
 		}
 		// Add closing link tag after processing children
 		if node.Data == "a" && linkCounter != nil {
@@ -260,7 +308,100 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 		}
 	} else {
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, parentBlock, depth+1, inPre)
+			extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, parentBlock, depth+1, inPre, chromeMode)
+		}
+	}
+}
+
+// tableTokenText returns node's flattened visible text with [LINK:n]…[/LINK]
+// and inline [IMAGE:n] placeholders, for table cells and captions on the
+// token-emitting path: the section-wide formatInlineLinks/formatInlineImages
+// pass runs over the table's rendered output too, so a cell anchor reaches
+// the final text as a real link instead of a bare label.
+//
+// Alignment contract: it increments the counters for exactly the anchors the
+// section-wide collector numbers — in chrome mode the collector prunes
+// raw-text subtrees (IsRawTextElement, template included), so the emitter
+// skips them too; in content mode the collector counts everything, and the
+// emitter mirrors GetTextContent's skip set (script/style/noscript carry no
+// anchor elements after parsing; template content is real parsed nodes and
+// is included).
+//
+// Unlike the linear text pass, this flattener never emits newlines (a
+// markdown table row is one line); whitespace between fragments collapses to
+// single spaces.
+func tableTokenText(node *html.Node, imageCounter, linkCounter *int, chromeMode bool) string {
+	if node == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(64)
+	writeTokenText(&b, node, imageCounter, linkCounter, chromeMode)
+	return strings.TrimSpace(b.String())
+}
+
+// writeTokenText is tableTokenText's recursive worker.
+func writeTokenText(b *strings.Builder, node *html.Node, imageCounter, linkCounter *int, chromeMode bool) {
+	switch node.Type {
+	case html.TextNode:
+		if text := strings.TrimSpace(node.Data); text != "" {
+			ensureTokenSpace(b)
+			b.WriteString(text)
+		}
+		return
+	case html.CommentNode, html.DoctypeNode:
+		return
+	case html.ElementNode:
+		switch node.Data {
+		case "script", "style", "noscript":
+			return
+		case "template":
+			// Chrome mode: the collector prunes it, so skip entirely.
+			// Content mode: real parsed children — include, matching
+			// GetTextContent and the unpruned collector.
+			if chromeMode {
+				return
+			}
+		case "a":
+			if linkCounter != nil {
+				*linkCounter++
+				ensureTokenSpace(b)
+				b.WriteString("[LINK:")
+				b.WriteString(strconv.Itoa(*linkCounter))
+				b.WriteString("]")
+				for child := node.FirstChild; child != nil; child = child.NextSibling {
+					writeTokenText(b, child, imageCounter, linkCounter, chromeMode)
+				}
+				b.WriteString("[/LINK]")
+				return
+			}
+		case "img":
+			if imageCounter != nil && imgHasValidSrc(node) {
+				*imageCounter++
+				ensureTokenSpace(b)
+				b.WriteString("[IMAGE:")
+				b.WriteString(strconv.Itoa(*imageCounter))
+				b.WriteString("]")
+				return
+			}
+			return
+		case "br":
+			ensureTokenSpace(b)
+			return
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			writeTokenText(b, child, imageCounter, linkCounter, chromeMode)
+		}
+	}
+}
+
+// ensureTokenSpace appends a single separating space when needed so flattened
+// fragments never run together and never double-space.
+func ensureTokenSpace(b *strings.Builder) {
+	if b.Len() > 0 {
+		last := b.String()[b.Len()-1]
+		if last != ' ' {
+			b.WriteByte(' ')
 		}
 	}
 }
@@ -350,6 +491,30 @@ func hasPresentationalRole(node *html.Node) bool {
 // Uses iterative traversal with explicit stack to avoid potential stack overflow
 // on deeply nested documents and improve cache locality.
 func CleanContentNode(node *html.Node) *html.Node {
+	return pruneDescendants(node, ShouldRemoveElement)
+}
+
+// RemoveHiddenElements removes hidden elements from node's subtree in place:
+// the hidden attribute, aria-hidden="true", a display:none/visibility:hidden
+// style, or a hidden class token (hidden, sr-only, d-none, ...). It is the
+// light-weight cleaner for page-chrome sections in reader mode: CleanContentNode
+// applies the content scorer's class removal, which would strip a nav region's
+// own "nav-menu" children along with the ads, so chrome regions clear only
+// what is invisible. The root node itself is never removed (callers decide its
+// fate; see IsHiddenElement).
+func RemoveHiddenElements(node *html.Node) *html.Node {
+	return pruneDescendants(node, IsHiddenElement)
+}
+
+// pruneDescendants detaches every element child for which remove returns
+// true, in place, and returns node. It is the single implementation of the
+// detach-while-iterating walk CleanContentNode and RemoveHiddenElements
+// share. Marked children are detached immediately — saving next BEFORE
+// RemoveChild, which clears the child's sibling links — instead of being
+// collected into a toRemove slice for a second pass; detached subtrees are
+// never pushed, so their descendants are never visited. The root itself is
+// never tested; callers decide its fate.
+func pruneDescendants(node *html.Node, remove func(*html.Node) bool) *html.Node {
 	if node == nil {
 		return nil
 	}
@@ -360,21 +525,13 @@ func CleanContentNode(node *html.Node) *html.Node {
 	stack := *stackPtr
 
 	stack = append(stack, node)
-
-	// Iterative traversal using explicit stack. Marked children are detached
-	// immediately (saving next before RemoveChild, which clears the child's
-	// sibling links) instead of being collected into a toRemove slice for a
-	// second pass — that slice was one allocation per call. Detached subtrees
-	// are not pushed, so their descendants are never visited; the deferred
-	// removal loop this replaces achieved the same effect only incidentally,
-	// by removing nodes whose parents lived in already-detached subtrees.
 	for len(stack) > 0 {
 		n := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
 		for child := n.FirstChild; child != nil; {
 			next := child.NextSibling
-			if child.Type == html.ElementNode && ShouldRemoveElement(child) {
+			if child.Type == html.ElementNode && remove(child) {
 				n.RemoveChild(child)
 			} else {
 				stack = append(stack, child)

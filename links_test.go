@@ -103,6 +103,36 @@ func TestGroupLinksByType(t *testing.T) {
 	})
 }
 
+func TestExtractAllLinksNonHTTPBaseFallsBackToCanonical(t *testing.T) {
+	t.Parallel()
+
+	// A <base> whose value normalizes to nothing (about:blank) is not a
+	// usable base: detection must fall through to the canonical/og:url ladder
+	// instead of disabling URL resolution for the whole document.
+	doc := []byte(`<html><head>
+		<base href="about:blank">
+		<link rel="canonical" href="https://example.com/page/">
+	</head><body><a href="rel.html">rel</a></body></html>`)
+
+	cfg := html.DefaultConfig()
+	cfg.MaxCacheEntries = 0
+	links, err := html.ExtractAllLinks(doc, cfg)
+	if err != nil {
+		t.Fatalf("ExtractAllLinks: %v", err)
+	}
+	// The ladder reduces the canonical to the origin root (NormalizeBaseURL's
+	// documented behavior), so the relative link resolves against the host.
+	var found bool
+	for _, l := range links {
+		if l.URL == "https://example.com/rel.html" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("relative link not resolved via canonical after unusable <base>: %+v", links)
+	}
+}
+
 func TestFragmentAndQueryHrefsExcluded(t *testing.T) {
 	t.Parallel()
 
@@ -176,5 +206,51 @@ func TestFragmentHrefStillConsumesPosition(t *testing.T) {
 	}
 	if strings.Contains(res.Text, "[LINK:") || strings.Contains(res.Text, "[/LINK]") {
 		t.Errorf("unmatched placeholder leaked into text: %q", res.Text)
+	}
+}
+
+// TestEmbedLinkTitleFallbacks pins the embed link-title ladder through the
+// public links API: an explicit title attribute wins, then the platform name
+// recognized in the URL (YouTube / Vimeo / Dailymotion), then the generic
+// "Embedded Video" for any other video URL.
+func TestEmbedLinkTitleFallbacks(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		src   string
+		title string // explicit title attribute; omitted when empty
+		want  string
+	}{
+		{"explicit title", "https://www.youtube.com/embed/a", "Watch this", "Watch this"},
+		{"youtube platform", "https://www.youtube.com/embed/a", "", "YouTube Video"},
+		{"vimeo platform", "https://player.vimeo.com/video/1", "", "Vimeo Video"},
+		{"dailymotion platform", "https://www.dailymotion.com/embed/video/x", "", "Dailymotion Video"},
+		{"generic video fallback", "https://cdn.example.com/player.mp4", "", "Embedded Video"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			embed := `<embed src="` + tt.src + `"`
+			if tt.title != "" {
+				embed += ` title="` + tt.title + `"`
+			}
+			links, err := html.ExtractAllLinks([]byte(`<html><body>` + embed + `></body></html>`))
+			if err != nil {
+				t.Fatalf("ExtractAllLinks: %v", err)
+			}
+			for _, l := range links {
+				if l.URL == tt.src {
+					if l.Title != tt.want {
+						t.Errorf("Title = %q, want %q", l.Title, tt.want)
+					}
+					if l.Type != "video" {
+						t.Errorf("Type = %q, want %q", l.Type, "video")
+					}
+					return
+				}
+			}
+			t.Errorf("embed URL %s missing from links: %+v", tt.src, links)
+		})
 	}
 }

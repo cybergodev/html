@@ -177,6 +177,13 @@ func (p *Processor) parseVideoNode(n *stdxhtml.Node) VideoInfo {
 	for _, attr := range n.Attr {
 		switch attr.Key {
 		case "src":
+			// An explicitly empty src="" is treated exactly like a missing
+			// one — browsers fall back to the <source> children, and so does
+			// the video.URL == "" branch below; only a non-empty invalid
+			// value rejects the element.
+			if attr.Val == "" {
+				continue
+			}
 			if !internal.IsValidURL(attr.Val) {
 				return VideoInfo{}
 			}
@@ -275,6 +282,11 @@ func (p *Processor) parseAudioNode(n *stdxhtml.Node) AudioInfo {
 	for _, attr := range n.Attr {
 		switch attr.Key {
 		case "src":
+			// Empty src="" is absence, not invalidity — see parseVideoNode;
+			// the <source> fallback below still gets its chance.
+			if attr.Val == "" {
+				continue
+			}
 			if !internal.IsValidURL(attr.Val) {
 				return AudioInfo{}
 			}

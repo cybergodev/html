@@ -18,6 +18,7 @@ package html
 //     of the result.
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -191,11 +192,14 @@ func TestRelTokenMatching(t *testing.T) {
 	}
 }
 
-// TestExtractSourceLinksTypeCaseInsensitive pins the <source type> fix: a
-// mixed-case MIME type must classify the resource. The src deliberately has
-// no recognizable media extension, so only the type attribute can classify
-// it — before the fix it fell through to the generic "media" class.
-func TestExtractSourceLinksTypeCaseInsensitive(t *testing.T) {
+// TestExtractTypeAttributeCaseInsensitive merges the former
+// TestExtractSourceLinksTypeCaseInsensitive / TestExtractLinkTagTypeCaseInsensitive
+// pair, whose scaffolds were byte-identical: MIME types are case-insensitive
+// markup, so a mixed-case type attribute must still classify the resource.
+// Each src deliberately has no recognizable extension, so only the type
+// attribute can classify it — before the fix the case-sensitive checks
+// dropped the resource into the wrong class or out of the result entirely.
+func TestExtractTypeAttributeCaseInsensitive(t *testing.T) {
 	t.Parallel()
 
 	p, err := New(DefaultConfig())
@@ -204,49 +208,129 @@ func TestExtractSourceLinksTypeCaseInsensitive(t *testing.T) {
 	}
 	defer func() { _ = p.Close() }()
 
-	doc := []byte(`<html><body><video><source src="/media/clip?id=1" type="VIDEO/MP4"></video></body></html>`)
-	links, err := p.ExtractAllLinks(doc)
-	if err != nil {
-		t.Fatalf("ExtractAllLinks: %v", err)
-	}
-
-	for _, l := range links {
-		if l.URL == "/media/clip?id=1" {
-			if l.Type != "video" {
-				t.Errorf("source with type=%q classified as %q, want %q", "VIDEO/MP4", l.Type, "video")
+	for _, tt := range []struct {
+		name     string
+		doc      string
+		url      string
+		declared string
+		want     string
+	}{
+		{
+			name:     "source type classifies video",
+			doc:      `<html><body><video><source src="/media/clip?id=1" type="VIDEO/MP4"></video></body></html>`,
+			url:      "/media/clip?id=1",
+			declared: "VIDEO/MP4",
+			want:     "video",
+		},
+		{
+			name:     "link type classifies stylesheet",
+			doc:      `<html><head><link type="text/CSS" href="/theme.css"></head></html>`,
+			url:      "/theme.css",
+			declared: "text/CSS",
+			want:     "css",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			links, err := p.ExtractAllLinks([]byte(tt.doc))
+			if err != nil {
+				t.Fatalf("ExtractAllLinks: %v", err)
 			}
-			return
-		}
+			for _, l := range links {
+				if l.URL == tt.url {
+					if l.Type != tt.want {
+						t.Errorf("resource with type=%q classified as %q, want %q", tt.declared, l.Type, tt.want)
+					}
+					return
+				}
+			}
+			t.Errorf("URL %s missing from results: %+v", tt.url, links)
+		})
 	}
-	t.Errorf("source URL /media/clip?id=1 missing from results: %+v", links)
 }
 
-// TestExtractLinkTagTypeCaseInsensitive pins the <link type> fallback fix: a
-// <link> with no matching rel tokens must still be classified via a
-// mixed-case type attribute. Before the fix the case-sensitive contains
-// checks dropped the resource entirely.
-func TestExtractLinkTagTypeCaseInsensitive(t *testing.T) {
+// TestExtractMarkdownLinkLabelIdioms table-drives the ExtractToMarkdown
+// link-label rendering regressions that used to live as five single-scenario
+// tests inside read_test.go (born there from the reader-mode label work, but
+// exercising the Extract path, not ReadPage). Rows pin:
+//   - the linked-image idiom for mixed labels, image-first or text-first
+//     (an alt-bearing image is part of the label whichever side it sits on,
+//     and the old visit-time hasText check dropped image-first tokens);
+//   - page text that looks like a well-formed [IMAGE:999] token but resolves
+//     to no image stays literal (the unpaired-token policy);
+//   - a multiline alt breaks the inline ![label](url) construct exactly as a
+//     newline-bearing link label does, and collapses to one line;
+//   - a document whose every href is rejected by the URL validator has an
+//     empty links list while the text pass still burned [LINK:n] positions —
+//     no token may leak, and the anchor words must survive.
+func TestExtractMarkdownLinkLabelIdioms(t *testing.T) {
 	t.Parallel()
 
-	p, err := New(DefaultConfig())
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer func() { _ = p.Close() }()
-
-	doc := []byte(`<html><head><link type="text/CSS" href="/theme.css"></head></html>`)
-	links, err := p.ExtractAllLinks(doc)
-	if err != nil {
-		t.Fatalf("ExtractAllLinks: %v", err)
-	}
-
-	for _, l := range links {
-		if l.URL == "/theme.css" {
-			if l.Type != "css" {
-				t.Errorf("link with type=%q classified as %q, want %q", "text/CSS", l.Type, "css")
+	for _, tt := range []struct {
+		name    string
+		doc     string
+		wants   []string
+		forbids []string
+	}{
+		{
+			name: "text-first mixed label nests the image idiom",
+			doc:  `<html><body><article><p>View the <a href="/report">full report <img src="/chart.png" alt="Q3 chart"></a> for details.</p></article></body></html>`,
+			wants: []string{
+				"[full report ![Q3 chart](/chart.png)](/report)",
+			},
+		},
+		{
+			name: "image-first mixed label keeps the idiom",
+			doc:  `<html><body><article><p>View the <a href="/report"><img src="/chart.png" alt="Q3 chart"> full report</a> for details.</p></article></body></html>`,
+			wants: []string{
+				"[![Q3 chart](/chart.png) full report](/report)",
+			},
+		},
+		{
+			name: "literal look-alike token stays verbatim",
+			doc: `<html><body><article>
+				<p><img src="/real.png" alt="real"></p>
+				<p>See <a href="/notes">the [IMAGE:999] notes</a> now.</p>
+			</article></body></html>`,
+			wants: []string{
+				"the [IMAGE:999] notes",
+			},
+		},
+		{
+			name: "multiline alt collapses to one line",
+			doc:  "<html><body><article><p>Chart: <img src=\"/c.png\" alt=\"revenue\nchart 2026\"></p></article></body></html>",
+			wants: []string{
+				"![revenue chart 2026](/c.png)",
+			},
+		},
+		{
+			name:  "all-invalid hrefs leak no tokens",
+			doc:   `<html><body><article><p>Click <a href="javascript:alert(1)">Bad</a> or <a href="vbscript:x">Worse</a> now.</p></article></body></html>`,
+			wants: []string{"Bad", "Worse"},
+			forbids: []string{
+				"[LINK:",
+				"[IMAGE:",
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.InlineImageFormat = "markdown"
+			cfg.InlineLinkFormat = "markdown"
+			cfg.MaxCacheEntries = 0
+			out, err := ExtractToMarkdown([]byte(tt.doc), cfg)
+			if err != nil {
+				t.Fatalf("ExtractToMarkdown: %v", err)
 			}
-			return
-		}
+			for _, want := range tt.wants {
+				if !strings.Contains(out, want) {
+					t.Errorf("output missing %q:\n%s", want, out)
+				}
+			}
+			for _, forbid := range tt.forbids {
+				if strings.Contains(out, forbid) {
+					t.Errorf("forbidden %q leaked into output:\n%s", forbid, out)
+				}
+			}
+		})
 	}
-	t.Errorf("stylesheet /theme.css missing from results: %+v", links)
 }

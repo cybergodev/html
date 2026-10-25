@@ -727,3 +727,56 @@ func TestCacheLRUEvictionOrder(t *testing.T) {
 		t.Errorf("Get(a) after overwrite = %v, want 10", got)
 	}
 }
+
+// TestCacheEvictProbeCap pins the maxEvictProbe boundary of evictOne: with a
+// TTL configured and more live (non-expired) entries than the probe budget,
+// the expired-entry scan stops after maxEvictProbe candidates and falls back
+// to evicting the LRU entry — the bounded probe must not scan the whole map
+// on every Set past capacity.
+func TestCacheEvictProbeCap(t *testing.T) {
+	t.Parallel()
+
+	const capacity = maxEvictProbe + 8
+	c := NewCache[string](capacity, time.Hour)
+	for i := 0; i < capacity; i++ {
+		c.Set(fmt.Sprintf("k%02d", i), "v")
+	}
+	if got := c.Len(); got != capacity {
+		t.Fatalf("Len() = %d, want %d", got, capacity)
+	}
+
+	// One entry past capacity triggers eviction; none are expired, so the
+	// probe scans maxEvictProbe entries without a match and must fall back
+	// to the LRU entry (k00, the oldest).
+	c.Set("new", "v")
+	if got := c.Len(); got != capacity {
+		t.Fatalf("Len() after eviction = %d, want %d", got, capacity)
+	}
+	if c.Get("k00") != nil {
+		t.Error("LRU entry k00 survived eviction: the probe overran its budget or skipped the LRU fallback")
+	}
+	if c.Get("new") == nil {
+		t.Error("the inserting entry was evicted instead of the LRU entry")
+	}
+}
+
+// TestCacheEvictOnePrefersExpired covers evictOne's other exit: with TTL
+// configured and an expired entry present, the probe removes the expired
+// entry instead of falling back to the LRU eviction.
+func TestCacheEvictOnePrefersExpired(t *testing.T) {
+	t.Parallel()
+
+	c := NewCache[string](4, time.Millisecond)
+	for i := 0; i < 4; i++ {
+		c.Set(fmt.Sprintf("e%d", i), "v")
+	}
+	time.Sleep(50 * time.Millisecond) // all four entries are now expired
+
+	c.Set("fresh", "v")
+	if c.Get("fresh") == nil {
+		t.Error("fresh entry was lost during eviction of expired entries")
+	}
+	if got := c.Len(); got != 4 {
+		t.Errorf("Len() = %d, want 4 after evicting one expired entry", got)
+	}
+}

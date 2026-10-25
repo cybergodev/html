@@ -345,7 +345,7 @@ func nextHTTPCandidate(s string, from int) (int, bool) {
 // (?i)https?://[^\s<>"',;)}\]]{1,500}\.(?:ext|...): a fold-case "https?://"
 // prefix, a greedy run of allowed bytes capped at mediaURLMaxRun, then a
 // greedy one-byte-at-a-time backoff to the rightmost '.' + extension that fits.
-func matchMediaURLAt(s string, p int, exts [256][]string) string {
+func matchMediaURLAt(s string, p int, exts *[256][]string) string {
 	n := len(s)
 	if !asciiFoldHasPrefix(s[p:], "http") {
 		return ""
@@ -411,9 +411,12 @@ func ScanMediaURLs(html string, video bool, maxMatches int, onURL func(string) b
 	if maxMatches <= 0 || onURL == nil {
 		return
 	}
-	exts := audioURLExtIndex
+	// The index tables are 6 KiB ([256][]string); pass a pointer — a value
+	// parameter copied the whole array into matchMediaURLAt's frame on every
+	// call, once per candidate byte in the document.
+	exts := &audioURLExtIndex
 	if video {
-		exts = videoURLExtIndex
+		exts = &videoURLExtIndex
 	}
 	matches := 0
 	i := 0

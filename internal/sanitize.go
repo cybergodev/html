@@ -210,8 +210,12 @@ func sanitizeNodeInPlace(n *html.Node, audit AuditRecorder) bool {
 				if attrKey == "style" {
 					// sanitizeStyleValue returns either "" (blocked) or its
 					// input unchanged, so there is no partial-rewrite case to
-					// write back here.
-					if sanitizeStyleValue(attr.Val) == "" {
+					// write back here. An empty value ("style=\"\"") is
+					// vacuously safe, not blocked: sanitizeStyleValue("")
+					// returns "" too, and reading that as "blocked" removed
+					// and audit-logged every empty style attribute on
+					// otherwise benign markup.
+					if attr.Val != "" && sanitizeStyleValue(attr.Val) == "" {
 						audit.RecordBlockedAttr(attr.Key, attr.Val)
 						modified = true
 						continue

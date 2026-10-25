@@ -140,103 +140,99 @@ func TestMediaPastWalkCapExtracted(t *testing.T) {
 	}
 }
 
-func TestAllLinksPastWalkCapExtracted(t *testing.T) {
+// TestLateDocumentFeaturesPastWalkCap table-drives the four walk-cap probes
+// that shared one scaffold — build a document whose feature sits beyond the
+// removed 50k-node walk cap, run the entry point that observes it, and scan
+// the result for the expected value. Rows (the former
+// TestAllLinksPastWalkCapExtracted / TestTitleFallbackPastWalkCap /
+// TestBaseElementPastWalkCap / TestBaseURLMetaPastWalkCap):
+//   - links and images past the cap still collected by ExtractAllLinks;
+//   - the h1 title fallback past the cap (Processor.Extract);
+//   - <base>-driven resolution — <base> is detected through
+//     FindElementByTag and a relative link resolves only if the base is
+//     found, so the row exercises both walks at once;
+//   - og:url-driven resolution — no <base>, so detectBaseURL scans for
+//     og:url / rel=canonical and NormalizeBaseURL reduces it to the origin.
+func TestLateDocumentFeaturesPastWalkCap(t *testing.T) {
 	t.Parallel()
 
-	doc := beyondWalkCapDoc("<html><body>",
-		`<p><a href="/late.html">late</a><img src="/late.png" alt="late"></p></body></html>`)
+	for _, tt := range []struct {
+		name       string
+		tail       string
+		useExtract bool
+		wantSubstr []string // substring matches against link URLs
+		wantExact  string   // exact resolved-URL match
+		wantTitle  string   // Extract-only: res.Title
+	}{
+		{
+			name:       "links and images collected",
+			tail:       `<p><a href="/late.html">late</a><img src="/late.png" alt="late"></p></body></html>`,
+			wantSubstr: []string{"late.html", "late.png"},
+		},
+		{
+			name:       "h1 title fallback",
+			tail:       "<h1>Late Heading</h1></body></html>",
+			useExtract: true,
+			wantTitle:  "Late Heading",
+		},
+		{
+			name:      "base element resolution",
+			tail:      `<a href="rel/page.html">rel</a><base href="https://late.example/dir/"></body></html>`,
+			wantExact: "https://late.example/rel/page.html",
+		},
+		{
+			name:      "og:url meta resolution",
+			tail:      `<meta property="og:url" content="https://og.example/art/">` + `<a href="rel/page.html">rel</a></body></html>`,
+			wantExact: "https://og.example/rel/page.html",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	cfg := DefaultConfig()
-	cfg.MaxCacheEntries = 0
-	links, err := ExtractAllLinks(doc, cfg)
-	if err != nil {
-		t.Fatalf("ExtractAllLinks: %v", err)
-	}
+			doc := beyondWalkCapDoc("<html><body>", tt.tail)
+			cfg := DefaultConfig()
+			cfg.MaxCacheEntries = 0
 
-	var sawLink, sawImage bool
-	for _, l := range links {
-		if strings.Contains(l.URL, "late.html") {
-			sawLink = true
-		}
-		if strings.Contains(l.URL, "late.png") {
-			sawImage = true
-		}
-	}
-	if !sawLink {
-		t.Errorf("late.html missing from ExtractAllLinks result: %+v", links)
-	}
-	if !sawImage {
-		t.Errorf("late.png missing from ExtractAllLinks result: %+v", links)
-	}
-}
+			if tt.useExtract {
+				res, err := Extract(doc, cfg)
+				if err != nil {
+					t.Fatalf("Extract: %v", err)
+				}
+				if tt.wantTitle != "" && res.Title != tt.wantTitle {
+					t.Errorf("Title = %q, want %q", res.Title, tt.wantTitle)
+				}
+				return
+			}
 
-func TestTitleFallbackPastWalkCap(t *testing.T) {
-	t.Parallel()
-
-	doc := beyondWalkCapDoc("<html><body>", "<h1>Late Heading</h1></body></html>")
-
-	cfg := DefaultConfig()
-	cfg.MaxCacheEntries = 0
-	res, err := Extract(doc, cfg)
-	if err != nil {
-		t.Fatalf("Extract: %v", err)
-	}
-	if res.Title != "Late Heading" {
-		t.Errorf("Title = %q, want the h1 fallback past the walk cap", res.Title)
-	}
-}
-
-func TestBaseElementPastWalkCap(t *testing.T) {
-	t.Parallel()
-
-	// <base> is detected through FindElementByTag; a relative link is resolved
-	// only if the base is found, so it exercises both walks at once.
-	doc := beyondWalkCapDoc("<html><body>",
-		`<a href="rel/page.html">rel</a><base href="https://late.example/dir/"></body></html>`)
-
-	cfg := DefaultConfig()
-	cfg.MaxCacheEntries = 0
-	links, err := ExtractAllLinks(doc, cfg)
-	if err != nil {
-		t.Fatalf("ExtractAllLinks: %v", err)
-	}
-
-	var found bool
-	for _, l := range links {
-		if l.URL == "https://late.example/rel/page.html" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("relative link not resolved against the <base> past the walk cap: %+v", links)
-	}
-}
-
-func TestBaseURLMetaPastWalkCap(t *testing.T) {
-	t.Parallel()
-
-	// No <base>: detectBaseURL scans for og:url / rel=canonical instead.
-	// NormalizeBaseURL reduces either form to the origin root, so the resolved
-	// link keeps only the host.
-	doc := beyondWalkCapDoc("<html><body>",
-		`<meta property="og:url" content="https://og.example/art/">`+
-			`<a href="rel/page.html">rel</a></body></html>`)
-
-	cfg := DefaultConfig()
-	cfg.MaxCacheEntries = 0
-	links, err := ExtractAllLinks(doc, cfg)
-	if err != nil {
-		t.Fatalf("ExtractAllLinks: %v", err)
-	}
-
-	var found bool
-	for _, l := range links {
-		if l.URL == "https://og.example/rel/page.html" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("relative link not resolved against og:url past the walk cap: %+v", links)
+			links, err := ExtractAllLinks(doc, cfg)
+			if err != nil {
+				t.Fatalf("ExtractAllLinks: %v", err)
+			}
+			for _, want := range tt.wantSubstr {
+				found := false
+				for _, l := range links {
+					if strings.Contains(l.URL, want) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("URL containing %q missing from result: %+v", want, links)
+				}
+			}
+			if tt.wantExact != "" {
+				found := false
+				for _, l := range links {
+					if l.URL == tt.wantExact {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Fatalf("resolved URL %q missing from result: %+v", tt.wantExact, links)
+				}
+			}
+		})
 	}
 }
 

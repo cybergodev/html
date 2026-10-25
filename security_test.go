@@ -265,11 +265,22 @@ func TestDataURLInjection(t *testing.T) {
 		name          string
 		html          string
 		shouldExtract bool
+		wantURL       string // when set, Images[0].URL must equal it exactly
 	}{
 		{
 			name:          "safe image data URL",
 			html:          `<html><body><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAYAAACNbyblAAAAHElEQVQI12P4//8/w38GIAXDIBKE0DHxgljNBAAO9TXL0Y4OHwAAAABJRU5ErkJggg==">Content</body></html>`,
 			shouldExtract: true,
+		},
+		{
+			// Browsers accept "DATA:" schemes, so a whitelisted media type in
+			// any case must survive sanitization with its URL preserved
+			// verbatim (moved from regressions_test.go, where this row
+			// lived as TestUppercaseSafeDataURLImageExtracted).
+			name:          "uppercase safe image data URL",
+			html:          `<html><body><img src="DATA:image/png;base64,iVBORw0KGgo=" alt="dot">Content</body></html>`,
+			shouldExtract: true,
+			wantURL:       "DATA:image/png;base64,iVBORw0KGgo=",
 		},
 		{
 			name:          "oversized data URL",
@@ -301,6 +312,9 @@ func TestDataURLInjection(t *testing.T) {
 			}
 			if !tt.shouldExtract && hasImage {
 				t.Error("Expected data URL to be rejected")
+			}
+			if tt.wantURL != "" && (len(result.Images) != 1 || result.Images[0].URL != tt.wantURL) {
+				t.Errorf("image URL = %+v, want exactly %q", result.Images, tt.wantURL)
 			}
 		})
 	}
@@ -582,42 +596,49 @@ func TestHighSecurityConfigStricterThanDefault(t *testing.T) {
 // payloads contain no raw <>"' and passed, so script-executing data URLs
 // (image/svg+xml, text/html) reached LinkResource.URL through the
 // non-sanitizing ExtractAllLinks path. IsValidURL now enforces the same
-// safeMediaTypes whitelist as the DOM sanitizer.
+// safeMediaTypes whitelist as the DOM sanitizer. The table also carries the
+// case variants of the former TestScriptableDataURLCaseInsensitive
+// (regressions_test.go): RFC 3986 schemes and MIME types are
+// case-insensitive, so every casing of a scriptable payload must be rejected
+// while any casing of a whitelisted media type survives.
 func TestExtractAllLinksRejectsScriptableDataURLs(t *testing.T) {
 	t.Parallel()
 
-	const svgPayload = `data:image/svg+xml,%3Csvg%20onload%3Dalert(1)%3E`
-	const htmlPayload = `data:text/html,%3Cscript%3Ealert(1)%3C/script%3E`
-	const pngPayload = `data:image/png;base64,iVBORw0KGgo=`
-	doc := `<html><body>
-		<a href="` + svgPayload + `">svg</a>
-		<a href="` + htmlPayload + `">html</a>
-		<a href="` + pngPayload + `">png</a>
-	</body></html>`
+	for _, tt := range []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{"svg lowercase", `data:image/svg+xml,%3Csvg%20onload%3Dalert(1)%3E`, false},
+		{"svg mixed case", `Data:image/svg+xml,%3Csvg%3E`, false},
+		{"html lowercase", `data:text/html,%3Cscript%3Ealert(1)%3E/script%3E`, false},
+		{"html uppercase", `DATA:text/html,%3Cscript%3Ealert(1)%3E/script%3E`, false},
+		{"png lowercase", `data:image/png;base64,iVBORw0KGgo=`, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	links, err := html.ExtractAllLinks([]byte(doc))
-	if err != nil {
-		t.Fatalf("ExtractAllLinks() failed: %v", err)
-	}
+			doc := `<html><body><a href="` + tt.payload + `">x</a><a href="https://go.dev">safe</a></body></html>`
+			links, err := html.ExtractAllLinks([]byte(doc))
+			if err != nil {
+				t.Fatalf("ExtractAllLinks() failed: %v", err)
+			}
 
-	var sawSVG, sawHTML, sawPNG bool
-	for _, link := range links {
-		switch {
-		case strings.HasPrefix(link.URL, "data:image/svg"):
-			sawSVG = true
-		case strings.HasPrefix(link.URL, "data:text/html"):
-			sawHTML = true
-		case strings.HasPrefix(link.URL, "data:image/png"):
-			sawPNG = true
-		}
-	}
-	if sawSVG {
-		t.Error("SVG data URL must not appear in extracted links")
-	}
-	if sawHTML {
-		t.Error("text/html data URL must not appear in extracted links")
-	}
-	if !sawPNG {
-		t.Error("whitelisted image/png data URL should still be extracted")
+			sawPayload, sawSafe := false, false
+			for _, link := range links {
+				if strings.EqualFold(link.URL, tt.payload) {
+					sawPayload = true
+				}
+				if link.URL == "https://go.dev" {
+					sawSafe = true
+				}
+			}
+			if sawPayload != tt.want {
+				t.Errorf("payload kept = %v, want %v (links: %+v)", sawPayload, tt.want, links)
+			}
+			if !sawSafe {
+				t.Errorf("the plain https link must survive every data-URL decision (links: %+v)", links)
+			}
+		})
 	}
 }

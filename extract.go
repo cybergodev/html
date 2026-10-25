@@ -22,6 +22,7 @@ var markdownEscapeReplacer = strings.NewReplacer(
 	`\`, `\\`,
 	`[`, `\[`,
 	`]`, `\]`,
+	`|`, `\|`,
 )
 
 // containsASCIIFold reports whether substr is contained in s, case-insensitively
@@ -56,19 +57,51 @@ func containsASCIIFold(s, substr string) bool {
 }
 
 // escapeMarkdownText escapes characters that could break Markdown link/image syntax.
-// Escapes ], [, and \ to prevent injection of arbitrary Markdown content.
+// Escapes ], [, \, and | to prevent injection of arbitrary Markdown content;
+// a raw '|' inside a label ends the cell when the construct is substituted
+// into a rendered Markdown table (the table escaper sees only the
+// pre-substitution [LINK:n] text, so it cannot cover this).
 func escapeMarkdownText(s string) string {
 	// Fast path: strings.(*Replacer).Replace allocates a new string even when
 	// nothing matches, so scan first and skip the replacer entirely when the
-	// text contains none of the three escapable characters. Link and image
+	// text contains none of the four escapable characters. Link and image
 	// text almost never contains them, so this avoids an allocation per call.
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
-		case '\\', '[', ']':
+		case '\\', '[', ']', '|':
 			return markdownEscapeReplacer.Replace(s)
 		}
 	}
 	return s
+}
+
+// collapseInlineSpace trims s and collapses internal whitespace runs (space,
+// tab, newline, CR) to single spaces. A link label captured between block
+// elements inside one anchor (an icon <div> followed by a text <span>, the
+// common "icon-list-item" shape) otherwise carries newlines into the rendered
+// [label](URL), splitting the construct across lines and breaking most
+// renderers' inline parsing. Also makes whitespace-only labels empty, so the
+// "Link N" fallback fires for them.
+func collapseInlineSpace(s string) string {
+	if !strings.ContainsAny(s, " \t\n\r") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	inSpace := false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case ' ', '\t', '\n', '\r':
+			inSpace = true
+		default:
+			if inSpace && b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			inSpace = false
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // markdownURLDestReplacer percent-encodes the bytes that would break a
@@ -77,18 +110,22 @@ var markdownURLDestReplacer = strings.NewReplacer(
 	"(", "%28",
 	")", "%29",
 	" ", "%20",
+	"|", "%7C",
 )
 
-// escapeMarkdownURLDest percent-encodes the parentheses and spaces in a
-// Markdown link/image destination. An unescaped ')' terminates the
+// escapeMarkdownURLDest percent-encodes the parentheses, spaces, and pipes
+// in a Markdown link/image destination. An unescaped ')' terminates the
 // destination early and spills the rest of the URL into rendered text, and
 // per CommonMark unescaped whitespace also terminates it — so a destination
-// like "my file.png" rendered as broken text rather than a link.
+// like "my file.png" rendered as broken text rather than a link. A raw '|'
+// does not terminate the destination inline, but when the construct lands in
+// a rendered Markdown table it terminates the CELL (the table escaper sees
+// only the pre-substitution [LINK:n] text), shifting every following column.
 // Percent-encoding — rather than backslash-escaping — keeps the destination
 // a valid URL that survives copy-paste. Fast path: most destinations contain
 // none of these bytes.
 func escapeMarkdownURLDest(url string) string {
-	if !strings.ContainsAny(url, "() ") {
+	if !strings.ContainsAny(url, "() |") {
 		return url
 	}
 	return markdownURLDestReplacer.Replace(url)
@@ -498,7 +535,7 @@ func (p *Processor) processContentWithContext(ctx context.Context, htmlContent s
 // Use this when you have a file path instead of raw bytes.
 //
 // Returns the same errors as [Processor.Extract], plus a *FileError wrapping
-// ErrFileNotFound, ErrInvalidFilePath, or a path-traversal rejection for
+// ErrFileNotFound or ErrInvalidFilePath, or a path-traversal rejection (which wraps ErrInvalidFilePath) for
 // file-access failures.
 func (p *Processor) ExtractFromFile(filePath string) (*Result, error) {
 	return recoverPanic(func() (*Result, error) {
@@ -864,7 +901,8 @@ func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string, 
 	// caller asked for when that format is "none".
 	images, links := p.extractImagesAndLinks(contentNode,
 		p.config.PreserveImages || needsImageTokens,
-		p.config.PreserveLinks || needsLinkTokens)
+		p.config.PreserveLinks || needsLinkTokens,
+		false)
 	if p.config.PreserveImages {
 		result.Images = images
 	}
@@ -895,9 +933,17 @@ func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string, 
 		text := internal.CleanTextBytes(tb.Bytes())
 		internal.PutTrackedBuilder(tb)
 
-		// Apply formatters in order: images first, then links. A "none"
-		// formatter returns its input unchanged.
-		result.Text = p.formatInlineLinks(p.formatInlineImages(text, images, imageFormat), links, linkFormat)
+		// Apply formatters in order: links first, then images. Link labels
+		// may carry [IMAGE:n] placeholders through (see formatInlineLinks),
+		// and the image pass nests their markdown inside the constructs; a
+		// "none" formatter returns its input unchanged. The substitution can
+		// collapse a placeholder to nothing (an empty-label anchor with no
+		// usable href), leaving the two spaces that flanked the token
+		// adjacent — re-normalize so Text carries the same single-space form
+		// the plain path produces (safe now that the table renderer emits no
+		// column-width padding for it to fold).
+		result.Text = internal.CleanTextBytes([]byte(
+			p.formatInlineImages(p.formatInlineLinks(text, links, images, linkFormat), images, imageFormat)))
 	} else {
 		result.Text = p.extractTextContent(contentNode, p.config.TableFormat)
 	}
@@ -953,13 +999,7 @@ func stripExactSiteNameSuffix(title, siteName string) string {
 		return title
 	}
 	for _, sep := range titleSeparators {
-		idx := strings.LastIndex(title, sep)
-		if idx <= 0 {
-			continue
-		}
-		before := strings.TrimSpace(title[:idx])
-		after := strings.TrimSpace(title[idx+len(sep):])
-		if before != "" && strings.EqualFold(after, siteName) {
+		if before, after, ok := splitAtLastSeparator(title, sep); ok && strings.EqualFold(after, siteName) {
 			return before
 		}
 	}
@@ -974,9 +1014,9 @@ func (p *Processor) extractTitle(doc, contentNode *stdxhtml.Node, method string)
 	// traversal. The previous implementation issued up to three separate
 	// FindElementByTag calls (one full tree walk each); documents lacking a
 	// <title> or <h1> — common — paid for all three. The nil guards keep
-	// the FIRST occurrence of each tag: without them the walk (which runs
-	// until all three candidates are found) kept overwriting the candidates,
-	// so the fallback title became the LAST h1/h2 before the stopping point.
+	// the FIRST occurrence of each tag: without them the walk kept
+	// overwriting the candidates, so the fallback title became the LAST
+	// h1/h2 it saw.
 	var titleNode, h1Node, h2Node *stdxhtml.Node
 	internal.WalkNodes(doc, func(n *stdxhtml.Node) bool {
 		if n.Type == stdxhtml.ElementNode {
@@ -995,7 +1035,11 @@ func (p *Processor) extractTitle(doc, contentNode *stdxhtml.Node, method string)
 				}
 			}
 		}
-		// Keep walking until all three candidates have been located.
+		// Returning false only prunes descent into this node's subtree — the
+		// walk itself keeps draining its stack, so this is a pruning hint,
+		// not a termination. Once all three candidates are located, every
+		// remaining stacked node returns false too; the nil guards above keep
+		// the first occurrence of each tag.
 		return titleNode == nil || h1Node == nil || h2Node == nil
 	})
 	if titleNode != nil {
@@ -1030,6 +1074,25 @@ func (p *Processor) extractTitle(doc, contentNode *stdxhtml.Node, method string)
 // later one is considered.
 var titleSeparators = []string{" - ", " | ", " · ", " – ", " — ", " » ", " « "}
 
+// splitAtLastSeparator splits title at the last occurrence of sep, returning
+// the trimmed halves. ok is false when sep does not occur at a usable
+// position — absent, at index 0 (no leading half), or with either trimmed
+// half empty. It backs both title-suffix strippers so the separator scan
+// exists exactly once: the exact-match and heuristic policies differ (see
+// stripExactSiteNameSuffix vs stripSiteName), the split mechanics must not.
+func splitAtLastSeparator(title, sep string) (before, after string, ok bool) {
+	idx := strings.LastIndex(title, sep)
+	if idx <= 0 {
+		return "", "", false
+	}
+	before = strings.TrimSpace(title[:idx])
+	after = strings.TrimSpace(title[idx+len(sep):])
+	if before == "" || after == "" {
+		return "", "", false
+	}
+	return before, after, true
+}
+
 // maxSiteNameSuffixLen is the longest trailing segment that stripSiteName will
 // treat as a site name. A page's site name is a short proper noun ("Example
 // News", "Acme Corp"); a genuinely long second part of a two-part title is not
@@ -1050,13 +1113,8 @@ func (p *Processor) stripSiteName(title string) string {
 		return ""
 	}
 	for _, sep := range titleSeparators {
-		idx := strings.LastIndex(title, sep)
-		if idx <= 0 {
-			continue
-		}
-		before := strings.TrimSpace(title[:idx])
-		after := strings.TrimSpace(title[idx+len(sep):])
-		if before == "" || after == "" {
+		before, after, ok := splitAtLastSeparator(title, sep)
+		if !ok {
 			continue
 		}
 		if len(after) <= maxSiteNameSuffixLen && len(before) >= 3 {
@@ -1237,10 +1295,140 @@ func writeMarkdownInline(tb *table.TrackedBuilder, image bool, label, url string
 		_ = tb.WriteByte('!')
 	}
 	_ = tb.WriteByte('[')
-	_, _ = tb.WriteString(escapeMarkdownText(label))
+	if image {
+		_, _ = tb.WriteString(escapeMarkdownText(label))
+	} else {
+		// A link label may still carry [IMAGE:n] placeholders (links are
+		// substituted before images); they must survive verbatim so the image
+		// pass can nest real image markdown inside the construct —
+		// [text ![alt](img)](url), the linked-image idiom.
+		_, _ = tb.WriteString(escapeMarkdownLinkLabel(label))
+	}
 	_, _ = tb.WriteString("](")
 	_, _ = tb.WriteString(escapeMarkdownURLDest(url))
 	_ = tb.WriteByte(')')
+}
+
+// escapeMarkdownLinkLabel escapes a link label exactly like escapeMarkdownText
+// except that [IMAGE:n] placeholders pass through verbatim (see
+// writeMarkdownInline): escaping them would turn the later nested image
+// markdown into literal bracket text.
+func escapeMarkdownLinkLabel(s string) string {
+	if !strings.ContainsAny(s, `\[]|`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); {
+		if s[i] == '[' && strings.HasPrefix(s[i:], "[IMAGE:") {
+			if end := imageTokenEnd(s, i); end > 0 {
+				b.WriteString(s[i:end])
+				i = end
+				continue
+			}
+		}
+		switch s[i] {
+		case '\\', '[', ']', '|':
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// imageTokenEnd returns the index just past a well-formed [IMAGE:<digits>]
+// token starting at i, or 0 when the span starting there is not one.
+func imageTokenEnd(s string, i int) int {
+	j := i + len("[IMAGE:")
+	start := j
+	for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+		j++
+	}
+	if j > start && j < len(s) && s[j] == ']' {
+		return j + 1
+	}
+	return 0
+}
+
+// normalizeLinkLabelText reshapes a link label that contains image
+// placeholders (links are substituted before images):
+//   - decorative images (empty alt) are dropped — a menu icon carries nothing
+//     a text consumer needs;
+//   - a label left with images only (a logo link) becomes the non-decorative
+//     images' alt texts joined by spaces — the accessible-name convention;
+//   - a mixed label keeps its text plus the non-decorative image placeholders,
+//     so the image pass can nest real image markdown inside the construct —
+//     whichever order the text and images appear in;
+//   - a well-formed marker that matches no image is page text that looks like
+//     a token; it stays literally (the same policy as an unpaired [LINK:n]
+//     marker) instead of being deleted only on image-bearing pages.
+//
+// The result is whitespace-collapsed; a label reduced to nothing keeps the
+// caller's "Link N" fallback intact (empty return).
+func normalizeLinkLabelText(label string, images []ImageInfo) string {
+	if !strings.Contains(label, "[IMAGE:") || len(images) == 0 {
+		return label
+	}
+	var b strings.Builder
+	b.Grow(len(label))
+	hasText := false
+	var alts []string
+	i := 0
+	for i < len(label) {
+		if label[i] == '[' && strings.HasPrefix(label[i:], "[IMAGE:") {
+			if end := imageTokenEnd(label, i); end > 0 {
+				span := label[i:end]
+				if img, ok := imageByPosition(images, span[len("[IMAGE:"):len(span)-1]); ok {
+					// Decorative images (empty alt) are dropped. Non-decorative
+					// ones keep their token unconditionally: a mixed label
+					// keeps it whether the text was seen before OR after the
+					// token (the image pass nests its markdown inside the
+					// construct), and the images-only case below returns the
+					// alt-text join and discards b wholesale — so an icon that
+					// precedes the label text is not silently lost.
+					if alt := strings.TrimSpace(img.Alt); alt != "" {
+						alts = append(alts, alt)
+						b.WriteString(span)
+					}
+					i = end
+					continue
+				}
+				// A well-formed marker that resolves to no image is page
+				// text that looks like a token: emit it literally rather than
+				// deleting the words — image-less labels keep such text
+				// verbatim (early return above), so image-bearing ones must
+				// too.
+				b.WriteString(span)
+				hasText = true
+				i = end
+				continue
+			}
+		}
+		if c := label[i]; c != ' ' && c != '\t' {
+			hasText = true
+		}
+		b.WriteByte(label[i])
+		i++
+	}
+	if !hasText && len(alts) > 0 {
+		return strings.Join(alts, " ")
+	}
+	return collapseInlineSpace(b.String())
+}
+
+// imageByPosition looks an image up by its [IMAGE:n] position digits.
+func imageByPosition(images []ImageInfo, digits string) (ImageInfo, bool) {
+	pos, err := strconv.Atoi(digits)
+	if err != nil {
+		return ImageInfo{}, false
+	}
+	for i := range images {
+		if images[i].Position == pos {
+			return images[i], true
+		}
+	}
+	return ImageInfo{}, false
 }
 
 // writeHTMLAttr writes a quoted HTML attribute, escaping the value so it
@@ -1283,7 +1471,10 @@ func (p *Processor) formatInlineImages(textWithPlaceholders string, images []Ima
 			if images[i].Position == 0 {
 				continue
 			}
-			altText := images[i].Alt
+			// Collapse like link labels (see collapseInlineSpace): a
+			// multiline or space-padded alt breaks the inline markdown
+			// construct exactly as a newline-bearing label would.
+			altText := collapseInlineSpace(images[i].Alt)
 			if altText == "" {
 				altText = "Image " + strconv.Itoa(images[i].Position)
 			}
@@ -1337,8 +1528,19 @@ func (p *Processor) formatInlineImages(textWithPlaceholders string, images []Ima
 	return textWithPlaceholders
 }
 
-func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkInfo, format string) string {
-	if len(links) == 0 || format == "none" {
+// formatInlineLinks substitutes [LINK:n]…[/LINK] placeholders. It runs BEFORE
+// formatInlineImages (its output may still carry [IMAGE:n] tokens — inside
+// link labels they become nested image markdown on the image pass), and
+// images is the section's image list: labels holding only images take their
+// alt texts (a logo link), and decorative (empty-alt) images are dropped
+// from labels (a menu icon). See normalizeLinkLabelText.
+func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkInfo, images []ImageInfo, format string) string {
+	// No len(links) guard here: a document whose every anchor carries an
+	// invalid href still emits [LINK:n] tokens (each <a> consumes a
+	// position), and returning early on the empty list would leak them into
+	// the output. The contains-token fast check below covers the common
+	// no-token case, and unknown positions render their label text.
+	if format == "none" {
 		return textWithPlaceholders
 	}
 
@@ -1395,8 +1597,12 @@ func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkI
 					found := false
 					for textStart < noEndTagFrom && j <= n-len(endTag) {
 						if textWithPlaceholders[j] == '[' && textWithPlaceholders[j:j+7] == endTag {
-							// Found the closing tag
-							linkText := textWithPlaceholders[textStart:j]
+							// Found the closing tag. Reshape the label: collapse
+							// whitespace (block children inside the anchor put
+							// newlines here), then apply the image rules —
+							// decorative icons dropped, images-only labels
+							// become their alt texts.
+							linkText := normalizeLinkLabelText(collapseInlineSpace(textWithPlaceholders[textStart:j]), images)
 
 							link, ok := linkMap[position]
 							if !ok {
@@ -1475,7 +1681,15 @@ var (
 // The two counters are independent, so one walk yields the same results as the
 // previous two. Pass wantImages/wantLinks false to skip (and avoid allocating)
 // a kind; the traversal runs at most once.
-func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantLinks bool) (images []ImageInfo, links []LinkInfo) {
+//
+// chromeMode selects the skip policy of the reader-mode chrome sections: the
+// walk prunes raw-text subtrees (IsRawTextElement) to mirror
+// ExtractChromeTextWithStructure, the pass those sections' [LINK:n]/[IMAGE:n]
+// tokens are emitted by. The default (content) mode prunes nothing: on the
+// article path CleanContentNode has already removed every subtree the text
+// pass would skip, so an unpruned walk observes the same nodes. Pass node
+// itself is never pruned in either mode.
+func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantLinks, chromeMode bool) (images []ImageInfo, links []LinkInfo) {
 	if !wantImages && !wantLinks {
 		return nil, nil
 	}
@@ -1496,6 +1710,9 @@ func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantL
 	// (extractTextWithStructure): unmatched [IMAGE:n]/[LINK:n] tokens would
 	// otherwise leak into Text and their URLs would be dropped.
 	internal.WalkNodes(node, func(n *stdxhtml.Node) bool {
+		if chromeMode && n != node && n.Type == stdxhtml.ElementNode && internal.IsRawTextElement(n.Data) {
+			return false
+		}
 		if n.Type != stdxhtml.ElementNode {
 			return true
 		}
@@ -1788,12 +2005,12 @@ func containsLowConfidencePhrase(text string) bool {
 }
 
 // publishedTimeLayouts are the timestamp layouts metadata producers actually
-// emit, most specific first: RFC 3339 with and without fractional seconds,
-// timezone-less ISO-ish forms (with seconds and minute precision), and a
-// bare date.
+// emit, most specific first: RFC 3339 (time.Parse accepts an optional
+// fractional-seconds field even when the layout does not signify one, so a
+// separate RFC3339Nano layout is unnecessary), timezone-less ISO-ish forms
+// (with seconds and minute precision), and a bare date.
 var publishedTimeLayouts = [...]string{
 	time.RFC3339,
-	time.RFC3339Nano,
 	"2006-01-02T15:04:05",
 	"2006-01-02 15:04:05",
 	"2006-01-02 15:04",

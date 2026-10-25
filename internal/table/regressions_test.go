@@ -10,11 +10,13 @@ package table
 //     cells expanded into tens of millions of CellData), and maxGridCells
 //     clamps the numRows x maxCols rendering grid that padTableColumns /
 //     applyRowspanGrid / per-column slices allocate;
-//   - calculateMaxColumnWidths counts the escape sequences
-//     writeMarkdownCellText emits, so a cell containing '|' or '\' no longer
-//     renders one character wider than its padded column;
 //   - TrackedBuilder.SecureClear (pool secure-clear support) and the
 //     getRenderer format dispatch that replaced the unused registry.
+//
+// The former width-escape regressions (column-width counting and padded-row
+// alignment) were removed with the padding machinery itself: public output
+// passes through CleanTextBytes, which collapses the padding, so the
+// machinery was deleted (owner decision) rather than kept aligned.
 
 import (
 	"strconv"
@@ -129,7 +131,7 @@ func TestExtractTableDataExpansionCapMultiRow(t *testing.T) {
 	const rows, colspan = 100, 1000
 	markup := "<table>" + strings.Repeat(`<tr><td colspan="1000">x</td></tr>`, rows) + "</table>"
 	p := NewProcessor(capTestAccessor{}, capTestWalker{})
-	data := p.extractTableData(parseCapTestTable(t, markup), "markdown")
+	data := p.extractTableData(parseCapTestTable(t, markup), "markdown", nil)
 
 	total := 0
 	for _, row := range data {
@@ -156,7 +158,7 @@ func TestExtractTableDataExpansionCap(t *testing.T) {
 
 	markup := "<table><tr>" + strings.Repeat(`<td colspan="1000">x</td>`, 20) + "</tr></table>"
 	p := NewProcessor(capTestAccessor{}, capTestWalker{})
-	rows := p.extractTableData(parseCapTestTable(t, markup), "markdown")
+	rows := p.extractTableData(parseCapTestTable(t, markup), "markdown", nil)
 
 	total := 0
 	for _, row := range rows {
@@ -235,63 +237,6 @@ func TestCalculateMaxColumnsRowspanOffset(t *testing.T) {
 // Escaped-cell column widths (from width_escape_regression_test.go)
 // ---------------------------------------------------------------------------
 
-func TestColumnWidthCountsEscapes(t *testing.T) {
-	t.Parallel()
-
-	td := [][]CellData{
-		{{Text: "a|b"}, {Text: "x"}},
-		{{Text: "ccc"}, {Text: "yy"}},
-	}
-	w := calculateMaxColumnWidths(td, 2)
-
-	// "a|b" has 3 runes but renders as "a\|b" (4 chars), so the column pads
-	// to 4 and the plain "ccc" row aligns with it.
-	if w[0] != 4 {
-		t.Errorf("column width = %d, want 4 (rune count plus pipe escape)", w[0])
-	}
-	if w[1] != 2 {
-		t.Errorf("plain column width = %d, want 2", w[1])
-	}
-}
-
-// TestMarkdownRowsAlignWithEscapedCells is the end-to-end counterpart: the
-// renderer's per-cell padding must measure the same width
-// calculateMaxColumnWidths used. It previously counted runes only, so a cell
-// containing '|' or '\' rendered wider than its column — the header row and
-// the escaped data row came out different lengths.
-func TestMarkdownRowsAlignWithEscapedCells(t *testing.T) {
-	t.Parallel()
-
-	td := [][]CellData{
-		{{Text: "head"}, {Text: "x"}},
-		{{Text: "a|b"}, {Text: "y"}},
-		{{Text: "abcd"}, {Text: "z"}},
-		{{Text: `back\slash`}, {Text: "w"}},
-	}
-
-	var tb TrackedBuilder
-	extractTableAsMarkdown(td, &tb, 2)
-
-	var widths []int
-	for _, line := range strings.Split(strings.TrimRight(tb.String(), "\n"), "\n") {
-		// The separator row carries fixed-width alignment markers and is not
-		// padded to the column width by design.
-		if strings.Contains(line, "---") {
-			continue
-		}
-		widths = append(widths, len(line))
-	}
-	if len(widths) < 2 {
-		t.Fatalf("unexpected output: %q", tb.String())
-	}
-	for i := 1; i < len(widths); i++ {
-		if widths[i] != widths[0] {
-			t.Fatalf("row %d rendered %d bytes wide, header row %d — cells containing a pipe or backslash knock the row out of alignment:\n%s",
-				i, widths[i], widths[0], tb.String())
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Builder and renderer dispatch (from p2_regression_test.go)
 // ---------------------------------------------------------------------------
@@ -320,5 +265,58 @@ func TestGetRendererDispatch(t *testing.T) {
 	}
 	if _, ok := getRenderer("no-such-format").(*MarkdownRenderer); !ok {
 		t.Error("unknown format did not fall back to MarkdownRenderer")
+	}
+}
+
+// TestExtractWithCellTextOverride pins the cell-text override at the table
+// layer (the root package exercises it end-to-end through ReadPage's section
+// rendering; ExtractWithCellText and its appendRowCells callback branches had
+// no in-package test): cellText replaces the accessor's GetTextContent for
+// td/th cells, it is invoked with the result DISCARDED for non-cell row
+// children so shared counters stay aligned (the counter-burn contract), and
+// a nil callback renders exactly like Extract.
+func TestExtractWithCellTextOverride(t *testing.T) {
+	t.Parallel()
+
+	const markup = `<table>
+		<tr><th id="h">Head</th></tr>
+		<tr><td id="c">cell</td><template id="tpl"><a href="/x">burned</a></template></tr>
+	</table>`
+
+	var sawHeader, sawCell, sawTemplate bool
+	cellText := func(n *html.Node) string {
+		switch n.Data {
+		case "th":
+			sawHeader = true
+		case "td":
+			sawCell = true
+		case "template":
+			sawTemplate = true // counter-burn call: text discarded
+		}
+		return "CB:" + n.Data
+	}
+
+	p := NewProcessor(capTestAccessor{}, capTestWalker{})
+	tb := NewTrackedBuilder()
+	p.ExtractWithCellText(parseCapTestTable(t, markup), tb, "markdown", cellText)
+	out := tb.String()
+
+	if !strings.Contains(out, "CB:th") || !strings.Contains(out, "CB:td") {
+		t.Errorf("cell-text override did not reach the rendered cells: %q", out)
+	}
+	if !sawHeader || !sawCell || !sawTemplate {
+		t.Errorf("callback coverage: header=%v cell=%v template-burn=%v, want all true", sawHeader, sawCell, sawTemplate)
+	}
+	if strings.Contains(out, "burned") {
+		t.Errorf("template counter-burn call leaked its text into the row: %q", out)
+	}
+
+	// A nil callback takes the accessor path and matches Extract byte-for-byte.
+	tbl := parseCapTestTable(t, markup)
+	tbNil, tbPlain := NewTrackedBuilder(), NewTrackedBuilder()
+	p.ExtractWithCellText(tbl, tbNil, "markdown", nil)
+	p.Extract(tbl, tbPlain, "markdown")
+	if tbNil.String() != tbPlain.String() {
+		t.Errorf("nil cellText diverged from Extract:\n%q\n%q", tbNil.String(), tbPlain.String())
 	}
 }

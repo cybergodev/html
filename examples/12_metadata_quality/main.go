@@ -157,7 +157,9 @@ func main() {
 	fmt.Println("  CanonicalURL:  <link rel=canonical> > og:url")
 	fmt.Println()
 	fmt.Println("Quality signals:")
-	fmt.Println("  Confidence: 1.0 clean article | 0.6 listing or short article | 0.4 thin/paywall")
+	fmt.Println("  Confidence: 1.0 clean article | 0.8 article under 5% of body text")
+	fmt.Println("              0.6 listing / short article / long body fallback")
+	fmt.Println("              0.4 thin article / paywall stub | 0.2 short body | 0 empty")
 	fmt.Println("  ExtractionMethod: article | listing | body (fallback)")
 	fmt.Println("  Config.ExtractMetadata=false disables collection")
 }

@@ -135,7 +135,7 @@ type Config struct {
 
 	// === Output Formats ===
 	InlineImageFormat string // How images are formatted in text output. Options: "none", "markdown", "html", "placeholder". Default: "none".
-	InlineLinkFormat  string // How links are formatted in text output. Options: "none", "markdown", "html". Default: "none".
+	InlineLinkFormat  string // How links are formatted in text output. Options: "none", "markdown", "html". Default: "none". Reader mode (ReadPage*) always preserves links and treats "none" as "markdown"; "none" applies to the Extract family only.
 	TableFormat       string // How tables are formatted in output. Options: "markdown", "html". Default: "markdown".
 	Encoding          string // Character encoding of input HTML. Leave empty for auto-detection. Common: "utf-8", "windows-1252", "gbk".
 

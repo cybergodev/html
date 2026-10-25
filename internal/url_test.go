@@ -3,86 +3,6 @@ package internal
 
 import "testing"
 
-func TestExtractDomain(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		url  string
-		want string
-	}{
-		{
-			name: "HTTP URL with path",
-			url:  "http://example.com/path",
-			want: "example.com",
-		},
-		{
-			name: "HTTPS URL with path",
-			url:  "https://example.com/path/to/page",
-			want: "example.com",
-		},
-		{
-			name: "HTTP URL without path",
-			url:  "http://example.com",
-			want: "example.com",
-		},
-		{
-			name: "HTTPS URL without path",
-			url:  "https://example.com",
-			want: "example.com",
-		},
-		{
-			name: "protocol-relative URL with path",
-			url:  "//example.com/path",
-			want: "example.com",
-		},
-		{
-			name: "protocol-relative URL without path",
-			url:  "//example.com",
-			want: "example.com",
-		},
-		{
-			name: "URL with port",
-			url:  "http://example.com:8080/path",
-			want: "example.com:8080",
-		},
-		{
-			name: "URL with subdomain",
-			url:  "https://sub.example.com/path",
-			want: "sub.example.com",
-		},
-		{
-			name: "relative path returns empty (no domain)",
-			url:  "/path/to/page",
-			want: "",
-		},
-		{
-			name: "empty string",
-			url:  "",
-			want: "",
-		},
-		{
-			name: "no scheme and no leading slash",
-			url:  "example.com",
-			want: "example.com",
-		},
-		{
-			name: "complex URL with query and fragment",
-			url:  "https://example.com/path?query=value#fragment",
-			want: "example.com",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ExtractDomain(tt.url)
-			if got != tt.want {
-				t.Errorf("ExtractDomain(%q) = %q, want %q", tt.url, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestExtractBaseFromURL(t *testing.T) {
 	t.Parallel()
 
@@ -401,129 +321,6 @@ func TestResolveURL(t *testing.T) {
 	}
 }
 
-func TestIsDifferentDomain(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		baseURL   string
-		targetURL string
-		want      bool
-	}{
-		{
-			name:      "same domain HTTP",
-			baseURL:   "http://example.com/path1",
-			targetURL: "http://example.com/path2",
-			want:      false,
-		},
-		{
-			name:      "same domain HTTPS",
-			baseURL:   "https://example.com/path1",
-			targetURL: "https://example.com/path2",
-			want:      false,
-		},
-		{
-			name:      "different domains",
-			baseURL:   "http://example.com/path",
-			targetURL: "http://other.com/path",
-			want:      true,
-		},
-		{
-			name:      "different subdomains same domain",
-			baseURL:   "http://sub1.example.com/path",
-			targetURL: "http://sub2.example.com/path",
-			want:      true,
-		},
-		{
-			name:      "HTTP vs HTTPS same domain",
-			baseURL:   "http://example.com/path",
-			targetURL: "https://example.com/path",
-			want:      false,
-		},
-		{
-			name:      "same domain with port",
-			baseURL:   "http://example.com:8080/path",
-			targetURL: "http://example.com:8080/other",
-			want:      false,
-		},
-		{
-			name:      "same domain different ports",
-			baseURL:   "http://example.com:8080/path",
-			targetURL: "http://example.com:9090/other",
-			want:      true,
-		},
-		{
-			name:      "base URL is relative path",
-			baseURL:   "/path/to/page",
-			targetURL: "http://example.com/other",
-			want:      false,
-		},
-		{
-			name:      "target URL is relative path",
-			baseURL:   "http://example.com/path",
-			targetURL: "/other",
-			want:      false,
-		},
-		{
-			name:      "both are relative paths",
-			baseURL:   "/path1",
-			targetURL: "/path2",
-			want:      false,
-		},
-		{
-			name:      "protocol-relative URLs same domain",
-			baseURL:   "//example.com/path1",
-			targetURL: "//example.com/path2",
-			want:      false,
-		},
-		{
-			name:      "protocol-relative URLs different domains",
-			baseURL:   "//example.com/path",
-			targetURL: "//other.com/path",
-			want:      true,
-		},
-		{
-			name:      "empty base URL",
-			baseURL:   "",
-			targetURL: "http://example.com/path",
-			want:      false,
-		},
-		{
-			name:      "empty target URL",
-			baseURL:   "http://example.com/path",
-			targetURL: "",
-			want:      false,
-		},
-		{
-			name:      "both empty URLs",
-			baseURL:   "",
-			targetURL: "",
-			want:      false,
-		},
-		{
-			name:      "base is javascript URL",
-			baseURL:   "javascript:void(0)",
-			targetURL: "http://example.com/path",
-			want:      false,
-		},
-		{
-			name:      "target is javascript URL",
-			baseURL:   "http://example.com/path",
-			targetURL: "javascript:void(0)",
-			want:      false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := IsDifferentDomain(tt.baseURL, tt.targetURL)
-			if got != tt.want {
-				t.Errorf("IsDifferentDomain(%q, %q) = %v, want %v", tt.baseURL, tt.targetURL, got, tt.want)
-			}
-		})
-	}
-}
-
 // TestIsExternalURL_CaseInsensitiveScheme verifies scheme matching is
 // case-insensitive per RFC 3986 §3.1, matching browser behavior. A
 // case-sensitive test misclassifies uppercase-scheme URLs as relative/internal.
@@ -614,38 +411,15 @@ func TestResolveURLProtocolRelativeBase(t *testing.T) {
 }
 
 // url_authority_regression_test.go — pins the D-002 P1 authority-handling
-// fixes: ExtractDomain no longer scans '@' past the authority (profile URLs
-// like "/@alice" were misread as userinfo, extracting "alice" as the domain
-// and flagging same-site links as external), and the four base-URL builders
-// (ExtractBaseFromURL, NormalizeBaseURL, ResolveURL's rooted-reference
-// branch, asDirectoryBase) cut at the first '/', '?', or '#' after the
-// authority so a query/fragment-only tail can no longer end up inside the
-// base ("https://e.com?x=1/" corrupted every relative URL resolved against
-// it).
+// fixes for the base-URL builders (ExtractBaseFromURL, NormalizeBaseURL,
+// ResolveURL's rooted-reference branch, asDirectoryBase): they cut at the
+// first '/', '?', or '#' after the authority so a query/fragment-only tail
+// can no longer end up inside the base ("https://e.com?x=1/" corrupted every
+// relative URL resolved against it). (The ExtractDomain userinfo half of the
+// original fix was deleted with that production-dead helper.)
 
 func TestAuthorityDelimiters(t *testing.T) {
 	t.Parallel()
-
-	domainCases := []struct {
-		url  string
-		want string
-	}{
-		// '@' in the path is not userinfo.
-		{"https://example.com/@alice", "example.com"},
-		{"https://example.com/@alice/status/42", "example.com"},
-		// userinfo inside the authority still strips.
-		{"https://user:pass@example.com/path", "example.com"},
-		// query/fragment after the authority no longer leaks into the domain.
-		{"https://e.com?x=1", "e.com"},
-		{"https://e.com#top", "e.com"},
-		{"https://e.com/", "e.com"},
-		{"https://e.com/path", "e.com"},
-	}
-	for _, c := range domainCases {
-		if got := ExtractDomain(c.url); got != c.want {
-			t.Errorf("ExtractDomain(%q) = %q, want %q", c.url, got, c.want)
-		}
-	}
 
 	baseCases := []struct {
 		name string
@@ -672,16 +446,46 @@ func TestAuthorityDelimiters(t *testing.T) {
 	}
 }
 
-// TestSameSitePathUserLinkNotExternal pins the user-visible effect: with
-// IncludeExternalLinks disabled, a same-site "/@user" profile link must be
-// kept, while a genuinely external link must still be filtered.
-func TestSameSitePathUserLinkNotExternal(t *testing.T) {
+// TestNormalizeBaseURLProtocolRelativeWithPort pins the hasSchemePrefix guard:
+// a protocol-relative base with a port (or userinfo) contains ':' but has no
+// scheme, and the old strings.Contains(":") rejection disabled URL resolution
+// for every link on such pages while the port-less form worked.
+func TestNormalizeBaseURLProtocolRelativeWithPort(t *testing.T) {
 	t.Parallel()
 
-	if IsDifferentDomain("https://example.com/page", "https://example.com/@alice") {
-		t.Error("IsDifferentDomain misclassified a same-site /@user link as external")
+	cases := []struct{ in, want string }{
+		{"//static.example.com:8080/", "//static.example.com:8080/"},
+		{"//static.example.com:8080/assets/", "//static.example.com:8080/"},
+		{"//user:pass@cdn.example.com/", "//user:pass@cdn.example.com/"},
+		{"//plain.example.com/", "//plain.example.com/"},
+		{"javascript:x", ""},
+		{"about:blank", ""},
+		{"data:,x", ""},
+		{"https://e.com/x", "https://e.com/"},
 	}
-	if !IsDifferentDomain("https://example.com/page", "https://other.example.net/x") {
-		t.Error("IsDifferentDomain failed to classify a cross-site link as external")
+	for _, c := range cases {
+		if got := NormalizeBaseURL(c.in); got != c.want {
+			t.Errorf("NormalizeBaseURL(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestResolveURLQueryOnlyOverFragmentBase pins the RFC 3986 §5.3
+// query-reference rule on a fragment-bearing base: the base's fragment is
+// dropped even when a '?' appears inside it, instead of the new query being
+// appended after the fragment.
+func TestResolveURLQueryOnlyOverFragmentBase(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct{ base, ref, want string }{
+		{"http://e.com/p#f?x", "?q=1", "http://e.com/p?q=1"},
+		{"http://e.com/p#f", "?q=1", "http://e.com/p?q=1"},
+		{"http://e.com/p?f=1#frag", "?q=2", "http://e.com/p?q=2"},
+		{"http://e.com/p", "?q=1", "http://e.com/p?q=1"},
+	}
+	for _, c := range cases {
+		if got := ResolveURL(c.base, c.ref); got != c.want {
+			t.Errorf("ResolveURL(%q, %q) = %q, want %q", c.base, c.ref, got, c.want)
+		}
 	}
 }

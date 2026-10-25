@@ -471,7 +471,11 @@ func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
 		if p.audit != nil {
 			p.audit.RecordPathTraversal(filePath)
 		}
-		return nil, newFileError("ReadFile", filePath, fmt.Errorf("path traversal detected: %s", cleanPath))
+		// Wrapping ErrInvalidFilePath makes the rejection match errors.Is —
+		// FileError's own doc promises ErrFileNotFound/ErrInvalidFilePath
+		// checking, and before this the traversal case matched neither,
+		// leaving string-matching on Error() as the only detection.
+		return nil, newFileError("ReadFile", filePath, fmt.Errorf("path traversal detected: %s: %w", cleanPath, ErrInvalidFilePath))
 	}
 
 	// Enforce AllowedBaseDir restriction when configured. Containment is verified

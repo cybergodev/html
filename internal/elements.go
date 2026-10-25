@@ -31,9 +31,6 @@ func IsKnownInlineNamespacePrefix(prefix string) bool {
 	return knownInlineNamespacePrefixes[prefix]
 }
 
-// IsBlockElement returns true if the tag is a known block-level element.
-// Block elements add newlines and paragraph spacing.
-//
 // isBlockElementForScoring reports whether a tag is a block-level element that
 // should count toward a candidate's blockCount. It is deliberately narrower than
 // IsBlockElement: table-cell wrappers (td/th/tr) and structural shells
@@ -128,6 +125,21 @@ func IsInlineElement(tag string) bool {
 func IsNonContentElement(tag string) bool {
 	switch tag {
 	case "script", "style", "noscript", "nav", "aside", "footer", "header":
+		return true
+	}
+	return false
+}
+
+// IsRawTextElement reports whether the tag's subtree is raw text (script/
+// style code), inert metadata, or a template fragment — content that must be
+// skipped in EVERY extraction mode. It is the complete skip policy for
+// page-chrome regions (ExtractChromeTextWithStructure), where content-oriented
+// skipping must not apply: a header's nested <nav> menu is the region's
+// substance, but a stray <script> is noise in a nav bar just as it is in an
+// article.
+func IsRawTextElement(tag string) bool {
+	switch tag {
+	case "script", "style", "noscript", "template":
 		return true
 	}
 	return false

@@ -84,6 +84,21 @@ func TestSanitizeHTML(t *testing.T) {
 	}
 }
 
+func TestSanitizeHTMLEmptyStylePreserved(t *testing.T) {
+	t.Parallel()
+
+	// style="" is vacuously safe — sanitizeStyleValue("") returns "" as its
+	// "unchanged input" answer, which must not be read as "blocked": the
+	// empty attribute stays instead of being removed as a blocked attribute.
+	out := SanitizeHTML(`<div style="">keep</div>`)
+	if !strings.Contains(out, `style=""`) {
+		t.Errorf("empty style attribute removed from output: %q", out)
+	}
+	if !strings.Contains(out, "keep") {
+		t.Errorf("element content lost: %q", out)
+	}
+}
+
 func BenchmarkSanitizeHTML(b *testing.B) {
 	htmlContent := `<html><body><div>Content<script>alert('test')</script><style>body{}</style><noscript>No JS</noscript>More</div></body></html>`
 
@@ -982,8 +997,14 @@ func referenceContainsDangerousScheme(uri string) bool {
 		isDangerousScheme(lowerURI, "file:") {
 		return true
 	}
-	if strings.HasPrefix(trimmed, "//") {
-		restLower := strings.ToLower(strings.TrimLeft(trimmed[2:], " \t\n\r"))
+	if strings.HasPrefix(schemeStripped, "//") {
+		// Mirror production's protocolRelativeRemainder policy, which keys
+		// the "//" test off schemeStripped (C0-stripped on both sides) and
+		// strips the full C0-or-space set after the slashes. The pre-fix
+		// reference keyed off trimmed (C0 prefix retained) with a
+		// " \t\n\r"-only TrimLeft — both halves of the C0 bypass that
+		// production fixed (see TestProtocolRelativeC0Bypass).
+		restLower := strings.ToLower(stripURLWhitespace(strings.TrimLeft(schemeStripped[2:], c0ControlOrSpace)))
 		if isDangerousScheme(restLower, "javascript:") ||
 			isDangerousScheme(restLower, "vbscript:") ||
 			isDangerousScheme(restLower, "data:") ||
@@ -1009,6 +1030,7 @@ func TestContainsDangerousSchemeFastPathEquivalence(t *testing.T) {
 		"\x01javascript:alert(1)",
 		" javascript:alert(1)",
 		"//javascript:alert(1)",
+		"\x01\x02//javascript:alert(1)", // C0 before the scheme: the pre-fix oracle diverged here
 		"// javascript:alert(1)",
 		"//vbscript:x",
 		"//data:text/html,x",

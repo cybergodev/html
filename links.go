@@ -296,7 +296,14 @@ func (p *Processor) detectBaseURL(doc *stdxhtml.Node) string {
 	if baseNode := internal.FindElementByTag(doc, "base"); baseNode != nil {
 		for _, attr := range baseNode.Attr {
 			if attr.Key == "href" && attr.Val != "" {
-				return internal.NormalizeBaseURL(attr.Val)
+				// A <base> value that normalizes to nothing (about:blank,
+				// data:, …) is not a usable base: fall through to the
+				// canonical / og:url / first-absolute-href ladder below
+				// instead of disabling URL resolution for the whole document.
+				if u := internal.NormalizeBaseURL(attr.Val); u != "" {
+					return u
+				}
+				break
 			}
 		}
 	}

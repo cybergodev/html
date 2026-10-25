@@ -17,9 +17,6 @@ package html_test
 //     processor instead of dropping them.
 //   - raw-HTML attribute values are entity-decoded so media URLs extracted
 //     from sanitizer-removed tags match their DOM-extracted counterparts.
-//   - RFC 3986 case-insensitive data: URL schemes: "DATA:text/html,…" is
-//     rejected from link extraction exactly like "data:text/html,…", while a
-//     whitelisted "DATA:image/png" image survives sanitization.
 //   - the inline placeholder contract between the text pass and
 //     extractImagesAndLinks: dispatched tables burn [IMAGE:n]/[LINK:n]
 //     positions for their subtree, and enabling only one of
@@ -278,65 +275,11 @@ func TestExtractToMarkdownForwardsAudit(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// data: URL scheme case-insensitivity (from dataurl_case_regression_test.go)
-// ---------------------------------------------------------------------------
-
-// TestScriptableDataURLCaseInsensitive verifies that uppercase/mixed-case
-// scriptable data URLs are rejected from link extraction exactly like their
-// lowercase form.
-func TestScriptableDataURLCaseInsensitive(t *testing.T) {
-	t.Parallel()
-
-	p, err := html.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = p.Close() }()
-
-	doc := `<html><body>
-<a href="DATA:text/html,%3Cscript%3Ealert(1)%3E/script%3E">evil-upper</a>
-<a href="Data:image/svg+xml,%3Csvg%3E">svg-mixed</a>
-<a href="data:text/html,%3Cscript%3Ealert(1)%3E/script%3E">evil-lower</a>
-<a href="https://go.dev">safe</a>
-</body></html>`
-	links, err := p.ExtractAllLinks([]byte(doc))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(links) != 1 || links[0].URL != "https://go.dev" {
-		for _, l := range links {
-			low := strings.ToLower(l.URL)
-			if strings.HasPrefix(low, "data:text/html") || strings.HasPrefix(low, "data:image/svg") {
-				t.Errorf("scriptable data URL returned by ExtractAllLinks: %s", l.URL)
-			}
-		}
-		t.Errorf("expected only the safe link, got %v", links)
-	}
-}
-
-// TestUppercaseSafeDataURLImageExtracted verifies the functionality half of
-// the fix: browsers accept "DATA:" schemes, so a whitelisted media type in
-// any case must survive sanitization and appear in Images.
-func TestUppercaseSafeDataURLImageExtracted(t *testing.T) {
-	t.Parallel()
-
-	cfg := html.DefaultConfig()
-	cfg.BaseURL = "https://site.com/page"
-	p, err := html.New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = p.Close() }()
-
-	res, err := p.Extract([]byte(`<html><body><img src="DATA:image/png;base64,iVBORw0KGgo=" alt="dot"></body></html>`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Images) != 1 || res.Images[0].URL != "DATA:image/png;base64,iVBORw0KGgo=" {
-		t.Errorf("uppercase safe data-URL image not extracted: %+v", res.Images)
-	}
-}
+// The RFC 3986 data:-scheme case regressions (DATA:text/html rejected,
+// DATA:image/png kept) moved to security_test.go: they pin the same
+// safeMediaTypes whitelist as TestExtractAllLinksRejectsScriptableDataURLs
+// and TestDataURLInjection, through the same entry points with only the
+// letter case differing.
 
 // ---------------------------------------------------------------------------
 // Inline placeholder contract (from placeholder_regression_test.go)
@@ -344,10 +287,14 @@ func TestUppercaseSafeDataURLImageExtracted(t *testing.T) {
 
 // TestTableDoesNotShiftInlinePlaceholders extracts a document whose table
 // cells contain an image and a link between two paragraph-level elements.
-// Before the fix, the table's elements were numbered by
+// The original bug: the table's elements were numbered by
 // extractImagesAndLinks but never by the text pass, so every placeholder
 // after the table substituted the wrong entry (the outro image rendered the
-// table's image, and the table's link never appeared).
+// table's image, and the table's link never appeared). Since the token-aware
+// table path landed, cell anchors and images emit their own placeholders, so
+// the cells render real [T](URL)/![B](url) constructs — and the numbering
+// discipline this test was born from still holds: the outro elements must
+// resolve to their own entries.
 func TestTableDoesNotShiftInlinePlaceholders(t *testing.T) {
 	t.Parallel()
 
@@ -377,11 +324,13 @@ func TestTableDoesNotShiftInlinePlaceholders(t *testing.T) {
 	if !strings.Contains(res.Text, "[O](https://outro.example/o)") {
 		t.Errorf("outro link markdown missing: %q", res.Text)
 	}
-	if strings.Contains(res.Text, "![B](/b.png)") {
-		t.Errorf("table-cell image substituted into inline text: %q", res.Text)
+	// Table cells now carry their own placeholders through the renderer, so
+	// the table's image and link appear inside the rendered rows.
+	if !strings.Contains(res.Text, "![B](/b.png)") {
+		t.Errorf("table-cell image markdown missing: %q", res.Text)
 	}
-	if strings.Contains(res.Text, "[T](https://table.example/t)") {
-		t.Errorf("table-cell link substituted into inline text: %q", res.Text)
+	if !strings.Contains(res.Text, "[T](https://table.example/t)") {
+		t.Errorf("table-cell link markdown missing: %q", res.Text)
 	}
 
 	// Positions in the structured results must still cover the table cells.
