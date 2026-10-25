@@ -210,8 +210,12 @@ func sanitizeNodeInPlace(n *html.Node, audit AuditRecorder) bool {
 				if attrKey == "style" {
 					// sanitizeStyleValue returns either "" (blocked) or its
 					// input unchanged, so there is no partial-rewrite case to
-					// write back here.
-					if sanitizeStyleValue(attr.Val) == "" {
+					// write back here. An empty value ("style=\"\"") is
+					// vacuously safe, not blocked: sanitizeStyleValue("")
+					// returns "" too, and reading that as "blocked" removed
+					// and audit-logged every empty style attribute on
+					// otherwise benign markup.
+					if attr.Val != "" && sanitizeStyleValue(attr.Val) == "" {
 						audit.RecordBlockedAttr(attr.Key, attr.Val)
 						modified = true
 						continue
@@ -297,6 +301,12 @@ func blockedDangerousPrefix(s string, list []string) string {
 // the "//" test. Slicing the unstripped text instead was a bypass: with two
 // leading control bytes, trimmed[2:] consumed the "//" and the remainder began
 // at "javascript:", so the "//javascript:" policy prefix no longer matched.
+//
+// The ToLower is LOAD-BEARING for the slow-path callers: they feed the result
+// to blockedDangerousPrefix → isDangerousScheme, which compares exactly against
+// the lowercase policy prefixes (unlike blockedFoldPrefix, which ASCII-folds).
+// TestProtocolRelativeC0Bypass pins this — removing the ToLower let
+// "\x01\x02//JavaScript:alert(1)" through.
 func protocolRelativeRemainder(s string) string {
 	rest, ok := strings.CutPrefix(s, "//")
 	if !ok {
@@ -328,8 +338,16 @@ func isSafeURIWithAudit(uri string, audit AuditRecorder) bool {
 			return false
 		}
 		if strings.HasPrefix(uri, "//") {
-			rest := strings.TrimLeft(uri[2:], " \t\n\r")
-			if blockedFoldPrefix(rest, protocolRelativeBlockedPrefixes) != "" {
+			// Route through protocolRelativeRemainder — the single
+			// implementation of the "//" policy (see containsDangerousSchemeFast)
+			// — rather than re-splicing uri[2:] here. On this printable-ASCII
+			// fast path its trims are provable no-ops (isPlainPrintableASCII
+			// rejects those bytes) and its ToLower is semantically redundant
+			// (blockedFoldPrefix ASCII-folds) — at worst one small allocation
+			// for an uppercase protocol-relative URL, the price of keeping one
+			// spelling of the policy. A hand-rolled copy is how the "//" policy
+			// drifted into four spellings once before.
+			if blockedFoldPrefix(protocolRelativeRemainder(uri), protocolRelativeBlockedPrefixes) != "" {
 				audit.RecordBlockedURL(TruncateAuditURL(uri), "dangerous protocol-relative URL")
 				return false
 			}
@@ -692,10 +710,11 @@ func dataURLMediaType(mediaPart string) (mediaType string, ok bool) {
 	}
 	if rest, isBase64 := strings.CutSuffix(mediaPart, ";base64"); isBase64 {
 		mediaType = rest
-	} else if semicolonIdx := strings.IndexByte(mediaPart, ';'); semicolonIdx >= 0 {
-		// semicolonIdx == 0 yields an empty mediaType, rejected by the ok=false
-		// return below (mirrors the sanitizer's empty-MIME rejection).
-		mediaType = mediaPart[:semicolonIdx]
+	} else if head, _, hasParam := strings.Cut(mediaPart, ";"); hasParam {
+		// An empty head (a leading ';') yields an empty mediaType, rejected by
+		// the ok=false return below (mirrors the sanitizer's empty-MIME
+		// rejection).
+		mediaType = head
 	} else {
 		mediaType = mediaPart
 	}

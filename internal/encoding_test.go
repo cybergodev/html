@@ -11,8 +11,81 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
 	"golang.org/x/text/encoding/simplifiedchinese"
 )
+
+// TestDeclaredCharsetCoverage pins declared-charset support for the legacy
+// encodings real pages declare but x/text newcomers used to miss: a document
+// that DECLARES koi8-r / windows-125x / gb18030 must decode through its
+// declaration (previously "unsupported encoding" on basic-only paths or a
+// statistical mis-pick). Statistical candidates are deliberately unchanged —
+// only the declared path is covered.
+func TestDeclaredCharsetCoverage(t *testing.T) {
+	t.Parallel()
+
+	russian := "Справка по кодировкам"
+	greek := "Ελληνική σελίδα"
+	turkish := "Türkçe sayfa"
+	chinese := "汉字编码测试文档"
+
+	encode := func(e encoding.Encoding, s string) []byte {
+		b, err := e.NewEncoder().Bytes([]byte(s))
+		if err != nil {
+			t.Fatalf("encode fixture: %v", err)
+		}
+		return b
+	}
+
+	cases := []struct {
+		charset string
+		doc     []byte
+		want    string
+	}{
+		{"koi8-r", encode(charmap.KOI8R, russian), russian},
+		{"windows-1253", encode(charmap.Windows1253, greek), greek},
+		{"windows-1254", encode(charmap.Windows1254, turkish), turkish},
+		{"gb18030", encode(simplifiedchinese.GB18030, chinese), chinese},
+	}
+	for _, c := range cases {
+		doc := append([]byte(`<html><head><meta charset="`+c.charset+`"></head><body><p>`),
+			append(append([]byte{}, c.doc...), []byte(`</p></body></html>`)...)...)
+		ed := &EncodingDetector{}
+		charset := ed.DetectCharset(doc)
+		if charset != c.charset {
+			t.Errorf("DetectCharset(%s doc) = %q, want %q", c.charset, charset, c.charset)
+			continue
+		}
+		decoded, err := ed.ToUTF8(doc, charset)
+		if err != nil {
+			t.Errorf("ToUTF8(%s) error: %v", c.charset, err)
+			continue
+		}
+		if !strings.Contains(string(decoded), c.want) {
+			t.Errorf("ToUTF8(%s) round-trip lost %q: %q", c.charset, c.want, string(decoded))
+		}
+	}
+}
+
+// TestDetectCharsetWhitespaceAroundValue pins the HTML5-whitespace handling of
+// the byte-level <meta charset> extractor: a newline after the '=' (legal
+// markup) must not leak into the value, and a value that normalizes to
+// nothing (whitespace-only) must not surface as an empty detected charset.
+func TestDetectCharsetWhitespaceAroundValue(t *testing.T) {
+	t.Parallel()
+
+	ed := &EncodingDetector{}
+	if got := ed.DetectCharsetBasic([]byte("<html><head><meta charset=\n\"iso-8859-7\"></head><body>")); got != "iso-8859-7" {
+		t.Errorf("newline after '=' = %q, want iso-8859-7", got)
+	}
+	if got := ed.DetectCharsetBasic([]byte(`<html><head><meta charset=" "></head><body>`)); got != "utf-8" {
+		t.Errorf("whitespace-only value = %q, want utf-8 fallback", got)
+	}
+	if got := ed.DetectCharsetBasic([]byte("<html><head><meta charset=\n\" \"></head><body>")); got != "utf-8" {
+		t.Errorf("newline + whitespace-only value = %q, want utf-8 fallback", got)
+	}
+}
 
 func TestDetectCharset(t *testing.T) {
 	tests := []struct {

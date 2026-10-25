@@ -508,7 +508,7 @@ Security fixes are released as:
 
 ### Automated Testing
 
-The library includes comprehensive security-focused tests with **~94% code coverage** (main package 93.9%; `internal` 92.8%, `internal/table` 92.4%):
+The library includes comprehensive security-focused tests with **~95% code coverage** (main package 95.0%; `internal` 94.7%, `internal/table` 93.6%):
 
 ```bash
 # Run all tests including security tests

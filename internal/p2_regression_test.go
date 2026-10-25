@@ -137,16 +137,6 @@ func TestCacheStartCleanupAfterStopReturnsUsableCancel(t *testing.T) {
 	cancel2() // must not panic
 }
 
-func TestExtractDomainStripsUserinfo(t *testing.T) {
-	t.Parallel()
-	if got := ExtractDomain("https://user:pass@example.com/path"); got != "example.com" {
-		t.Errorf("ExtractDomain with userinfo = %q, want example.com", got)
-	}
-	if got := ExtractDomain("https://example.com/path"); got != "example.com" {
-		t.Errorf("ExtractDomain without userinfo = %q, want example.com", got)
-	}
-}
-
 func TestExtractBaseFromURLQueryOnly(t *testing.T) {
 	t.Parallel()
 	if got := ExtractBaseFromURL("https://example.com?ref=x"); got != "https://example.com/" {

@@ -29,7 +29,7 @@ func main() {
 	fmt.Println("BAD: Creating new processor each time:")
 	const benchDoc = `<html><body><article><h1>Go Performance Guide</h1><p>This article covers performance optimization techniques for Go applications, including profiling, benchmarking, and memory management strategies.</p><p>Understanding how the Go scheduler works is essential for writing efficient concurrent programs that make the most of available CPU resources.</p><p>Memory allocation patterns significantly impact GC pressure. Prefer stack-allocated values and sync.Pool for heap-heavy workloads.</p></article></body></html>`
 	start := time.Now()
-	for i := 0; i < 2000; i++ {
+	for range 2000 {
 		p, _ := html.New()
 		_, _ = p.Extract([]byte(benchDoc))
 		_ = p.Close()
@@ -45,7 +45,7 @@ func main() {
 	defer func() { _ = processor.Close() }()
 
 	start = time.Now()
-	for i := 0; i < 2000; i++ {
+	for range 2000 {
 		_, _ = processor.Extract([]byte(benchDoc))
 	}
 	fmt.Printf("  2000 extractions: %v\n\n", time.Since(start))
@@ -65,8 +65,8 @@ func main() {
 
 	// Cold cache: each document is unique (all cache misses).
 	start = time.Now()
-	for i := 0; i < cacheIters; i++ {
-		doc := []byte(fmt.Sprintf(`<html><body><article><h1>Cache Test %d</h1>%s</article></body></html>`, i, cacheBody))
+	for i := range cacheIters {
+		doc := fmt.Appendf(nil, `<html><body><article><h1>Cache Test %d</h1>%s</article></body></html>`, i, cacheBody)
 		_, _ = processor.Extract(doc)
 	}
 	missTime := time.Since(start)
@@ -75,7 +75,7 @@ func main() {
 	warmDoc := []byte("<html><body><article><h1>Cache Warm</h1>" + cacheBody + "</article></body></html>")
 	_, _ = processor.Extract(warmDoc) // populate the cache
 	start = time.Now()
-	for i := 0; i < cacheIters; i++ {
+	for range cacheIters {
 		_, _ = processor.Extract(warmDoc)
 	}
 	hitTime := time.Since(start)
@@ -103,8 +103,8 @@ func main() {
 		"<p>The runtime multiplexes goroutines onto a small pool of OS threads, so launching " +
 		"thousands of concurrent tasks is cheap and does not require manual thread management.</p>"
 	docs := make([][]byte, numDocs)
-	for i := 0; i < numDocs; i++ {
-		docs[i] = []byte(fmt.Sprintf(`<html><body><article><h1>Doc %d</h1>%s</article></body></html>`, i, docBody))
+	for i := range numDocs {
+		docs[i] = fmt.Appendf(nil, `<html><body><article><h1>Doc %d</h1>%s</article></body></html>`, i, docBody)
 	}
 
 	// Sequential processing (same document set, for a fair comparison)
@@ -179,12 +179,12 @@ func main() {
 	var wg sync.WaitGroup
 	start = time.Now()
 
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < docsPerGoroutine; j++ {
-				doc := []byte(fmt.Sprintf(`<article><h1>Goroutine %d-%d</h1><p>Content</p></article>`, id, j))
+			for j := range docsPerGoroutine {
+				doc := fmt.Appendf(nil, `<article><h1>Goroutine %d-%d</h1><p>Content</p></article>`, id, j)
 				_, _ = processor2.Extract(doc)
 			}
 		}(i)
@@ -229,8 +229,8 @@ func main() {
 	fmt.Println("------------------------")
 
 	// Process some documents
-	for i := 0; i < 20; i++ {
-		doc := []byte(fmt.Sprintf(`<article><h1>Doc %d</h1><p>Content</p></article>`, i))
+	for i := range 20 {
+		doc := fmt.Appendf(nil, `<article><h1>Doc %d</h1><p>Content</p></article>`, i)
 		_, _ = processor2.Extract(doc)
 		// Same document again (cache hit)
 		_, _ = processor2.Extract(doc)

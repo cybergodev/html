@@ -2,6 +2,7 @@ package html
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -209,6 +210,13 @@ func (p *Processor) extractAllLinksCore(ctx context.Context, htmlBytes []byte) (
 	links, err := p.extractLinksRespectingDeadline(ctx, utf8String)
 	if err != nil {
 		p.stats.errorCount.Add(1)
+		// Depth violations are recorded at the violation site in
+		// validateDepthTraversal (shared with the Extract path); the timeout is
+		// recorded here, matching extractCoreWithContext so an audit-enabled
+		// processor does not keep a blind spot for ExtractAllLinks timeouts.
+		if p.audit != nil && errors.Is(err, ErrProcessingTimeout) {
+			p.audit.RecordTimeout(p.config.ProcessingTimeout)
+		}
 		return nil, err
 	}
 
@@ -288,7 +296,14 @@ func (p *Processor) detectBaseURL(doc *stdxhtml.Node) string {
 	if baseNode := internal.FindElementByTag(doc, "base"); baseNode != nil {
 		for _, attr := range baseNode.Attr {
 			if attr.Key == "href" && attr.Val != "" {
-				return internal.NormalizeBaseURL(attr.Val)
+				// A <base> value that normalizes to nothing (about:blank,
+				// data:, …) is not a usable base: fall through to the
+				// canonical / og:url / first-absolute-href ladder below
+				// instead of disabling URL resolution for the whole document.
+				if u := internal.NormalizeBaseURL(attr.Val); u != "" {
+					return u
+				}
+				break
 			}
 		}
 	}
@@ -544,6 +559,11 @@ func (p *Processor) extractSourceLinks(n *stdxhtml.Node, baseURL string, linkMap
 
 	resolvedURL := p.resolveURLIfEnabled(baseURL, src)
 
+	// MIME types are case-insensitive ("VIDEO/MP4" is legal markup), and the
+	// rel-token handling above already matches its tokens case-insensitively —
+	// classify the type attribute the same way instead of dropping mixed-case
+	// declarations into the extension fallback.
+	mediaType = strings.ToLower(mediaType)
 	resourceType := "media"
 	if strings.HasPrefix(mediaType, "video/") {
 		resourceType = "video"
@@ -612,7 +632,7 @@ func (p *Processor) extractLinkTagLinks(n *stdxhtml.Node, baseURL string, linkMa
 	// their canonical spellings; the former exact-value switch silently
 	// dropped any mixed-case or multi-token spelling into the type-attribute
 	// fallback below. When several tokens match, the last one wins.
-	for _, tok := range strings.Fields(strings.ToLower(rel)) {
+	for tok := range strings.FieldsSeq(strings.ToLower(rel)) {
 		switch tok {
 		case "stylesheet":
 			if p.config.IncludeCSS {
@@ -655,10 +675,14 @@ func (p *Processor) extractLinkTagLinks(n *stdxhtml.Node, baseURL string, linkMa
 		}
 	}
 	if !include {
-		if strings.Contains(linkType, "css") && p.config.IncludeCSS {
+		// The type attribute's MIME value is case-insensitive ("text/CSS" is
+		// legal markup); match it lowercased so mixed-case declarations are
+		// classified instead of silently dropped.
+		lowerType := strings.ToLower(linkType)
+		if strings.Contains(lowerType, "css") && p.config.IncludeCSS {
 			resourceType = "css"
 			include = true
-		} else if strings.Contains(linkType, "javascript") && p.config.IncludeJS {
+		} else if strings.Contains(lowerType, "javascript") && p.config.IncludeJS {
 			resourceType = "js"
 			include = true
 		}

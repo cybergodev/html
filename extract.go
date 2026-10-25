@@ -22,6 +22,7 @@ var markdownEscapeReplacer = strings.NewReplacer(
 	`\`, `\\`,
 	`[`, `\[`,
 	`]`, `\]`,
+	`|`, `\|`,
 )
 
 // containsASCIIFold reports whether substr is contained in s, case-insensitively
@@ -34,7 +35,7 @@ func containsASCIIFold(s, substr string) bool {
 	}
 	for i := 0; i <= sLen-substrLen; i++ {
 		match := true
-		for j := 0; j < substrLen; j++ {
+		for j := range substrLen {
 			c := s[i+j]
 			sc := substr[j]
 			if c >= 'A' && c <= 'Z' {
@@ -56,19 +57,51 @@ func containsASCIIFold(s, substr string) bool {
 }
 
 // escapeMarkdownText escapes characters that could break Markdown link/image syntax.
-// Escapes ], [, and \ to prevent injection of arbitrary Markdown content.
+// Escapes ], [, \, and | to prevent injection of arbitrary Markdown content;
+// a raw '|' inside a label ends the cell when the construct is substituted
+// into a rendered Markdown table (the table escaper sees only the
+// pre-substitution [LINK:n] text, so it cannot cover this).
 func escapeMarkdownText(s string) string {
 	// Fast path: strings.(*Replacer).Replace allocates a new string even when
 	// nothing matches, so scan first and skip the replacer entirely when the
-	// text contains none of the three escapable characters. Link and image
+	// text contains none of the four escapable characters. Link and image
 	// text almost never contains them, so this avoids an allocation per call.
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
-		case '\\', '[', ']':
+		case '\\', '[', ']', '|':
 			return markdownEscapeReplacer.Replace(s)
 		}
 	}
 	return s
+}
+
+// collapseInlineSpace trims s and collapses internal whitespace runs (space,
+// tab, newline, CR) to single spaces. A link label captured between block
+// elements inside one anchor (an icon <div> followed by a text <span>, the
+// common "icon-list-item" shape) otherwise carries newlines into the rendered
+// [label](URL), splitting the construct across lines and breaking most
+// renderers' inline parsing. Also makes whitespace-only labels empty, so the
+// "Link N" fallback fires for them.
+func collapseInlineSpace(s string) string {
+	if !strings.ContainsAny(s, " \t\n\r") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	inSpace := false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case ' ', '\t', '\n', '\r':
+			inSpace = true
+		default:
+			if inSpace && b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			inSpace = false
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // markdownURLDestReplacer percent-encodes the bytes that would break a
@@ -77,18 +110,22 @@ var markdownURLDestReplacer = strings.NewReplacer(
 	"(", "%28",
 	")", "%29",
 	" ", "%20",
+	"|", "%7C",
 )
 
-// escapeMarkdownURLDest percent-encodes the parentheses and spaces in a
-// Markdown link/image destination. An unescaped ')' terminates the
+// escapeMarkdownURLDest percent-encodes the parentheses, spaces, and pipes
+// in a Markdown link/image destination. An unescaped ')' terminates the
 // destination early and spills the rest of the URL into rendered text, and
 // per CommonMark unescaped whitespace also terminates it — so a destination
-// like "my file.png" rendered as broken text rather than a link.
+// like "my file.png" rendered as broken text rather than a link. A raw '|'
+// does not terminate the destination inline, but when the construct lands in
+// a rendered Markdown table it terminates the CELL (the table escaper sees
+// only the pre-substitution [LINK:n] text), shifting every following column.
 // Percent-encoding — rather than backslash-escaping — keeps the destination
 // a valid URL that survives copy-paste. Fast path: most destinations contain
 // none of these bytes.
 func escapeMarkdownURLDest(url string) string {
-	if !strings.ContainsAny(url, "() ") {
+	if !strings.ContainsAny(url, "() |") {
 		return url
 	}
 	return markdownURLDestReplacer.Replace(url)
@@ -463,6 +500,15 @@ func (p *Processor) processContentWithContext(ctx context.Context, htmlContent s
 		return nil, err
 	}
 
+	// Collect structured metadata BEFORE sanitization: the sanitizer strips
+	// <script> elements, which carry the JSON-LD payloads this pass reads.
+	// Disabled by config, in which case every field stays empty and title
+	// resolution uses the DOM-only priority.
+	var meta internal.Metadata
+	if p.config.ExtractMetadata {
+		meta = internal.CollectMetadata(doc)
+	}
+
 	// Sanitize DOM in-place (avoids render + re-parse overhead). Runs only on a
 	// depth-validated tree, so its recursion is bounded by MaxDepth.
 	if p.config.EnableSanitization {
@@ -480,7 +526,7 @@ func (p *Processor) processContentWithContext(ctx context.Context, htmlContent s
 	default:
 	}
 
-	return p.extractFromDocument(doc, originalHTML)
+	return p.extractFromDocument(doc, originalHTML, meta)
 }
 
 // ExtractFromFile extracts content from an HTML file with automatic encoding detection.
@@ -489,7 +535,7 @@ func (p *Processor) processContentWithContext(ctx context.Context, htmlContent s
 // Use this when you have a file path instead of raw bytes.
 //
 // Returns the same errors as [Processor.Extract], plus a *FileError wrapping
-// ErrFileNotFound, ErrInvalidFilePath, or a path-traversal rejection for
+// ErrFileNotFound or ErrInvalidFilePath, or a path-traversal rejection (which wraps ErrInvalidFilePath) for
 // file-access failures.
 func (p *Processor) ExtractFromFile(filePath string) (*Result, error) {
 	return recoverPanic(func() (*Result, error) {
@@ -783,16 +829,61 @@ func (p *Processor) validateDepthTraversal(root *stdxhtml.Node, initialDepth int
 	return nil
 }
 
-func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string) (*Result, error) {
-	result := &Result{}
-	result.Title = p.extractTitle(doc)
+// Extraction-method values reported by Result.ExtractionMethod.
+const (
+	// extractionMethodArticle marks an extraction whose root is the
+	// main-content node the scorer selected.
+	extractionMethodArticle = "article"
+	// extractionMethodBody marks a full-<body> extraction: either no candidate
+	// scored above zero or ExtractArticle is disabled.
+	extractionMethodBody = "body"
+	// extractionMethodListing marks a recognized listing/index page (a card
+	// container of several link-dense sibling <article> elements): the
+	// extracted Text is the whole card list, not a single article.
+	extractionMethodListing = "listing"
+)
 
+func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string, meta internal.Metadata) (*Result, error) {
+	result := &Result{}
+
+	// Body text length feeds the confidence ratio and the listing dominance
+	// guard. Computed on the sanitized tree before cleaning, so the ratio
+	// measures the article's share of all visible page text; one pooled-buffer
+	// walk, the same shape as the other O(N) passes on this document.
+	bodyTextLen := 0
+	if body := internal.FindElementByTag(doc, "body"); body != nil {
+		bodyTextLen = internal.TextContentLength(body)
+	}
+
+	// Identify the content node first: the title resolution below prefers an
+	// h1 inside it over a page-level h1. Listing pages (card feeds) are
+	// recognized before article selection — every card is its own <article>
+	// and would otherwise let the scorer pick a single card — and only when
+	// the card list dominates the page's visible text, so an article page
+	// with a stray article-card section stays on the article path.
 	contentNode := doc
+	method := extractionMethodBody
 	if p.config.ExtractArticle {
-		if article := p.extractArticleNode(doc); article != nil {
+		if listing := internal.FindListingContainer(doc); listing != nil &&
+			internal.TextContentLength(listing)*2 >= bodyTextLen {
+			contentNode = listing
+			method = extractionMethodListing
+		} else if article, m := p.extractArticleNode(doc); article != nil {
 			contentNode = article
+			method = m
 		}
 	}
+	result.ExtractionMethod = method
+
+	result.Title = p.resolveTitle(doc, contentNode, method, meta)
+	if p.config.ExtractMetadata {
+		result.Author = meta.Author
+		result.PublishedTime = parsePublishedTime(meta.PublishedTime)
+		result.Description = meta.Description
+		result.SiteName = meta.SiteName
+		result.CanonicalURL = meta.CanonicalURL
+	}
+
 	contentNode = internal.CleanContentNode(contentNode)
 
 	imageFormat := p.imageFormat
@@ -810,7 +901,8 @@ func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string) 
 	// caller asked for when that format is "none".
 	images, links := p.extractImagesAndLinks(contentNode,
 		p.config.PreserveImages || needsImageTokens,
-		p.config.PreserveLinks || needsLinkTokens)
+		p.config.PreserveLinks || needsLinkTokens,
+		false)
 	if p.config.PreserveImages {
 		result.Images = images
 	}
@@ -841,15 +933,25 @@ func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string) 
 		text := internal.CleanTextBytes(tb.Bytes())
 		internal.PutTrackedBuilder(tb)
 
-		// Apply formatters in order: images first, then links. A "none"
-		// formatter returns its input unchanged.
-		result.Text = p.formatInlineLinks(p.formatInlineImages(text, images, imageFormat), links, linkFormat)
+		// Apply formatters in order: links first, then images. Link labels
+		// may carry [IMAGE:n] placeholders through (see formatInlineLinks),
+		// and the image pass nests their markdown inside the constructs; a
+		// "none" formatter returns its input unchanged. The substitution can
+		// collapse a placeholder to nothing (an empty-label anchor with no
+		// usable href), leaving the two spaces that flanked the token
+		// adjacent — re-normalize so Text carries the same single-space form
+		// the plain path produces (safe now that the table renderer emits no
+		// column-width padding for it to fold).
+		result.Text = internal.CleanTextBytes([]byte(
+			p.formatInlineImages(p.formatInlineLinks(text, links, images, linkFormat), images, imageFormat)))
 	} else {
 		result.Text = p.extractTextContent(contentNode, p.config.TableFormat)
 	}
 
-	result.WordCount = p.countWords(result.Text)
-	result.ReadingTime = p.calculateReadingTime(result.WordCount)
+	var cjkChars int
+	result.WordCount, cjkChars = p.countWords(result.Text)
+	result.ReadingTime = p.calculateReadingTime(result.WordCount, cjkChars)
+	result.Confidence = computeExtractionConfidence(method, result.Text, bodyTextLen)
 
 	// HasMediaReference is a necessary condition for the raw-HTML media scans,
 	// and it is the same content-only test for both media kinds, so it is
@@ -868,18 +970,53 @@ func (p *Processor) extractFromDocument(doc *stdxhtml.Node, htmlContent string) 
 	return result, nil
 }
 
-func (p *Processor) extractTitle(doc *stdxhtml.Node) string {
+// resolveTitle picks the document title. When metadata extraction is enabled
+// and the document declares one, the metadata title (JSON-LD headline over
+// og:title) wins: producers curate it to be suffix-free. Otherwise the DOM
+// ladder applies: <title> → h1 inside the selected article → first document
+// h1 → first h2.
+//
+// A metadata title is stripped of a site-name suffix only when the trailing
+// segment exactly matches the declared site name (og:site_name / JSON-LD
+// publisher). The length-heuristic stripper used for <title> is deliberately
+// NOT applied here: metadata headlines legitimately contain " - " subtitles
+// ("GDP Falls 0.3% - Worst Quarter Since 2020") that a short tail would
+// falsely truncate.
+func (p *Processor) resolveTitle(doc, contentNode *stdxhtml.Node, method string, meta internal.Metadata) string {
+	if t := strings.TrimSpace(meta.Title); t != "" {
+		return stripExactSiteNameSuffix(t, meta.SiteName)
+	}
+	return p.extractTitle(doc, contentNode, method)
+}
+
+// stripExactSiteNameSuffix removes a trailing " - Site" style segment from
+// title only when that segment equals siteName (case-insensitive). Returns
+// title unchanged when siteName is empty or no separator's trailing segment
+// matches.
+func stripExactSiteNameSuffix(title, siteName string) string {
+	siteName = strings.TrimSpace(siteName)
+	if siteName == "" {
+		return title
+	}
+	for _, sep := range titleSeparators {
+		if before, after, ok := splitAtLastSeparator(title, sep); ok && strings.EqualFold(after, siteName) {
+			return before
+		}
+	}
+	return title
+}
+
+func (p *Processor) extractTitle(doc, contentNode *stdxhtml.Node, method string) string {
 	if doc == nil {
 		return ""
 	}
 	// Collect the first <title>, <h1>, and <h2> in a single document-order
 	// traversal. The previous implementation issued up to three separate
 	// FindElementByTag calls (one full tree walk each); documents lacking a
-	// <title> or <h1> — common — paid for all three. Priority is unchanged:
-	// title → h1 → h2, each preferring a non-empty value. The nil guards keep
-	// the FIRST occurrence of each tag: without them the walk (which runs
-	// until all three candidates are found) kept overwriting the candidates,
-	// so the fallback title became the LAST h1/h2 before the stopping point.
+	// <title> or <h1> — common — paid for all three. The nil guards keep
+	// the FIRST occurrence of each tag: without them the walk kept
+	// overwriting the candidates, so the fallback title became the LAST
+	// h1/h2 it saw.
 	var titleNode, h1Node, h2Node *stdxhtml.Node
 	internal.WalkNodes(doc, func(n *stdxhtml.Node) bool {
 		if n.Type == stdxhtml.ElementNode {
@@ -898,12 +1035,26 @@ func (p *Processor) extractTitle(doc *stdxhtml.Node) string {
 				}
 			}
 		}
-		// Keep walking until all three candidates have been located.
+		// Returning false only prunes descent into this node's subtree — the
+		// walk itself keeps draining its stack, so this is a pruning hint,
+		// not a termination. Once all three candidates are located, every
+		// remaining stacked node returns false too; the nil guards above keep
+		// the first occurrence of each tag.
 		return titleNode == nil || h1Node == nil || h2Node == nil
 	})
 	if titleNode != nil {
 		if title := internal.GetTextContent(titleNode); title != "" {
-			return title
+			return p.stripSiteName(title)
+		}
+	}
+	// An h1 inside the selected article is the article's own headline; the
+	// first document h1 may instead belong to site chrome (a logo band, a
+	// page masthead) that happens to precede the article in document order.
+	if method == extractionMethodArticle && contentNode != nil {
+		if h1 := internal.FindElementByTag(contentNode, "h1"); h1 != nil {
+			if title := internal.GetTextContent(h1); title != "" {
+				return title
+			}
 		}
 	}
 	if h1Node != nil {
@@ -917,9 +1068,84 @@ func (p *Processor) extractTitle(doc *stdxhtml.Node) string {
 	return ""
 }
 
-func (p *Processor) extractArticleNode(doc *stdxhtml.Node) *stdxhtml.Node {
+// titleSeparators are the single-character delimiters that conventionally join a
+// page title to its site name ("My Post - Example.com", "My Post | Site"). They
+// are matched in order so a title using " - " strips at that delimiter before a
+// later one is considered.
+var titleSeparators = []string{" - ", " | ", " · ", " – ", " — ", " » ", " « "}
+
+// splitAtLastSeparator splits title at the last occurrence of sep, returning
+// the trimmed halves. ok is false when sep does not occur at a usable
+// position — absent, at index 0 (no leading half), or with either trimmed
+// half empty. It backs both title-suffix strippers so the separator scan
+// exists exactly once: the exact-match and heuristic policies differ (see
+// stripExactSiteNameSuffix vs stripSiteName), the split mechanics must not.
+func splitAtLastSeparator(title, sep string) (before, after string, ok bool) {
+	idx := strings.LastIndex(title, sep)
+	if idx <= 0 {
+		return "", "", false
+	}
+	before = strings.TrimSpace(title[:idx])
+	after = strings.TrimSpace(title[idx+len(sep):])
+	if before == "" || after == "" {
+		return "", "", false
+	}
+	return before, after, true
+}
+
+// maxSiteNameSuffixLen is the longest trailing segment that stripSiteName will
+// treat as a site name. A page's site name is a short proper noun ("Example
+// News", "Acme Corp"); a genuinely long second part of a two-part title is not
+// a site name and must stay intact.
+const maxSiteNameSuffixLen = 30
+
+// stripSiteName removes a trailing site name from a page title of the common
+// "Title - Site", "Title | Site", or "Title · Site" form. It is deliberately
+// conservative so it never mutilates a legitimate title:
+//
+//   - It only trims at the LAST occurrence of a separator, so an internal " - "
+//     inside the title is preserved and only the trailing part is removed.
+//   - The trailing part must be short (≤ maxSiteNameSuffixLen) and the leading
+//     part non-trivial (≥ 3 chars), so a two-part title whose second part is
+//     substantial is kept whole, and a bare "A - B" or "3 - 4" is untouched.
+func (p *Processor) stripSiteName(title string) string {
+	if title == "" {
+		return ""
+	}
+	for _, sep := range titleSeparators {
+		before, after, ok := splitAtLastSeparator(title, sep)
+		if !ok {
+			continue
+		}
+		if len(after) <= maxSiteNameSuffixLen && len(before) >= 3 {
+			return before
+		}
+		return title // matched a separator but the tail is not a short site name
+	}
+	return title
+}
+
+// minArticleSiblingChars is the minimum text length a sibling block must carry
+// to be considered part of a split article. A block below this is a stray
+// wrapper (an empty spacer div, a one-word divider) rather than a byline,
+// author-note, or section that belongs with the article.
+const minArticleSiblingChars = 40
+
+// extractArticleNode returns the node representing the article body together
+// with the extraction method: extractionMethodArticle when a candidate scored
+// above zero, extractionMethodBody for the <body> fallback. The returned node
+// is nil only for a nil document.
+//
+// For the built-in DefaultScorer, the winning candidate is widened by the
+// scorer's score-guarded ancestor climb (climbToContentWrapper): real articles
+// are frequently split into a headline block, a body block, and a byline block
+// under wrappers, and the climb captures those sibling fragments whenever the
+// wrapper scores at least as well as the fragment. Custom scorers keep the
+// expandToArticleCluster sibling heuristic instead — they have no access to
+// the fold's scores.
+func (p *Processor) extractArticleNode(doc *stdxhtml.Node) (*stdxhtml.Node, string) {
 	if doc == nil {
-		return nil
+		return nil, extractionMethodBody
 	}
 
 	// Fast path: the built-in DefaultScorer can find the best article node from a
@@ -928,11 +1154,28 @@ func (p *Processor) extractArticleNode(doc *stdxhtml.Node) *stdxhtml.Node {
 	// for every non-inline element, and the map allocation that
 	// ScoreArticleCandidates would require. Custom scorers lack that method and
 	// fall back to the per-node Score() loop, whose behavior is unchanged.
-	if ds, ok := p.scorer.(*internal.DefaultScorer); ok {
-		if bestNode := ds.FindBestArticleNode(doc); bestNode != nil {
-			return bestNode
+	var bestNode *stdxhtml.Node
+	isDefault := false
+	hookTried := false
+	switch s := p.scorer.(type) {
+	case *internal.DefaultScorer:
+		bestNode = s.FindBestArticleNode(doc)
+		isDefault = true
+	case *scorerAdapter:
+		// Optional single-pass selection hook: a custom scorer implementing
+		// ArticleFinder searches the tree itself, avoiding the per-element
+		// Score enumeration below. A nil return is the scorer's "no article"
+		// verdict and skips the enumeration too.
+		if af, ok := s.external.(ArticleFinder); ok {
+			hookTried = true
+			if cn := af.FindArticleNode(contentNodeAdapter{doc}); cn != nil {
+				if wrapped, ok := cn.(contentNodeAdapter); ok && wrapped.Node != nil {
+					bestNode = wrapped.Node
+				}
+			}
 		}
-	} else {
+	}
+	if bestNode == nil && !isDefault && !hookTried {
 		candidates := make(map[*stdxhtml.Node]int, initialMapCap)
 		internal.WalkNodes(doc, func(n *stdxhtml.Node) bool {
 			if n.Type == stdxhtml.ElementNode && !internal.IsInlineElement(n.Data) {
@@ -942,11 +1185,88 @@ func (p *Processor) extractArticleNode(doc *stdxhtml.Node) *stdxhtml.Node {
 			}
 			return true
 		})
-		if bestNode := internal.SelectBestCandidate(candidates); bestNode != nil {
-			return bestNode
+		bestNode = internal.SelectBestCandidate(candidates)
+	}
+	if bestNode == nil {
+		return internal.FindElementByTag(doc, "body"), extractionMethodBody
+	}
+	if isDefault {
+		// FindBestArticleNode already applied the score-guarded climb; running
+		// expandToArticleCluster on top would re-widen on the unguarded sibling
+		// heuristic and pull penalized chrome back in.
+		return bestNode, extractionMethodArticle
+	}
+	return p.expandToArticleCluster(bestNode), extractionMethodArticle
+}
+
+// expandToArticleCluster widens bestNode to its parent when the article is split
+// across sibling blocks under a content wrapper. It is deliberately conservative:
+//
+//   - A semantic container (<article>/<main>, role=article/main) already marks
+//     the article boundary and is returned unchanged — the author drew the line.
+//   - The parent must be a non-chrome element (ShouldRemoveElement false), not
+//     nil, and not <body>/<html>. Blocks spread directly under <body> are not
+//     expanded: there the highest-scoring node already tends to be <body> itself,
+//     and when it is not, the competing sibling is far more likely unrelated
+//     ("related content") than a split of the same article.
+//   - At least one sibling must be a content-bearing, non-chrome, block-level
+//     element (≥ minArticleSiblingChars of text).
+//   - bestNode must still dominate the parent: its text is at least half the
+//     parent's text. A parent with a sibling that rivals or exceeds bestNode is
+//     more likely two separate sections than one split article.
+//
+// When the guards pass, the parent is returned and CleanContentNode (run by the
+// caller) strips any remaining chrome among the siblings, so the full article
+// survives. When any guard fails, bestNode is returned unchanged.
+func (p *Processor) expandToArticleCluster(bestNode *stdxhtml.Node) *stdxhtml.Node {
+	if bestNode == nil {
+		return nil
+	}
+
+	// A semantic container already delimits the article.
+	switch bestNode.Data {
+	case "article", "main":
+		return bestNode
+	}
+	for _, attr := range bestNode.Attr {
+		if attr.Key == "role" {
+			switch strings.ToLower(attr.Val) {
+			case "main", "article":
+				return bestNode
+			}
 		}
 	}
-	return internal.FindElementByTag(doc, "body")
+
+	parent := bestNode.Parent
+	if parent == nil || parent.Type != stdxhtml.ElementNode {
+		return bestNode
+	}
+	if parent.Data == "body" || parent.Data == "html" {
+		return bestNode
+	}
+	if internal.ShouldRemoveElement(parent) {
+		return bestNode
+	}
+
+	// bestNode must still be the dominant block of the parent: otherwise the
+	// siblings are competing sections, not a split of one article.
+	if internal.TextContentLength(bestNode)*2 < internal.TextContentLength(parent) {
+		return bestNode
+	}
+
+	// Find at least one content-bearing, non-chrome, block-level sibling.
+	for sib := parent.FirstChild; sib != nil; sib = sib.NextSibling {
+		if sib == bestNode || sib.Type != stdxhtml.ElementNode {
+			continue
+		}
+		if internal.ShouldRemoveElement(sib) || internal.IsInlineElement(sib.Data) {
+			continue
+		}
+		if internal.TextContentLength(sib) >= minArticleSiblingChars {
+			return parent
+		}
+	}
+	return bestNode
 }
 
 func (p *Processor) extractTextContent(node *stdxhtml.Node, tableFormat string) string {
@@ -975,10 +1295,140 @@ func writeMarkdownInline(tb *table.TrackedBuilder, image bool, label, url string
 		_ = tb.WriteByte('!')
 	}
 	_ = tb.WriteByte('[')
-	_, _ = tb.WriteString(escapeMarkdownText(label))
+	if image {
+		_, _ = tb.WriteString(escapeMarkdownText(label))
+	} else {
+		// A link label may still carry [IMAGE:n] placeholders (links are
+		// substituted before images); they must survive verbatim so the image
+		// pass can nest real image markdown inside the construct —
+		// [text ![alt](img)](url), the linked-image idiom.
+		_, _ = tb.WriteString(escapeMarkdownLinkLabel(label))
+	}
 	_, _ = tb.WriteString("](")
 	_, _ = tb.WriteString(escapeMarkdownURLDest(url))
 	_ = tb.WriteByte(')')
+}
+
+// escapeMarkdownLinkLabel escapes a link label exactly like escapeMarkdownText
+// except that [IMAGE:n] placeholders pass through verbatim (see
+// writeMarkdownInline): escaping them would turn the later nested image
+// markdown into literal bracket text.
+func escapeMarkdownLinkLabel(s string) string {
+	if !strings.ContainsAny(s, `\[]|`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); {
+		if s[i] == '[' && strings.HasPrefix(s[i:], "[IMAGE:") {
+			if end := imageTokenEnd(s, i); end > 0 {
+				b.WriteString(s[i:end])
+				i = end
+				continue
+			}
+		}
+		switch s[i] {
+		case '\\', '[', ']', '|':
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// imageTokenEnd returns the index just past a well-formed [IMAGE:<digits>]
+// token starting at i, or 0 when the span starting there is not one.
+func imageTokenEnd(s string, i int) int {
+	j := i + len("[IMAGE:")
+	start := j
+	for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+		j++
+	}
+	if j > start && j < len(s) && s[j] == ']' {
+		return j + 1
+	}
+	return 0
+}
+
+// normalizeLinkLabelText reshapes a link label that contains image
+// placeholders (links are substituted before images):
+//   - decorative images (empty alt) are dropped — a menu icon carries nothing
+//     a text consumer needs;
+//   - a label left with images only (a logo link) becomes the non-decorative
+//     images' alt texts joined by spaces — the accessible-name convention;
+//   - a mixed label keeps its text plus the non-decorative image placeholders,
+//     so the image pass can nest real image markdown inside the construct —
+//     whichever order the text and images appear in;
+//   - a well-formed marker that matches no image is page text that looks like
+//     a token; it stays literally (the same policy as an unpaired [LINK:n]
+//     marker) instead of being deleted only on image-bearing pages.
+//
+// The result is whitespace-collapsed; a label reduced to nothing keeps the
+// caller's "Link N" fallback intact (empty return).
+func normalizeLinkLabelText(label string, images []ImageInfo) string {
+	if !strings.Contains(label, "[IMAGE:") || len(images) == 0 {
+		return label
+	}
+	var b strings.Builder
+	b.Grow(len(label))
+	hasText := false
+	var alts []string
+	i := 0
+	for i < len(label) {
+		if label[i] == '[' && strings.HasPrefix(label[i:], "[IMAGE:") {
+			if end := imageTokenEnd(label, i); end > 0 {
+				span := label[i:end]
+				if img, ok := imageByPosition(images, span[len("[IMAGE:"):len(span)-1]); ok {
+					// Decorative images (empty alt) are dropped. Non-decorative
+					// ones keep their token unconditionally: a mixed label
+					// keeps it whether the text was seen before OR after the
+					// token (the image pass nests its markdown inside the
+					// construct), and the images-only case below returns the
+					// alt-text join and discards b wholesale — so an icon that
+					// precedes the label text is not silently lost.
+					if alt := strings.TrimSpace(img.Alt); alt != "" {
+						alts = append(alts, alt)
+						b.WriteString(span)
+					}
+					i = end
+					continue
+				}
+				// A well-formed marker that resolves to no image is page
+				// text that looks like a token: emit it literally rather than
+				// deleting the words — image-less labels keep such text
+				// verbatim (early return above), so image-bearing ones must
+				// too.
+				b.WriteString(span)
+				hasText = true
+				i = end
+				continue
+			}
+		}
+		if c := label[i]; c != ' ' && c != '\t' {
+			hasText = true
+		}
+		b.WriteByte(label[i])
+		i++
+	}
+	if !hasText && len(alts) > 0 {
+		return strings.Join(alts, " ")
+	}
+	return collapseInlineSpace(b.String())
+}
+
+// imageByPosition looks an image up by its [IMAGE:n] position digits.
+func imageByPosition(images []ImageInfo, digits string) (ImageInfo, bool) {
+	pos, err := strconv.Atoi(digits)
+	if err != nil {
+		return ImageInfo{}, false
+	}
+	for i := range images {
+		if images[i].Position == pos {
+			return images[i], true
+		}
+	}
+	return ImageInfo{}, false
 }
 
 // writeHTMLAttr writes a quoted HTML attribute, escaping the value so it
@@ -1021,7 +1471,10 @@ func (p *Processor) formatInlineImages(textWithPlaceholders string, images []Ima
 			if images[i].Position == 0 {
 				continue
 			}
-			altText := images[i].Alt
+			// Collapse like link labels (see collapseInlineSpace): a
+			// multiline or space-padded alt breaks the inline markdown
+			// construct exactly as a newline-bearing label would.
+			altText := collapseInlineSpace(images[i].Alt)
 			if altText == "" {
 				altText = "Image " + strconv.Itoa(images[i].Position)
 			}
@@ -1075,8 +1528,19 @@ func (p *Processor) formatInlineImages(textWithPlaceholders string, images []Ima
 	return textWithPlaceholders
 }
 
-func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkInfo, format string) string {
-	if len(links) == 0 || format == "none" {
+// formatInlineLinks substitutes [LINK:n]…[/LINK] placeholders. It runs BEFORE
+// formatInlineImages (its output may still carry [IMAGE:n] tokens — inside
+// link labels they become nested image markdown on the image pass), and
+// images is the section's image list: labels holding only images take their
+// alt texts (a logo link), and decorative (empty-alt) images are dropped
+// from labels (a menu icon). See normalizeLinkLabelText.
+func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkInfo, images []ImageInfo, format string) string {
+	// No len(links) guard here: a document whose every anchor carries an
+	// invalid href still emits [LINK:n] tokens (each <a> consumes a
+	// position), and returning early on the empty list would leak them into
+	// the output. The contains-token fast check below covers the common
+	// no-token case, and unknown positions render their label text.
+	if format == "none" {
 		return textWithPlaceholders
 	}
 
@@ -1133,8 +1597,12 @@ func (p *Processor) formatInlineLinks(textWithPlaceholders string, links []LinkI
 					found := false
 					for textStart < noEndTagFrom && j <= n-len(endTag) {
 						if textWithPlaceholders[j] == '[' && textWithPlaceholders[j:j+7] == endTag {
-							// Found the closing tag
-							linkText := textWithPlaceholders[textStart:j]
+							// Found the closing tag. Reshape the label: collapse
+							// whitespace (block children inside the anchor put
+							// newlines here), then apply the image rules —
+							// decorative icons dropped, images-only labels
+							// become their alt texts.
+							linkText := normalizeLinkLabelText(collapseInlineSpace(textWithPlaceholders[textStart:j]), images)
 
 							link, ok := linkMap[position]
 							if !ok {
@@ -1213,7 +1681,15 @@ var (
 // The two counters are independent, so one walk yields the same results as the
 // previous two. Pass wantImages/wantLinks false to skip (and avoid allocating)
 // a kind; the traversal runs at most once.
-func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantLinks bool) (images []ImageInfo, links []LinkInfo) {
+//
+// chromeMode selects the skip policy of the reader-mode chrome sections: the
+// walk prunes raw-text subtrees (IsRawTextElement) to mirror
+// ExtractChromeTextWithStructure, the pass those sections' [LINK:n]/[IMAGE:n]
+// tokens are emitted by. The default (content) mode prunes nothing: on the
+// article path CleanContentNode has already removed every subtree the text
+// pass would skip, so an unpruned walk observes the same nodes. Pass node
+// itself is never pruned in either mode.
+func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantLinks, chromeMode bool) (images []ImageInfo, links []LinkInfo) {
 	if !wantImages && !wantLinks {
 		return nil, nil
 	}
@@ -1234,6 +1710,9 @@ func (p *Processor) extractImagesAndLinks(node *stdxhtml.Node, wantImages, wantL
 	// (extractTextWithStructure): unmatched [IMAGE:n]/[LINK:n] tokens would
 	// otherwise leak into Text and their URLs would be dropped.
 	internal.WalkNodes(node, func(n *stdxhtml.Node) bool {
+		if chromeMode && n != node && n.Type == stdxhtml.ElementNode && internal.IsRawTextElement(n.Data) {
+			return false
+		}
 		if n.Type != stdxhtml.ElementNode {
 			return true
 		}
@@ -1348,15 +1827,30 @@ var asciiWordSpace = [256]bool{
 // CJK ideograph, kana, or Hangul syllable as one word. CJK text is
 // conventionally written without inter-word spaces, so a whitespace-only
 // scan reported a whole paragraph as a single word and skewed WordCount and
-// ReadingTime for CJK documents.
-func (p *Processor) countWords(text string) int {
+// ReadingTime for CJK documents. The cjk return value counts those CJK
+// characters so calculateReadingTime can apply a per-script reading rate.
+func (p *Processor) countWords(text string) (words, cjk int) {
 	if text == "" {
-		return 0
+		return 0, 0
 	}
 	n := len(text)
 	count := 0
 	inWord := false
 	for i := 0; i < n; {
+		// Skip ATX heading markers ("# " … "###### ") at the start of a line:
+		// the structured text pass emits them, and structure is not a word.
+		// A '#' not followed by a space ("#hashtag") is content and counts.
+		if text[i] == '#' && (i == 0 || text[i-1] == '\n') {
+			j := i
+			for j < n && text[j] == '#' {
+				j++
+			}
+			if j < n && text[j] == ' ' {
+				i = j + 1
+				inWord = false
+				continue
+			}
+		}
 		c := text[i]
 		if c < utf8.RuneSelf {
 			if asciiWordSpace[c] {
@@ -1371,6 +1865,7 @@ func (p *Processor) countWords(text string) int {
 		r, size := utf8.DecodeRuneInString(text[i:])
 		if isCJKRune(r) {
 			count++ // each CJK character reads as one word
+			cjk++
 			inWord = false
 		} else if !inWord {
 			// Non-CJK multi-byte scripts (Cyrillic, Greek, accented Latin,
@@ -1380,7 +1875,7 @@ func (p *Processor) countWords(text string) int {
 		}
 		i += size
 	}
-	return count
+	return count, cjk
 }
 
 // isCJKRune reports whether r is a CJK ideograph, kana, or Hangul syllable —
@@ -1397,12 +1892,144 @@ func isCJKRune(r rune) bool {
 	return false
 }
 
-func (p *Processor) calculateReadingTime(wordCount int) time.Duration {
+// calculateReadingTime estimates reading time using separate rates per
+// script: wordsPerMinute for space-separated words, cjkCharsPerMinute for
+// CJK characters (countWords already folded each CJK character into words,
+// so the CJK share is split out here). CJK reading speed is conventionally
+// quoted in characters per minute, and it is roughly 1.75× the English
+// word-per-minute rate.
+func (p *Processor) calculateReadingTime(wordCount, cjkChars int) time.Duration {
 	if wordCount == 0 {
 		return 0
 	}
-	minutes := float64(wordCount) / wordsPerMinute
+	latinWords := max(0, wordCount-cjkChars)
+	minutes := float64(latinWords)/wordsPerMinute + float64(cjkChars)/cjkCharsPerMinute
 	return time.Duration(minutes * float64(time.Minute))
+}
+
+// lowConfidencePhrases are consent-wall and paywall boilerplate markers. A
+// short extraction whose opening text matches one of them almost certainly
+// captured the wall instead of the article (the real content is absent from
+// the DOM, hidden, or behind an interaction), which computeExtractionConfidence
+// reports as a low tier instead of a failure.
+var lowConfidencePhrases = [...]string{
+	"subscribe to continue", "subscribe to read", "subscription to continue",
+	"sign in to continue", "log in to continue", "login to continue",
+	"register to read", "create a free account",
+	"enable cookies", "accept all cookies", "we use cookies", "accept to continue",
+}
+
+// computeExtractionConfidence derives Result.Confidence, a coarse
+// extraction-quality signal in [0, 1]:
+//
+//	0.0  no text extracted
+//	0.4  short (<600 chars) extraction opening with consent/paywall boilerplate,
+//	     or an article node yielding almost no text
+//	0.2/0.4/0.6  body-fallback extraction, tiered by text length
+//	0.6          recognized listing pages (the card list is the page's content,
+//	             but it is not a canonical single-article extraction)
+//	0.6/0.8      article node with short text, or text covering <5% of the
+//	             page's visible body text
+//	1.0          article node, ≥ confidentTextChars of text, covering at least
+//	             confidentBodyRatio of the body text
+//
+// The tiers are deliberately few and documented: callers should treat the
+// value as a triage signal (route <1.0 for review or a fallback strategy),
+// not as a probability.
+func computeExtractionConfidence(method, text string, bodyTextLen int) float64 {
+	textLen := len(text)
+	if textLen == 0 {
+		return 0
+	}
+
+	if method == extractionMethodListing {
+		// A listing's card list is the page's real content, but consumers
+		// treat articles and listings differently; the paywall check below
+		// still applies to listings trapped behind a wall.
+		if textLen < paywallTextMaxChars && containsLowConfidencePhrase(text) {
+			return 0.4
+		}
+		return 0.6
+	}
+
+	if textLen < paywallTextMaxChars && containsLowConfidencePhrase(text) {
+		return 0.4
+	}
+
+	// A sane article covers a reasonable share of the page's visible text. A
+	// body with no text (or no <body> at all) makes the ratio vacuous — treat
+	// it as satisfied rather than penalizing every extraction from it.
+	ratioOK := bodyTextLen <= 0 || float64(textLen) >= confidentBodyRatio*float64(bodyTextLen)
+
+	if method == extractionMethodArticle {
+		switch {
+		case textLen >= confidentTextChars && ratioOK:
+			return 1.0
+		case textLen >= confidentTextChars:
+			return 0.8
+		case textLen >= 50:
+			return 0.6
+		default:
+			return 0.4
+		}
+	}
+	switch {
+	case textLen >= confidentTextChars:
+		return 0.6
+	case textLen >= 50:
+		return 0.4
+	default:
+		return 0.2
+	}
+}
+
+// containsLowConfidencePhrase reports whether text's opening (up to
+// paywallScanChars, rune-boundary safe) contains a consent/paywall boilerplate
+// phrase.
+func containsLowConfidencePhrase(text string) bool {
+	scan := text
+	if len(scan) > paywallScanChars {
+		scan = scan[:paywallScanChars]
+		// Back off to a rune boundary so ToLower cannot see a split rune.
+		for len(scan) > 0 && scan[len(scan)-1]&0xC0 == 0x80 {
+			scan = scan[:len(scan)-1]
+		}
+	}
+	scan = strings.ToLower(scan)
+	for _, phrase := range lowConfidencePhrases {
+		if strings.Contains(scan, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// publishedTimeLayouts are the timestamp layouts metadata producers actually
+// emit, most specific first: RFC 3339 (time.Parse accepts an optional
+// fractional-seconds field even when the layout does not signify one, so a
+// separate RFC3339Nano layout is unnecessary), timezone-less ISO-ish forms
+// (with seconds and minute precision), and a bare date.
+var publishedTimeLayouts = [...]string{
+	time.RFC3339,
+	"2006-01-02T15:04:05",
+	"2006-01-02 15:04:05",
+	"2006-01-02 15:04",
+	"2006-01-02",
+}
+
+// parsePublishedTime parses a raw metadata timestamp, returning the zero time
+// when it is empty or matches none of the known layouts.
+func parsePublishedTime(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	for _, layout := range publishedTimeLayouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 // cloneResult returns a deep copy of a Result to prevent data races

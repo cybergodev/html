@@ -54,6 +54,21 @@ var charsetAliases = map[string]string{
 	"1250":        "windows-1250",
 	"cp1250":      "windows-1250",
 	"windows1250": "windows-1250",
+	"1253":        "windows-1253",
+	"cp1253":      "windows-1253",
+	"windows1253": "windows-1253",
+	"1254":        "windows-1254",
+	"cp1254":      "windows-1254",
+	"windows1254": "windows-1254",
+	"1255":        "windows-1255",
+	"cp1255":      "windows-1255",
+	"windows1255": "windows-1255",
+	"1256":        "windows-1256",
+	"cp1256":      "windows-1256",
+	"windows1256": "windows-1256",
+	"1258":        "windows-1258",
+	"cp1258":      "windows-1258",
+	"windows1258": "windows-1258",
 	// ISO-8859 variants
 	"8859-1":      "iso-8859-1",
 	"88591":       "iso-8859-1",
@@ -91,11 +106,17 @@ var charsetAliases = map[string]string{
 	"euc-kr": "euc-kr",
 	"euc_kr": "euc-kr",
 	"euckr":  "euc-kr",
+	// Cyrillic
+	"koi8-r": "koi8-r",
+	"koi8r":  "koi8-r",
+	"koi8":   "koi8-r",
 	// Chinese
 	"gb2312":     "gbk",
 	"gb2312-80":  "gbk",
 	"gb2312_80":  "gbk",
 	"gbk":        "gbk",
+	"gb18030":    "gb18030",
+	"gb-18030":   "gb18030",
 	"big5":       "big5",
 	"big-5":      "big5",
 	"big5-hkscs": "big5",
@@ -126,10 +147,7 @@ func extractCharsetFromBytes(data []byte) string {
 	}
 
 	// Limit search area to first 1024 bytes
-	maxSearch := 1024
-	if dataLen < maxSearch {
-		maxSearch = dataLen
-	}
+	maxSearch := min(dataLen, 1024)
 
 	// Look for <meta charset="..."> using byte comparison. HTML5 allows ASCII
 	// whitespace around the '=', so skip any between the attribute name and
@@ -148,7 +166,9 @@ func extractCharsetFromBytes(data []byte) string {
 		}
 	}
 
-	// Look for charset= in meta tags
+	// Look for charset= anywhere in the first 1KB — unlike the <meta-prefixed
+	// scan above and the regex backstops below, this byte scan carries no tag
+	// context, so a literal "charset=" in early title/body text matches too.
 	remaining := data[:maxSearch]
 	for len(remaining) > 8 {
 		idx := asciiIndexIgnoreCaseBytes(remaining, []byte("charset="))
@@ -179,7 +199,7 @@ func asciiIndexIgnoreCaseBytes(data, pattern []byte) int {
 	// Simple search for byte slices
 	for i := 0; i <= dataLen-patternLen; i++ {
 		match := true
-		for j := 0; j < patternLen; j++ {
+		for j := range patternLen {
 			dc := data[i+j]
 			pc := pattern[j]
 			// Fast ASCII lowercase conversion
@@ -201,6 +221,13 @@ func asciiIndexIgnoreCaseBytes(data, pattern []byte) int {
 	return -1
 }
 
+// isHTML5ASCIIWhitespace reports whether c is one of the five ASCII
+// whitespace bytes HTML5 allows between markup tokens: space, tab, line
+// feed, form feed, carriage return.
+func isHTML5ASCIIWhitespace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r'
+}
+
 // extractAttributeValueBytes extracts an HTML attribute value from byte slice.
 // Returns empty string if not found.
 func extractAttributeValueBytes(data []byte) string {
@@ -209,9 +236,11 @@ func extractAttributeValueBytes(data []byte) string {
 		return ""
 	}
 
-	// Skip leading whitespace
+	// Skip leading whitespace — all five HTML5 ASCII whitespace bytes: the
+	// name-side scan above accepts them between the attribute name and '=',
+	// and a newline after the '=' (legal markup) used to leak into the value.
 	start := 0
-	for start < dataLen && (data[start] == ' ' || data[start] == '\t') {
+	for start < dataLen && isHTML5ASCIIWhitespace(data[start]) {
 		start++
 	}
 	if start >= dataLen {
@@ -236,7 +265,7 @@ func extractAttributeValueBytes(data []byte) string {
 	end := 0
 	for end < dataLen {
 		c := data[end]
-		if c == ' ' || c == '\t' || c == '>' || c == ';' || c == '"' || c == '\'' {
+		if isHTML5ASCIIWhitespace(c) || c == '>' || c == ';' || c == '"' || c == '\'' {
 			break
 		}
 		end++
@@ -306,14 +335,20 @@ func (ed *EncodingDetector) DetectCharset(data []byte) string {
 		return normalizeCharset(ed.ForcedEncoding)
 	}
 
+	// Run the basic pass ONCE and share it with the smart pass: the fallback
+	// below needs the basic answer when smart confidence lands under 80, and
+	// DetectCharsetSmart used to recompute it — full-document UTF-8 validation
+	// plus the BOM/meta scan — a second time on exactly that path.
+	basicCharset := ed.DetectCharsetBasic(data)
+
 	// Use smart detection if enabled
 	if ed.EnableSmartDetection {
-		if match := ed.DetectCharsetSmart(data); match.Confidence >= 80 {
+		if match := ed.detectCharsetSmart(data, basicCharset); match.Confidence >= 80 {
 			return match.Charset
 		}
 	}
 
-	return ed.DetectCharsetBasic(data)
+	return basicCharset
 }
 
 // detectBOMCharset returns the charset declared by a byte-order mark at the
@@ -350,29 +385,25 @@ func (ed *EncodingDetector) DetectCharsetBasic(data []byte) string {
 	}
 
 	// Pre-compute sample size once
-	sampleSize := 1024
-	if dataLen < sampleSize {
-		sampleSize = dataLen
-	}
+	sampleSize := min(dataLen, 1024)
 	sample := data[:sampleSize]
 
-	// Fast path: Check if sample is pure ASCII (no high bytes)
-	// Pure ASCII is valid UTF-8 and doesn't need charset conversion
-	isPureASCII := true
-	for i := 0; i < sampleSize; i++ {
-		if sample[i]&0x80 != 0 {
-			isPureASCII = false
-			break
-		}
-	}
-
-	if isPureASCII {
+	// Fast path: a pure-ASCII sample (no high bytes) is valid UTF-8 and needs
+	// no charset conversion. isPureASCII is the same helper scoreUTF8 uses —
+	// its 64-bit word-at-a-time scan replaced a byte loop that had drifted
+	// from the optimized twin defined in this file.
+	if isPureASCII(sample) {
 		// For pure ASCII, we still need to check meta tags for declared encoding
 		// Use byte-based extraction to avoid string allocation
 		if declaredCharset := extractCharsetFromBytes(sample); declaredCharset != "" {
-			return normalizeCharset(declaredCharset)
+			// A value that normalizes to nothing (whitespace-only) is not a
+			// usable declaration: returning "" as the detected charset would
+			// surface downstream as an "unsupported encoding \"\"" error.
+			if c := normalizeCharset(declaredCharset); c != "" {
+				return c
+			}
 		}
-		// Pure ASCII with no charset declaration defaults to UTF-8
+		// Pure ASCII with no usable charset declaration defaults to UTF-8
 		return "utf-8"
 	}
 
@@ -395,17 +426,25 @@ func (ed *EncodingDetector) DetectCharsetBasic(data []byte) string {
 	// This is necessary because the original data slice may be modified by the caller
 	htmlStart := string(sample)
 
-	// Try to detect from meta tags using fast string-based extraction
+	// Try to detect from meta tags using fast string-based extraction. The
+	// non-empty guard keeps a whitespace-only declared value (e.g.
+	// <meta charset=" ">) from returning "" as the detected charset.
 	if declaredCharset := extractCharsetFromHTML(htmlStart); declaredCharset != "" {
-		return normalizeCharset(declaredCharset)
+		if c := normalizeCharset(declaredCharset); c != "" {
+			return c
+		}
 	}
 
 	// Fallback to regex patterns for edge cases not handled by string extraction
 	if matches := charsetPattern.FindStringSubmatch(htmlStart); len(matches) > 1 {
-		return normalizeCharset(matches[1])
+		if c := normalizeCharset(matches[1]); c != "" {
+			return c
+		}
 	}
 	if matches := charsetPatternAlt.FindStringSubmatch(htmlStart); len(matches) > 1 {
-		return normalizeCharset(matches[1])
+		if c := normalizeCharset(matches[1]); c != "" {
+			return c
+		}
 	}
 
 	// Default to windows-1252 for HTML (most common fallback for Western content).
@@ -419,15 +458,29 @@ func (ed *EncodingDetector) DetectCharsetBasic(data []byte) string {
 // falling back to the default documented on MaxSampleSize when unset (<=0). It
 // centralizes the bound shared by DetectCharsetSmart and tryAllEncodings so the
 // two sampling paths cannot drift.
+//
+// The 1MB cap mirrors SetMaxSampleSize's documented maximum: MaxSampleSize is
+// an exported field a caller can set directly, so clamping only in the setter
+// left the documented bound unenforced for a hand-built EncodingDetector.
 func (ed *EncodingDetector) sampleSizeOrDefault() int {
+	const maxSize = 1024 * 1024 // 1MB, matches SetMaxSampleSize
 	if ed.MaxSampleSize > 0 {
-		return ed.MaxSampleSize
+		return min(ed.MaxSampleSize, maxSize)
 	}
 	return 10240
 }
 
 // DetectCharsetSmart performs intelligent charset detection using statistical analysis
 func (ed *EncodingDetector) DetectCharsetSmart(data []byte) EncodingMatch {
+	return ed.detectCharsetSmart(data, ed.DetectCharsetBasic(data))
+}
+
+// detectCharsetSmart is DetectCharsetSmart with the caller-supplied basic-pass
+// result, so DetectCharset can run basic ONCE and share it: its low-confidence
+// fallback needs the basic answer, and re-running the whole basic pass —
+// full-document UTF-8 validation plus the BOM/meta scan — doubled the work on
+// exactly that path.
+func (ed *EncodingDetector) detectCharsetSmart(data []byte, basicCharset string) EncodingMatch {
 	// Honor an explicit override first, mirroring DetectCharset. Without this a
 	// direct caller of DetectCharsetSmart with ForcedEncoding set got
 	// auto-detection instead; DetectAndConvert used to short-circuit this
@@ -460,8 +513,7 @@ func (ed *EncodingDetector) DetectCharsetSmart(data []byte) EncodingMatch {
 		}
 	}
 
-	// First, try basic detection
-	basicCharset := ed.DetectCharsetBasic(data)
+	// The basic pass result arrives as a parameter (see detectCharsetSmart).
 
 	// Step 1: Quick validation of basic detection
 	// For meta-tag declared UTF-8, give it high priority
@@ -731,6 +783,18 @@ func getEncoding(charset string) encoding.Encoding {
 		return charmap.Windows1251 // Cyrillic
 	case "windows-1250":
 		return charmap.Windows1250 // Central European
+	case "windows-1253":
+		return charmap.Windows1253 // Greek
+	case "windows-1254":
+		return charmap.Windows1254 // Turkish
+	case "windows-1255":
+		return charmap.Windows1255 // Hebrew
+	case "windows-1256":
+		return charmap.Windows1256 // Arabic
+	case "windows-1258":
+		return charmap.Windows1258 // Vietnamese
+	case "koi8-r":
+		return charmap.KOI8R // Cyrillic
 	case "iso-8859-1":
 		return charmap.ISO8859_1
 	case "iso-8859-15":
@@ -773,6 +837,8 @@ func getEncoding(charset string) encoding.Encoding {
 		return korean.EUCKR
 	case "gbk":
 		return simplifiedchinese.GBK
+	case "gb18030":
+		return simplifiedchinese.GB18030
 	case "big5":
 		return traditionalchinese.Big5
 	default:
@@ -896,7 +962,7 @@ func isPureASCII(data []byte) bool {
 	// This defensive check ensures we don't read beyond allocated memory.
 	// For small slices, fall back to safe byte-by-byte checking.
 	if n < 8 {
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if data[i] >= 0x80 {
 				return false
 			}
@@ -1173,13 +1239,10 @@ func calculatePrintableRatio(data []byte) float64 {
 	}
 
 	// Sample-based analysis for large data to avoid full scan
-	sampleSize := dataLen
-	if sampleSize > 4096 {
-		sampleSize = 4096
-	}
+	sampleSize := min(dataLen, 4096)
 
 	printable := 0
-	for i := 0; i < sampleSize; i++ {
+	for i := range sampleSize {
 		if isPrintable(data[i]) {
 			printable++
 		}
@@ -1278,10 +1341,15 @@ func calculateValidUTF8RatioFull(data []byte) float64 {
 	return float64(valid) / float64(dataLen)
 }
 
-// countCJKCharacters counts CJK (Chinese, Japanese, Korean) characters
+// countCJKCharacters counts CJK (Chinese, Japanese, Korean) characters.
+// Decode in place: the caller (scoreDecodedData) guarantees valid UTF-8, so
+// utf8.DecodeRune steps the same rune sequence `range string(data)` did
+// without the full-buffer copy per scoring candidate.
 func countCJKCharacters(data []byte) int {
 	count := 0
-	for _, r := range string(data) {
+	for i := 0; i < len(data); {
+		r, size := utf8.DecodeRune(data[i:])
+		i += size
 		// CJK Unified Ideographs block
 		if (r >= 0x4E00 && r <= 0x9FFF) ||
 			(r >= 0x3400 && r <= 0x4DBF) ||
@@ -1304,9 +1372,12 @@ func countCJKCharacters(data []byte) int {
 	return count
 }
 
-// hasCyrillicCharacters checks for Cyrillic alphabet characters
+// hasCyrillicCharacters checks for Cyrillic alphabet characters. Decodes in
+// place for the same reason countCJKCharacters does.
 func hasCyrillicCharacters(data []byte) bool {
-	for _, r := range string(data) {
+	for i := 0; i < len(data); {
+		r, size := utf8.DecodeRune(data[i:])
+		i += size
 		if (r >= 0x0400 && r <= 0x04FF) || // Cyrillic
 			(r >= 0x0500 && r <= 0x052F) || // Cyrillic Supplement
 			(r >= 0x2DE0 && r <= 0x2DFF) || // Cyrillic Extended-A

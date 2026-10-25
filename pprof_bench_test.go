@@ -56,6 +56,60 @@ func BenchmarkRealisticNoCache(b *testing.B) {
 	}
 }
 
+// realisticFormattedDoc builds the same shape of article as realisticDoc but
+// pretty-printed: every element on its own line, indented. Server-rendered
+// pages commonly look like this, and it exercises a path the compact builders
+// do not — whitespace-only text nodes between tags, which the text pass must
+// normalize (newlines) and then discard as empty content.
+func realisticFormattedDoc() string {
+	var sb strings.Builder
+	sb.WriteString("<html>\n  <head>\n    <title>Formatted Article</title>\n  </head>\n  <body>\n")
+	sb.WriteString("    <nav>\n      <a href=\"/home\">Home</a>\n      <a href=\"/about\">About</a>\n    </nav>\n")
+	sb.WriteString("    <article>\n      <h1>Main Title</h1>\n")
+	for i := 0; i < 80; i++ {
+		fmt.Fprintf(&sb, "      <h2>Section %d &amp; Notes</h2>\n", i)
+		fmt.Fprintf(&sb, "      <p>Paragraph %d has <a href=\"/p/%d\">a link</a> and text content.</p>\n", i, i)
+		if i%5 == 0 {
+			fmt.Fprintf(&sb, "      <img src=\"/img/%d.jpg\" alt=\"Image %d\">\n", i, i)
+		}
+	}
+	sb.WriteString("      <table>\n")
+	for r := 0; r < 10; r++ {
+		sb.WriteString("        <tr><td>cell-a</td><td>cell-b</td><td>cell-c</td></tr>\n")
+	}
+	sb.WriteString("      </table>\n")
+	sb.WriteString("      <aside><a href=\"https://ext.example.com\" rel=\"nofollow\">external</a></aside>\n")
+	sb.WriteString("      <footer>Footer &copy; 2026</footer>\n")
+	sb.WriteString("    </article>\n  </body>\n</html>\n")
+	return sb.String()
+}
+
+// BenchmarkRealisticFormatted measures the full extraction path on the
+// pretty-printed document (cache and timeout disabled).
+func BenchmarkRealisticFormatted(b *testing.B) {
+	cfg := html.DefaultConfig()
+	cfg.MaxCacheEntries = 0 // disable cache to measure real extraction
+	cfg.ProcessingTimeout = 0
+	p, err := html.New(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+	doc := []byte(realisticFormattedDoc())
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r, err := p.Extract(doc)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if r.Title == "" {
+			b.Fatal("expected a title")
+		}
+	}
+}
+
 // BenchmarkRealisticDefault measures the default-config path (cache + timeout goroutine).
 func BenchmarkRealisticDefault(b *testing.B) {
 	p, _ := html.New()

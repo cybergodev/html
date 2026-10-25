@@ -26,7 +26,10 @@ type CellAccessor interface {
 // NodeWalker provides methods for walking the DOM tree.
 type NodeWalker interface {
 	// Walk traverses the DOM tree starting from node, calling callback for each node.
-	// The callback returns false to stop traversal, true to continue.
+	// The callback returns false to skip that node's subtree (its children are
+	// not visited); traversal continues with the node's siblings. Returning
+	// false does NOT abort the whole walk — extractTableData relies on this,
+	// pruning each processed row's children while later rows are still visited.
 	Walk(node *html.Node, callback func(*html.Node) bool)
 }
 
@@ -47,6 +50,23 @@ func NewProcessor(ca CellAccessor, nw NodeWalker) *Processor {
 // Extract extracts HTML table content and converts it to the specified format.
 // This is the main method for table extraction using the Processor.
 func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat string) {
+	p.extract(table, tb, tableFormat, nil)
+}
+
+// ExtractWithCellText is Extract with a cell-text override: cellText builds a
+// cell's text instead of the accessor's GetTextContent. The extraction pass
+// passes a token-emitting builder here (internal.tableTokenText) so cell
+// anchors and images reach the output as [LINK:n]/[IMAGE:n] placeholders that
+// the caller's formatInline* pass then substitutes — table links keep their
+// URLs instead of collapsing to bare labels. The closure is also invoked for
+// non-cell row children with its result discarded, advancing the counters
+// exactly as the document-order collector does for stray content outside
+// td/th. A nil cellText is equivalent to Extract.
+func (p *Processor) ExtractWithCellText(table *html.Node, tb *TrackedBuilder, tableFormat string, cellText func(*html.Node) string) {
+	p.extract(table, tb, tableFormat, cellText)
+}
+
+func (p *Processor) extract(table *html.Node, tb *TrackedBuilder, tableFormat string, cellText func(*html.Node) string) {
 	if table == nil {
 		return
 	}
@@ -63,31 +83,40 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 		tableFormat = "markdown"
 	}
 
+	// Step 1: Extract all row data from table. This runs before the leading
+	// blank line is written so a table with no renderable rows (no <tr>, or
+	// rows without td/th cells) emits nothing at all — a newline pair written
+	// up front inserted a paragraph break the source document did not have.
+	tableData := p.extractTableData(table, tableFormat, cellText)
+
+	if len(tableData) == 0 {
+		return
+	}
+
 	// Ensure blank line before table for proper Markdown parsing
 	EnsureNewline(tb)
 	if tb.LastChar == '\n' {
 		_ = tb.WriteByte('\n')
 	}
 
-	// Step 1: Extract all row data from table
-	tableData := p.extractTableData(table, tableFormat)
-
-	if len(tableData) == 0 {
-		return
+	// Step 2: Determine maximum columns — only the Markdown renderer consumes
+	// it (the rowspan grid and column filtering); the HTML renderer ignores
+	// it, so skip the full rowspan placement replay for the html format.
+	// getRenderer falls back to Markdown for unknown formats, and that
+	// fallback needs the value, so the computation runs for everything but an
+	// exact "html".
+	maxCols := 0
+	if tableFormat != "html" {
+		maxCols = calculateMaxColumns(tableData)
 	}
 
-	// Step 2: Determine maximum columns
-	maxCols := calculateMaxColumns(tableData)
-
-	// Step 3: Render in the requested format. getRenderer falls back to
-	// Markdown for unknown formats.
+	// Step 3: Render in the requested format.
 	getRenderer(tableFormat).Render(tableData, tb, maxCols)
 
-	// Ensure blank line after table for proper Markdown parsing
-	_ = tb.WriteByte('\n')
-	if tb.LastChar == '\n' {
-		_ = tb.WriteByte('\n')
-	}
+	// Ensure blank line after table for proper Markdown parsing. WriteByte
+	// unconditionally records the byte in LastChar, so after the '\n' just
+	// written the second newline was unconditional — write the pair directly.
+	_, _ = tb.WriteString("\n\n")
 }
 
 // maxExpandedCells bounds the AGGREGATE number of colspan placeholder cells a
@@ -101,7 +130,7 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 const maxExpandedCells = 10000
 
 // extractTableData walks through table rows and extracts cell data.
-func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]CellData {
+func (p *Processor) extractTableData(table *html.Node, tableFormat string, cellText func(*html.Node) string) [][]CellData {
 	// tableFormat arrives already normalized by Extract (lowercased, trimmed,
 	// empty defaulted to "markdown"), so the colspan-expansion and
 	// structure-row branches below and getRenderer's dispatch all see the
@@ -135,12 +164,25 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string) [][]C
 	expanded := 0
 
 	p.nodeWalker.Walk(table, func(node *html.Node) bool {
-		if node.Type != html.ElementNode || node.Data != "tr" {
+		if node.Type != html.ElementNode {
+			return true
+		}
+		// <template> is the one non-cell element the HTML parser keeps
+		// between rows (phrasing strays are foster-parented out of the
+		// table), and its parsed anchors are numbered by the section-wide
+		// collector. Burn them — text discarded, exactly like stray row
+		// children — so the counters stay aligned; rows below this node
+		// still process normally.
+		if cellText != nil && node.Data == "template" {
+			_ = cellText(node)
+			return false
+		}
+		if node.Data != "tr" {
 			return true
 		}
 
 		// Extract this row's cells into the reusable buffer.
-		rowBuf = p.appendRowCells(rowBuf[:0], node)
+		rowBuf = p.appendRowCells(rowBuf[:0], node, cellText)
 		if len(rowBuf) == 0 {
 			return false
 		}
@@ -200,24 +242,41 @@ func expandedPlaceholder(origin CellData) CellData {
 // (rowBuf[:0]) reuses its capacity across rows, so a table of N rows performs
 // O(1) allocations rather than one per row.
 //
+// When cellText is non-nil it builds each cell's text (token-aware) and is
+// also invoked — result discarded — on non-cell element children of the row,
+// so stray anchors between cells advance the [LINK:n]/[IMAGE:n] counters in
+// exactly the document order the section-wide collector numbered them.
+//
 // The returned slice belongs to the caller and is the only handle to those
 // cells — there is no shared scratch that a later row could overwrite while
 // the caller is still reading. The previous signature took a *[]CellData and
 // returned a slice aliasing that shared buffer, which required the caller to
 // know it had to finish reading before the next row was extracted.
-func (p *Processor) appendRowCells(dst []CellData, rowNode *html.Node) []CellData {
+func (p *Processor) appendRowCells(dst []CellData, rowNode *html.Node, cellText func(*html.Node) string) []CellData {
 	for child := rowNode.FirstChild; child != nil; child = child.NextSibling {
-		if child.Type != html.ElementNode || (child.Data != "td" && child.Data != "th") {
+		if child.Type != html.ElementNode {
+			continue
+		}
+		if child.Data != "td" && child.Data != "th" {
+			if cellText != nil {
+				_ = cellText(child) // counter-accurate, text discarded
+			}
 			continue
 		}
 
-		colspan := p.cellAccessor.GetColSpan(child)
-		if colspan < 1 {
-			colspan = 1
+		// GetTextContent is the hottest allocator in extraction (invoked once
+		// per table cell); when the token-aware walker is active its result
+		// fully replaces the plain text, so walk the subtree only once.
+		var text string
+		if cellText != nil {
+			text = cellText(child)
+		} else {
+			text = p.cellAccessor.GetTextContent(child)
 		}
+		colspan := max(p.cellAccessor.GetColSpan(child), 1)
 
 		dst = append(dst, CellData{
-			Text:            sanitizeCellText(p.cellAccessor.GetTextContent(child)),
+			Text:            sanitizeCellText(text),
 			Align:           p.cellAccessor.GetAlignment(child),
 			Colspan:         colspan,
 			Rowspan:         p.cellAccessor.GetRowSpan(child),

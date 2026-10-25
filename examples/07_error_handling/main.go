@@ -49,14 +49,18 @@ func main() {
 
 	// Demonstrate errors.Is() for sentinel errors
 	fmt.Println("\nAvailable sentinel errors:")
-	fmt.Println("  • html.ErrInputTooLarge    - Input exceeds MaxInputSize")
-	fmt.Println("  • html.ErrInvalidHTML      - HTML parsing failed")
-	fmt.Println("  • html.ErrProcessorClosed  - Operation on closed processor")
-	fmt.Println("  • html.ErrMaxDepthExceeded - Nesting exceeds MaxDepth")
-	fmt.Println("  • html.ErrInvalidConfig    - Configuration validation failed")
-	fmt.Println("  • html.ErrProcessingTimeout - Processing exceeded timeout")
-	fmt.Println("  • html.ErrFileNotFound     - File does not exist")
-	fmt.Println("  • html.ErrInvalidFilePath  - Path validation failed")
+	fmt.Println("  • html.ErrInputTooLarge        - Input exceeds MaxInputSize")
+	fmt.Println("  • html.ErrInvalidHTML          - HTML parsing failed")
+	fmt.Println("  • html.ErrProcessorClosed      - Operation on closed processor")
+	fmt.Println("  • html.ErrMaxDepthExceeded     - Nesting exceeds MaxDepth")
+	fmt.Println("  • html.ErrInvalidConfig        - Configuration validation failed")
+	fmt.Println("  • html.ErrProcessingTimeout    - Processing exceeded timeout")
+	fmt.Println("  • html.ErrFileNotFound         - File does not exist")
+	fmt.Println("  • html.ErrInvalidFilePath      - Path validation failed")
+	fmt.Println("  • html.ErrInternalPanic        - Internal panic was recovered")
+	fmt.Println("  • html.ErrMultipleConfigs      - More than one Config argument given")
+	fmt.Println("  • html.ErrBatchTooLarge        - Batch exceeds 10,000 items")
+	fmt.Println("  • html.ErrTooManyConcurrentOps - Too many concurrent one-shot calls")
 
 	// Example: Create processor with small limit to trigger ErrInputTooLarge
 	smallCfg := html.DefaultConfig()
@@ -73,6 +77,18 @@ func main() {
 		fmt.Println("\n✓ Use errors.Is() to check for specific error types")
 	}
 
+	// Nesting deeper than Config.MaxDepth (default 500) is rejected outright,
+	// guarding against stack overflow on hostile input.
+	deepInput := []byte(strings.Repeat("<div>", 501))
+	if _, depthErr := processor.Extract(deepInput); errors.Is(depthErr, html.ErrMaxDepthExceeded) {
+		fmt.Println("✓ 501-level nesting → ErrMaxDepthExceeded")
+	}
+
+	// Variadic-config entry points accept at most one Config.
+	if _, cfgErr := html.Extract([]byte("<p>ok</p>"), html.DefaultConfig(), html.DefaultConfig()); errors.Is(cfgErr, html.ErrMultipleConfigs) {
+		fmt.Println("✓ Two Config arguments → ErrMultipleConfigs")
+	}
+
 	// ============================================================
 	// 3. Custom Error Types
 	// ============================================================
@@ -84,9 +100,8 @@ func main() {
 	fmt.Println("  • html.ConfigError - Field, Value, Message fields")
 	fmt.Println("  • html.FileError   - Op, Path, FileErr fields")
 
-	// Example: Type assertion for more details
-	var inputErr *html.InputError
-	if errors.As(err, &inputErr) {
+	// Example: Type assertion for more details (Go 1.26 errors.AsType)
+	if inputErr, ok := errors.AsType[*html.InputError](err); ok {
 		fmt.Printf("\nInputError details:\n")
 		fmt.Printf("  Operation: %s\n", inputErr.Op)
 		fmt.Printf("  Size: %d\n", inputErr.Size)
@@ -97,15 +112,14 @@ func main() {
 	// (wrapping ErrInvalidConfig). A zero-value Config fails because
 	// MaxInputSize must be positive — always start from DefaultConfig().
 	_, err = html.New(html.Config{})
-	var cfgErr *html.ConfigError
-	if errors.As(err, &cfgErr) {
+	if cfgErr, ok := errors.AsType[*html.ConfigError](err); ok {
 		fmt.Printf("\nConfigError: field=%s, message=%q\n", cfgErr.Field, cfgErr.Message)
 	}
 	if errors.Is(err, html.ErrInvalidConfig) {
 		fmt.Println("  ✓ errors.Is(err, html.ErrInvalidConfig)")
 	}
 
-	fmt.Println("\n✓ Use errors.As() to access error details")
+	fmt.Println("\n✓ Use errors.AsType[T]() to access error details (Go 1.26+)")
 
 	// ============================================================
 	// 4. Processor Lifecycle
@@ -184,8 +198,7 @@ func main() {
 	// Non-existent file
 	_, err = processor2.ExtractFromFile("nonexistent.html")
 	if err != nil {
-		var fileErr *html.FileError
-		if errors.As(err, &fileErr) {
+		if fileErr, ok := errors.AsType[*html.FileError](err); ok {
 			fmt.Printf("FileError:\n")
 			fmt.Printf("  Path: %s\n", fileErr.Path)
 			fmt.Printf("  Error: %v\n", fileErr.FileErr)
@@ -205,7 +218,7 @@ func main() {
 	fmt.Println("2. Use errors.Is() for sentinel errors")
 	fmt.Println("   - ErrInputTooLarge, ErrInvalidHTML, ErrProcessorClosed, etc.")
 	fmt.Println()
-	fmt.Println("3. Use errors.As() for custom error types")
+	fmt.Println("3. Use errors.AsType[T]() for custom error types")
 	fmt.Println("   - InputError, ConfigError, FileError")
 	fmt.Println()
 	fmt.Println("4. Handle processor lifecycle with defer")

@@ -52,6 +52,9 @@ func (p *Processor) generateCacheKey(data []byte) [16]byte {
 	if p.config.PreserveAudios {
 		flags |= 1 << 4
 	}
+	if p.config.ExtractMetadata {
+		flags |= 1 << 5
+	}
 	_ = h.WriteByte(flags)
 
 	// Mix format strings

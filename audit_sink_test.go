@@ -8,6 +8,11 @@ package html
 //   - FilteredSink: New / Write / Close (0%)
 //   - LevelFilteredSink: New / Write / Close / meetsLevel (0%)
 //   - auditCollector.RecordEncodingIssue (0%)
+//
+// Plus the D-002 P2 audit-hardening regressions (moved here from the former
+// audit_hardening_regression_test.go): field caps on Record, the
+// MaxRawValueLength zero-fallback, its Validate rejection, and Close
+// error propagation.
 
 import (
 	"bytes"
@@ -122,6 +127,27 @@ func (r *recordingSink) count() int {
 
 // TestFilteredSink covers NewFilteredSink, FilteredSink.Write (both filter-pass
 // and filter-reject branches), and FilteredSink.Close.
+// panickingWriteSink is a MultiSink child whose Write always panics; its
+// Close still succeeds so Close-focused tests can reuse it if they want.
+type panickingWriteSink struct{}
+
+func (panickingWriteSink) Write(AuditEntry) { panic("boom") }
+func (panickingWriteSink) Close() error     { return nil }
+
+func TestMultiSinkWriteIsolatesPanickingChild(t *testing.T) {
+	t.Parallel()
+
+	// One panicking child must not starve the sinks after it of the entry:
+	// fan-out delivery is per-child panic-isolated, so the recording sink
+	// still receives what the panicking one aborted mid-loop.
+	rec := &recordingSink{}
+	multi := NewMultiSink(panickingWriteSink{}, rec)
+	multi.Write(AuditEntry{Message: "m"}) // must not panic
+	if rec.count() != 1 {
+		t.Fatalf("entry not delivered past the panicking child: count=%d", rec.count())
+	}
+}
+
 func TestFilteredSink(t *testing.T) {
 	t.Parallel()
 
@@ -824,8 +850,11 @@ func TestAuditCollectorRecordDepthViolation(t *testing.T) {
 
 // TestScorerAdapterCoverage covers scorerAdapter.ShouldRemove (0%) by using a
 // custom scorer whose ShouldRemove is configured to exercise the adapter's
-// delegation path. The adapter's ShouldRemove is called by the internal scoring
-// pipeline when removing non-content nodes during article extraction.
+// delegation path. Note: the adapter's ShouldRemove is NOT called by the
+// production pipeline — removal decisions are hardwired to the default scorer
+// (see the LIMITATION note on the public Scorer interface) — so the t.Log below
+// is the expected outcome; the test exists to keep the delegation path compiled
+// and covered should that change.
 func TestScorerAdapterCoverage(t *testing.T) {
 	t.Parallel()
 
@@ -1275,4 +1304,137 @@ func TestSEC003SinkConstructorsNoPanic(t *testing.T) {
 			t.Errorf("DroppedCount() = %d, want 0", got)
 		}
 	})
+}
+
+// TestSinkWriteDegenerateReceivers collects the nil-receiver and nil-inner
+// branches of the sink Write methods: every exported sink type must tolerate
+// a nil receiver and (where a list is involved) a nil inner sink without
+// panicking — the same SEC-003 contract the constructors and Close already
+// carry.
+func TestSinkWriteDegenerateReceivers(t *testing.T) {
+	t.Parallel()
+
+	entry := AuditEntry{EventType: AuditEventBlockedTag, Level: AuditLevelInfo}
+
+	var loggerSink *LoggerAuditSink
+	loggerSink.Write(entry) // nil receiver — must not panic
+
+	var zeroLogger LoggerAuditSink // zero value: nil logger field
+	zeroLogger.Write(entry)
+
+	var channelSink *ChannelAuditSink
+	channelSink.Write(entry) // nil receiver — must not panic
+
+	var writerSink *WriterAuditSink
+	writerSink.Write(entry) // nil receiver — must not panic
+
+	var multi *MultiSink
+	multi.Write(entry) // nil receiver — must not panic
+
+	// A MultiSink holding a nil inner sink must skip it, not panic, while the
+	// real sink still receives the entry.
+	rec := &p3RecordingSink{}
+	NewMultiSink(nil, rec).Write(entry)
+	if len(rec.entries) != 1 {
+		t.Errorf("entry not delivered past a nil inner sink: %+v", rec.entries)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// D-002 P2 audit hardening (moved from the former
+// audit_hardening_regression_test.go)
+// ---------------------------------------------------------------------------
+
+// TestAuditFieldsCapped pins the Record caps on every attacker-controlled
+// string field: a hostile multi-megabyte on*-attribute name used to be
+// retained in full in Attribute AND duplicated into Message per entry.
+func TestAuditFieldsCapped(t *testing.T) {
+	t.Parallel()
+
+	c := newAuditCollector(AuditConfig{
+		Enabled:         true,
+		LogBlockedAttrs: true,
+	})
+
+	hugeAttr := "on" + strings.Repeat("A", 1_000_000)
+	c.RecordBlockedAttr(hugeAttr, "x")
+
+	entries := c.GetEntries()
+	if len(entries) != 1 {
+		t.Fatalf("GetEntries() = %d entries, want 1", len(entries))
+	}
+	e := entries[0]
+
+	const capLimit = maxAuditFieldLength + len("...") + 64 // cap + marker + message prose headroom
+	if len(e.Attribute) > maxAuditFieldLength+len("...") {
+		t.Errorf("Attribute not capped: %d bytes", len(e.Attribute))
+	}
+	if len(e.Message) > capLimit {
+		t.Errorf("Message not capped: %d bytes", len(e.Message))
+	}
+	if !strings.HasPrefix(e.Attribute, "onAAA") {
+		t.Errorf("capped Attribute lost its head: %q", e.Attribute[:20])
+	}
+}
+
+// TestMaxRawValueLengthZeroFallsBackToDefault pins the zero-fallback: a
+// hand-built literal with zero MaxRawValueLength is exactly the pattern that
+// previously disabled raw-value truncation entirely. Note the distinction
+// from the direct-Record case in TestAuditCollectorRecordRawValueTruncation
+// ("zero max length disables truncation"): RecordBlockedAttr applies the
+// documented default cap, Record honors an explicit zero.
+func TestMaxRawValueLengthZeroFallsBackToDefault(t *testing.T) {
+	t.Parallel()
+
+	c := newAuditCollector(AuditConfig{
+		Enabled:          true,
+		LogBlockedAttrs:  true,
+		IncludeRawValues: true,
+	})
+
+	c.RecordBlockedAttr("onclick", strings.Repeat("v", 10_000))
+
+	entries := c.GetEntries()
+	if len(entries) != 1 {
+		t.Fatalf("GetEntries() = %d entries, want 1", len(entries))
+	}
+	max := DefaultMaxRawValueLength + len("...")
+	if len(entries[0].RawValue) > max {
+		t.Errorf("RawValue not truncated under the default cap: %d bytes (cap %d)", len(entries[0].RawValue), max)
+	}
+}
+
+func TestConfigValidateRejectsNegativeMaxRawValueLength(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.Audit.MaxRawValueLength = -1
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate accepted a negative Audit.MaxRawValueLength")
+	}
+}
+
+// closeFailingSink is an AuditSink whose Close always fails, to pin that
+// Processor.Close propagates sink close errors.
+type closeFailingSink struct{}
+
+func (closeFailingSink) Write(entry AuditEntry) {}
+func (closeFailingSink) Close() error           { return errors.New("sink close failed") }
+
+func TestCloseReturnsAuditSinkError(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Sink = closeFailingSink{}
+
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := p.Close(); err == nil {
+		t.Error("Close() = nil, want the audit sink's close error")
+	} else if !strings.Contains(err.Error(), "sink close failed") {
+		t.Errorf("Close() = %v, want the sink's close error", err)
+	}
 }

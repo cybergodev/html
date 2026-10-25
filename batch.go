@@ -275,32 +275,17 @@ func (p *Processor) runBatchWithContext(ctx context.Context, extractors []extrac
 	return br
 }
 
-// closedBatchResult creates a BatchResult for a closed processor.
-// It is a free function (not a method) because it does not need the receiver —
-// the processor is nil/closed and must not be dereferenced.
-func closedBatchResult(count int) *BatchResult {
-	br := &BatchResult{
-		Results: make([]*Result, count),
-		Errors:  make([]error, count),
-		Failed:  count,
-	}
-	for i := range count {
-		br.Errors[i] = ErrProcessorClosed
-	}
-	return br
-}
-
 // prepareBatch runs the input guards shared by all four ExtractBatch* methods
 // before any work is dispatched. It returns a non-nil *BatchResult for the
-// short-circuit cases — a nil/closed processor (closedBatchResult), a batch
-// exceeding maxBatchSize (uniformErrorBatch), or an empty batch — and nil to
-// signal "validation passed, build the extractors and proceed". Centralizing
-// these guards removes a 13-line preamble that was duplicated verbatim across
-// the four methods. Safe to call on a nil *Processor: closedBatchResult is a
-// free function and never dereferences the receiver.
+// short-circuit cases — a nil/closed processor (uniformErrorBatch with
+// ErrProcessorClosed), a batch exceeding maxBatchSize, or an empty batch —
+// and nil to signal "validation passed, build the extractors and proceed".
+// Centralizing these guards removes a 13-line preamble that was duplicated
+// verbatim across the four methods. Safe to call on a nil *Processor:
+// uniformErrorBatch is a free function and never dereferences the receiver.
 func (p *Processor) prepareBatch(count int) *BatchResult {
 	if p == nil || p.closed.Load() {
-		return closedBatchResult(count)
+		return uniformErrorBatch(count, ErrProcessorClosed)
 	}
 	if count > maxBatchSize {
 		return uniformErrorBatch(count,

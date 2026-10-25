@@ -80,9 +80,41 @@ func main() {
 	}
 
 	// ============================================================
-	// PART 2: Filter links by type using custom config
+	// PART 2: URL resolution with an explicit BaseURL
 	// ============================================================
-	fmt.Println("\nPart 2: Filter Links by Type")
+	fmt.Println("\nPart 2: URL Resolution (BaseURL)")
+	fmt.Println("--------------------------------")
+
+	// The fixture above carried its own <base> tag. A fetched page usually has
+	// none — set BaseURL to the page's URL and relative references resolve
+	// against it (ResolveRelativeURLs defaults to true).
+	noBaseHTML := `<html><body>
+		<a href="tutorial.html">Tutorial</a>
+		<img src="img/hero.jpg">
+	</body></html>`
+
+	baseCfg := html.DefaultConfig()
+	baseCfg.BaseURL = "https://example.com/blog/"
+	resolved, _ := html.ExtractAllLinks([]byte(noBaseHTML), baseCfg)
+	fmt.Println("ResolveRelativeURLs=true (default):")
+	for _, l := range resolved {
+		fmt.Printf("  %s [%s]\n", l.URL, l.Type)
+	}
+
+	// ResolveRelativeURLs=false keeps the original relative references.
+	relCfg := html.DefaultConfig()
+	relCfg.BaseURL = "https://example.com/blog/"
+	relCfg.ResolveRelativeURLs = false
+	rawLinks, _ := html.ExtractAllLinks([]byte(noBaseHTML), relCfg)
+	fmt.Println("ResolveRelativeURLs=false:")
+	for _, l := range rawLinks {
+		fmt.Printf("  %s [%s]\n", l.URL, l.Type)
+	}
+
+	// ============================================================
+	// PART 3: Filter links by type using custom config
+	// ============================================================
+	fmt.Println("\nPart 3: Filter Links by Type")
 	fmt.Println("----------------------------")
 
 	filterCfg := html.DefaultConfig()
@@ -119,9 +151,9 @@ func main() {
 		len(internalLinks), hasExternal)
 
 	// ============================================================
-	// PART 3: Image extraction
+	// PART 4: Image extraction
 	// ============================================================
-	fmt.Println("\nPart 3: Image Extraction")
+	fmt.Println("\nPart 4: Image Extraction")
 	fmt.Println("------------------------")
 
 	result, _ := processor.Extract([]byte(htmlContent))
@@ -136,9 +168,9 @@ func main() {
 	}
 
 	// ============================================================
-	// PART 4: Video extraction
+	// PART 5: Video extraction
 	// ============================================================
-	fmt.Println("\nPart 4: Video Extraction")
+	fmt.Println("\nPart 5: Video Extraction")
 	fmt.Println("------------------------")
 
 	fmt.Printf("Found %d videos:\n", len(result.Videos))
@@ -155,9 +187,9 @@ func main() {
 	}
 
 	// ============================================================
-	// PART 5: Audio extraction
+	// PART 6: Audio extraction
 	// ============================================================
-	fmt.Println("\nPart 5: Audio Extraction")
+	fmt.Println("\nPart 6: Audio Extraction")
 	fmt.Println("------------------------")
 
 	fmt.Printf("Found %d audio files:\n", len(result.Audios))
@@ -171,9 +203,9 @@ func main() {
 	}
 
 	// ============================================================
-	// PART 6: Selective media extraction
+	// PART 7: Selective media extraction
 	// ============================================================
-	fmt.Println("\nPart 6: Selective Media Extraction")
+	fmt.Println("\nPart 7: Selective Media Extraction")
 	fmt.Println("----------------------------------")
 
 	// Images only (disable video and audio)

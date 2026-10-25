@@ -18,6 +18,9 @@
 |------|------|
 | 🚀 **一行代码提取** | 单个函数调用即可从 HTML 提取纯净文本 |
 | 🔍 **智能文章检测** | 使用评分算法识别主要内容 |
+| 📋 **元数据提取** | 作者、发布时间、描述、站点名、规范链接 |
+| 🎚️ **提取置信度** | 每次提取附带质量信号(文章 / 列表页 / 回退 / 付费墙检测) |
+| 📖 **阅读模式** | 整页结构化阅读视图 —— 导航 / 主体 / 页脚等分区保留并标注,内联超链接,用于向 LLM 喂入纯净页面 |
 | 🌐 **自动编码检测** | 支持 UTF-8、Windows-1252、GBK、Shift_JIS 等 |
 | 🔄 **批量处理** | 支持 Worker Pool 和 Context 的并行提取 |
 | 📦 **多种输出格式** | 文本、Markdown、JSON |
@@ -30,6 +33,7 @@
 ## 🌐 应用场景
 
 - **新闻聚合器**：从新闻网站提取文章内容
+- **LLM 管线**：向语言模型喂入纯净、按结构分区(导航/主体/页脚)的页面内容
 - **网页爬虫**：从 HTML 页面获取结构化数据
 - **内容管理**：将 HTML 转换为 Markdown 或其他格式
 - **搜索引擎**：索引主要内容，排除导航和广告
@@ -75,7 +79,7 @@ func main() {
         log.Fatal(err)
     }
     fmt.Println(text)
-    // 输出: "你好世界\n\n这里是内容..."
+    // 输出: "# 你好世界\n\n这里是内容..."
 }
 ```
 
@@ -151,6 +155,7 @@ func main() {
 
     // 使用默认配置提取
     result, _ := processor.Extract(htmlBytes)
+    fmt.Printf("标题: %s\n", result.Title)
 
     // 从文件提取
     result, _ = processor.ExtractFromFile("page.html")
@@ -248,6 +253,38 @@ func main() {
 ```go
 text, _ := html.ExtractText(htmlBytes)
 // 返回不含导航/广告的纯净文本
+```
+
+### 阅读模式（喂 LLM 的纯净页面）
+
+阅读模式保留整页并按结构分区，而非只选出一篇文章 —— 移除 HTML/CSS/JS 标记，
+超链接以内联形式保留（默认 `[文字](URL)`，或经 `InlineLinkFormat` 输出
+`<a href="...">文字</a>`；链接始终保留 —— `"none"` 仅适用于 Extract 系列），
+每个区域标注为 header / navigation / main / aside / footer。
+广告、隐藏副本与可见的重复菜单会被自动去除：
+
+```go
+// 一次调用,得到可直接放入提示词的 Markdown 文档(带链接):
+markdown, _ := html.ReadPageToMarkdown(htmlBytes)
+
+// 同一文档的无链接版本(结构保留,链接文字作为普通词保留):
+plainText, _ := html.ReadPageToMarkdownText(htmlBytes)
+
+// 或结构化形式 —— 丢弃页面外壳,只喂主体内容:
+page, _ := html.ReadPage(htmlBytes)
+for _, sec := range page.Sections {
+    if sec.Kind == html.SectionMain {
+        prompt := sec.Text // 仅主体内容
+        _ = prompt
+    }
+}
+// page.Render() 拍平为带链接文档;page.RenderText() 不带链接。
+
+// HTML 锚点链接风格 + 绝对 URL:
+cfg := html.DefaultConfig()
+cfg.InlineLinkFormat = "html"
+cfg.BaseURL = "https://example.com/docs/"
+page, _ = html.ReadPage(htmlBytes, cfg)
 ```
 
 ### 从文件提取
@@ -399,6 +436,20 @@ html.ExtractWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (*
 html.ExtractFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (*Result, error)
 html.ExtractTextWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error)
 html.ExtractTextFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error)
+
+// 阅读模式（喂 LLM 的整页结构化阅读视图）
+html.ReadPage(htmlBytes []byte, cfg ...Config) (*ReadResult, error)
+html.ReadPageFromFile(filePath string, cfg ...Config) (*ReadResult, error)
+html.ReadPageWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (*ReadResult, error)
+html.ReadPageFromFileWithContext(ctx context.Context, filePath string, cfg ...Config) (*ReadResult, error)
+html.ReadPageToMarkdown(htmlBytes []byte, cfg ...Config) (string, error)            // 带链接
+html.ReadPageToMarkdownText(htmlBytes []byte, cfg ...Config) (string, error)        // 不带链接
+html.ReadPageFromFileToMarkdown(filePath string, cfg ...Config) (string, error)     // 带链接
+html.ReadPageFromFileToMarkdownText(filePath string, cfg ...Config) (string, error) // 不带链接
+html.ReadPageToMarkdownWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error)
+html.ReadPageToMarkdownTextWithContext(ctx context.Context, htmlBytes []byte, cfg ...Config) (string, error)
+html.ReadPageFromFileToMarkdownWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error)
+html.ReadPageFromFileToMarkdownTextWithContext(ctx context.Context, filePath string, cfg ...Config) (string, error)
 ```
 
 ### Processor 方法
@@ -440,6 +491,20 @@ processor.ExtractAllLinksFromFile(filePath string) ([]LinkResource, error)
 processor.ExtractAllLinksWithContext(ctx context.Context, htmlBytes []byte) ([]LinkResource, error)
 processor.ExtractAllLinksFromFileWithContext(ctx context.Context, filePath string) ([]LinkResource, error)
 
+// 阅读模式（喂 LLM 的整页结构化阅读视图）
+processor.ReadPage(htmlBytes []byte) (*ReadResult, error)
+processor.ReadPageFromFile(filePath string) (*ReadResult, error)
+processor.ReadPageWithContext(ctx context.Context, htmlBytes []byte) (*ReadResult, error)
+processor.ReadPageFromFileWithContext(ctx context.Context, filePath string) (*ReadResult, error)
+processor.ReadPageToMarkdown(htmlBytes []byte) (string, error)            // 带链接
+processor.ReadPageToMarkdownText(htmlBytes []byte) (string, error)        // 不带链接
+processor.ReadPageFromFileToMarkdown(filePath string) (string, error)     // 带链接
+processor.ReadPageFromFileToMarkdownText(filePath string) (string, error) // 不带链接
+processor.ReadPageToMarkdownWithContext(ctx context.Context, htmlBytes []byte) (string, error)
+processor.ReadPageToMarkdownTextWithContext(ctx context.Context, htmlBytes []byte) (string, error)
+processor.ReadPageFromFileToMarkdownWithContext(ctx context.Context, filePath string) (string, error)
+processor.ReadPageFromFileToMarkdownTextWithContext(ctx context.Context, filePath string) (string, error)
+
 // 批处理
 processor.ExtractBatch(htmlContents [][]byte) *BatchResult
 processor.ExtractBatchWithContext(ctx context.Context, htmlContents [][]byte) *BatchResult
@@ -471,16 +536,24 @@ html.HighSecurityAuditConfig() AuditConfig   // 安全优化审计配置
 
 ```go
 type Result struct {
-    Text           string        `json:"text"`
-    Title          string        `json:"title"`
-    Images         []ImageInfo   `json:"images,omitempty"`
-    Links          []LinkInfo    `json:"links,omitempty"`
-    Videos         []VideoInfo   `json:"videos,omitempty"`
-    Audios         []AudioInfo   `json:"audios,omitempty"`
-    ProcessingTime time.Duration `json:"-"` // 通过 MarshalJSON 序列化为 "processing_time_ms"
-    WordCount      int           `json:"word_count"`
-    ReadingTime    time.Duration `json:"-"` // 通过 MarshalJSON 序列化为 "reading_time_ms"
+    Text             string        `json:"text"`
+    Title            string        `json:"title"`
+    Images           []ImageInfo   `json:"images,omitempty"`
+    Links            []LinkInfo    `json:"links,omitempty"`
+    Videos           []VideoInfo   `json:"videos,omitempty"`
+    Audios           []AudioInfo   `json:"audios,omitempty"`
+    ProcessingTime   time.Duration `json:"-"` // 通过 MarshalJSON 序列化为 "processing_time_ms"
+    WordCount        int           `json:"word_count"`
+    ReadingTime      time.Duration `json:"-"` // 通过 MarshalJSON 序列化为 "reading_time_ms"
+    Author           string        `json:"author,omitempty"`        // JSON-LD author 或 <meta name="author">
+    PublishedTime    time.Time     `json:"published_time,omitzero"` // 零值 = 未知
+    Description      string        `json:"description,omitempty"`
+    SiteName         string        `json:"site_name,omitempty"`
+    CanonicalURL     string        `json:"canonical_url,omitempty"`
+    Confidence       float64       `json:"confidence"`                  // 质量信号,范围 [0, 1]
+    ExtractionMethod string        `json:"extraction_method,omitempty"` // "article" | "listing" | "body"
 }
+// 元数据字段依赖 ExtractMetadata(默认开启)——参见 examples/12_metadata_quality/。
 
 type ImageInfo struct {
     URL          string `json:"url"`
@@ -527,6 +600,27 @@ type NodeAttr struct {
     Value string
 }
 
+type ReadResult struct {
+    Title          string        `json:"title"`
+    Author         string        `json:"author,omitempty"`
+    PublishedTime  time.Time     `json:"published_time,omitzero"`
+    Description    string        `json:"description,omitempty"`
+    SiteName       string        `json:"site_name,omitempty"`
+    CanonicalURL   string        `json:"canonical_url,omitempty"`
+    Sections       []PageSection `json:"sections"`
+    ProcessingTime time.Duration `json:"-"`
+}
+// ReadResult.Render() 拍平为带链接文档;RenderText() 不带链接。
+
+type PageSection struct {
+    Kind      SectionKind `json:"kind"`  // "header", "navigation", "main", "aside", "footer"
+    Text      string      `json:"text"`  // 带内联链接(按 InlineLinkFormat 风格)
+    PlainText string      `json:"plain_text,omitempty"` // 无链接版本
+    Links     []LinkInfo  `json:"links,omitempty"`
+    Images    []ImageInfo `json:"images,omitempty"` // 区域内图片(受 PreserveImages 控制)
+    WordCount int         `json:"word_count"` // 按 PlainText 计词
+}
+
 type BatchResult struct {
     Results    []*Result
     Errors     []error
@@ -567,8 +661,9 @@ type Config struct {
     Audit              AuditConfig // 安全审计日志
 
     // === 内容提取 ===
-    ExtractArticle bool // 启用文章检测（默认：true）
-    PreserveImages bool // 提取图片（默认：true）
+    ExtractArticle  bool // 启用文章检测（默认：true）
+    ExtractMetadata bool // 收集作者/发布时间/描述/站点名/规范链接元数据（默认：true）
+    PreserveImages  bool // 提取图片（默认：true）
     PreserveLinks  bool // 提取链接（默认：true）
     PreserveVideos bool // 提取视频（默认：true）
     PreserveAudios bool // 提取音频（默认：true）
@@ -641,18 +736,10 @@ type Config struct {
 processor, _ := html.New(html.HighSecurityConfig())
 
 // 方法 2：自定义配置并启用审计
+//（DefaultAuditConfig 已默认开启全部 Log* 类别）
 config := html.DefaultConfig()
-config.Audit = html.AuditConfig{
-    Enabled:            true,
-    LogBlockedTags:     true,
-    LogBlockedAttrs:    true,
-    LogBlockedURLs:     true,
-    LogInputViolations: true,
-    LogDepthViolations: true,
-    LogTimeouts:        true,
-    LogEncodingIssues:  true,
-    LogPathTraversal:   true,
-}
+config.Audit = html.DefaultAuditConfig()
+config.Audit.Enabled = true
 processor, _ := html.New(config)
 
 // 获取审计日志
@@ -717,6 +804,8 @@ go run ./examples/01_quick_start/
 | [09_context_cancellation](examples/09_context_cancellation) | 上下文取消与超时 |
 | [10_secure_file_processing](examples/10_secure_file_processing) | AllowedBaseDir 沙箱与安全文件读取 |
 | [11_encoding](examples/11_encoding) | 字符编码检测与覆盖 |
+| [12_metadata_quality](examples/12_metadata_quality) | 结构化元数据(JSON-LD/OpenGraph)与提取置信度 |
+| [13_page_reader](examples/13_page_reader) | 阅读模式:喂 LLM 的整页结构化阅读视图 |
 
 ---
 
@@ -759,6 +848,13 @@ for i := 0; i < 100; i++ {
 }
 wg.Wait()
 ```
+
+输入可以安全共享：`Extract` 不写入输入切片，返回的 `Result` 也不与其别名 ——
+`Extract` 返回后即可立即复用或改写你的 `[]byte`，超时路径同样成立（默认
+`ProcessingTimeout > 0` 时，库会在该模式下解码出文档的私有副本，迟到的解析器
+读不到已被复用的缓冲区）。两点注意：`Config` 传入 `New` 之后不可再修改（需要
+按调用定制时先复制）；自定义 `Scorer` 或 `AuditSink` 会被多个 goroutine 调用，
+需自行同步其内部状态。
 
 ---
 
@@ -834,8 +930,10 @@ type ContentNode interface {
 
 `Processor` 在编译时实现了 `Extractor` 和 `StatsProvider` 接口。
 
-> **注意**：对于自定义 `Scorer` 实现，当前只有 `Score` 会被调用（用于文章节点候选评分）。
-> `ShouldRemove` 是接口的一部分，但提取管线不会对自定义评分器调用它 —— 节点移除始终遵循内置评分器的规则。
+> **注意**：对于自定义 `Scorer` 实现，`Score` 用于文章节点候选评分；若额外实现可选的
+> `ArticleFinder` 接口（`FindArticleNode(root ContentNode) ContentNode`），则以单次遍历
+> 完全接管文章节点选取。`ShouldRemove` 是接口的一部分，但提取管线不会对自定义评分器
+> 调用它 —— 节点移除始终遵循内置评分器的规则。
 
 ---
 
@@ -867,6 +965,10 @@ if err != nil {
         // 提供了多个 Config
     case errors.Is(err, html.ErrInternalPanic):
         // 内部 panic 已恢复
+    case errors.Is(err, html.ErrBatchTooLarge):
+        // 批处理超过 10,000 项
+    case errors.Is(err, html.ErrTooManyConcurrentOps):
+        // 并发的一次性(包级)操作过多
     }
 }
 ```

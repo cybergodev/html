@@ -319,6 +319,11 @@ func (c *auditCollector) Record(entry AuditEntry) {
 		if len(c.entries) >= c.maxEntries {
 			keep := c.maxEntries / 2
 			copy(c.entries, c.entries[len(c.entries)-keep:])
+			// Zero the vacated tail before re-slicing: the backing array would
+			// otherwise keep referencing the dropped entries (Message/URL/
+			// RawValue strings), pinning up to ~2x the configured cap in
+			// memory until later appends overwrite them.
+			clear(c.entries[keep:])
 			c.entries = c.entries[:keep]
 		}
 		c.entries = append(c.entries, entry)
@@ -708,16 +713,18 @@ func (s *WriterAuditSink) Write(entry AuditEntry) {
 		log.Printf("Failed to marshal audit entry: %v", err)
 		return
 	}
+	// Append the newline before writing so the JSON line and its terminator
+	// go out as one Write: two writes let output from other users of the same
+	// io.Writer (e.g. a shared os.Stdout) interleave between them.
+	data = append(data, '\n')
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, err := s.writer.Write(data); err != nil {
-		// A failed data write drops the entry entirely; say so, mirroring the
+		// A failed write drops the entry entirely; say so, mirroring the
 		// marshal branch above — a silent return hid real delivery failures
 		// (disk full, closed file, broken pipe).
 		log.Printf("Failed to write audit entry: %v", err)
-		return
 	}
-	_, _ = s.writer.Write([]byte("\n")) // best-effort newline after successful data write
 }
 
 // Close is a no-op for the writer sink.
@@ -735,14 +742,23 @@ func NewMultiSink(sinks ...AuditSink) *MultiSink {
 	return &MultiSink{sinks: sinks}
 }
 
-// Write writes an audit entry to all sinks.
+// Write writes an audit entry to all sinks. Each child write is individually
+// panic-isolated: a misbehaving sink is skipped for the entry and the sinks
+// after it still receive it. Without per-child isolation the panic would unwind
+// the whole fan-out at the first child, silently disabling every sink listed
+// after the broken one.
 func (s *MultiSink) Write(entry AuditEntry) {
 	if s == nil {
 		return
 	}
 	for _, sink := range s.sinks {
 		if sink != nil {
-			sink.Write(entry)
+			func() {
+				defer func() {
+					_ = recover() // skip a panicking child; see comment above
+				}()
+				sink.Write(entry)
+			}()
 		}
 	}
 }
@@ -804,7 +820,11 @@ type LevelFilteredSink struct {
 // NewLevelFilteredSink wraps sink and forwards only entries at minLevel or
 // above. minLevel is lowercased so a hand-written "Critical" ranks the same
 // as the AuditLevelCritical constant instead of falling into the unknown-level
-// rank 0, which passes every entry.
+// rank 0, which passes every entry. That fail-open also applies to genuinely
+// unknown level strings (e.g. a typo such as "warn"): an unrecognized
+// minLevel disables filtering and every entry is forwarded, so callers should
+// pass one of the AuditLevelInfo/AuditLevelWarning/AuditLevelCritical
+// constants.
 func NewLevelFilteredSink(sink AuditSink, minLevel AuditLevel) *LevelFilteredSink {
 	return &LevelFilteredSink{sink: sink, minLevel: AuditLevel(strings.ToLower(string(minLevel)))}
 }

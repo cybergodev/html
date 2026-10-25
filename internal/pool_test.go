@@ -3,6 +3,7 @@ package internal
 
 import (
 	"bytes"
+	"strings"
 	"sync"
 	"testing"
 
@@ -349,4 +350,32 @@ func TestSlicePoolPutOversizedDropped(t *testing.T) {
 
 	// Nil Put is a documented no-op.
 	sp.Put(nil)
+}
+
+// TestPutTrackedBuilderGuards covers PutTrackedBuilder's degenerate inputs:
+// nil is a no-op, an oversized buffer is dropped rather than retained per-P,
+// and the secure-clear path zeroes the buffer before returning it.
+func TestPutTrackedBuilderGuards(t *testing.T) {
+	t.Parallel()
+
+	PutTrackedBuilder(nil) // documented no-op; must not panic
+
+	// Oversized builder: cap beyond maxPooledByteCap must be dropped. The
+	// builder stays usable for the caller afterwards.
+	big := GetTrackedBuilder()
+	_, _ = big.WriteString(strings.Repeat("x", maxPooledByteCap+1))
+	PutTrackedBuilder(big)
+	if big.Len() == 0 {
+		t.Log("oversized builder was reset by Put; either way it is not retained")
+	}
+
+	// Secure-clear enabled: the returned buffer is zeroed before pooling.
+	SetPoolSecureClear(true)
+	defer SetPoolSecureClear(false)
+	tb := GetTrackedBuilder()
+	_, _ = tb.WriteString("sensitive")
+	PutTrackedBuilder(tb) // SecureClear path; must not panic
+	if tb.Len() != 0 {
+		t.Errorf("builder not cleared under secure clear: len=%d", tb.Len())
+	}
 }

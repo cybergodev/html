@@ -1,13 +1,22 @@
 package table
 
-// caps_regression_test.go — regression tests for the hostile-table
-// allocation caps:
-//   - maxExpandedCells bounds the aggregate colspan placeholder count per
-//     table (placeholders are synthetic cells no DOM-node bound can see;
-//     without the budget, ~50k <td colspan="1000"> cells expanded into tens
-//     of millions of CellData), and
-//   - maxGridCells clamps the numRows x maxCols rendering grid that
-//     padTableColumns/applyRowspanGrid/per-column slices allocate.
+// regressions_test.go — regression tests for the table package, gathered from
+// the former single-topic files (caps_regression_test.go,
+// width_escape_regression_test.go, p2_regression_test.go):
+//
+//   - the hostile-table allocation caps: maxExpandedCells bounds the aggregate
+//     colspan placeholder count per table (placeholders are synthetic cells no
+//     DOM-node bound can see; without the budget, ~50k <td colspan="1000">
+//     cells expanded into tens of millions of CellData), and maxGridCells
+//     clamps the numRows x maxCols rendering grid that padTableColumns /
+//     applyRowspanGrid / per-column slices allocate;
+//   - TrackedBuilder.SecureClear (pool secure-clear support) and the
+//     getRenderer format dispatch that replaced the unused registry.
+//
+// The former width-escape regressions (column-width counting and padded-row
+// alignment) were removed with the padding machinery itself: public output
+// passes through CleanTextBytes, which collapses the padding, so the
+// machinery was deleted (owner decision) rather than kept aligned.
 
 import (
 	"strconv"
@@ -16,6 +25,10 @@ import (
 
 	"golang.org/x/net/html"
 )
+
+// ---------------------------------------------------------------------------
+// Allocation caps (from caps_regression_test.go)
+// ---------------------------------------------------------------------------
 
 // capTestAccessor is a minimal CellAccessor: colspan/rowspan are parsed from
 // the node's attributes (clamped to 1000 like the production accessor);
@@ -118,7 +131,7 @@ func TestExtractTableDataExpansionCapMultiRow(t *testing.T) {
 	const rows, colspan = 100, 1000
 	markup := "<table>" + strings.Repeat(`<tr><td colspan="1000">x</td></tr>`, rows) + "</table>"
 	p := NewProcessor(capTestAccessor{}, capTestWalker{})
-	data := p.extractTableData(parseCapTestTable(t, markup), "markdown")
+	data := p.extractTableData(parseCapTestTable(t, markup), "markdown", nil)
 
 	total := 0
 	for _, row := range data {
@@ -145,7 +158,7 @@ func TestExtractTableDataExpansionCap(t *testing.T) {
 
 	markup := "<table><tr>" + strings.Repeat(`<td colspan="1000">x</td>`, 20) + "</tr></table>"
 	p := NewProcessor(capTestAccessor{}, capTestWalker{})
-	rows := p.extractTableData(parseCapTestTable(t, markup), "markdown")
+	rows := p.extractTableData(parseCapTestTable(t, markup), "markdown", nil)
 
 	total := 0
 	for _, row := range rows {
@@ -217,5 +230,93 @@ func TestCalculateMaxColumnsRowspanOffset(t *testing.T) {
 	}
 	if got := calculateMaxColumns(data); got != 3 {
 		t.Errorf("calculateMaxColumns(rowspan offset) = %d, want 3", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Escaped-cell column widths (from width_escape_regression_test.go)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Builder and renderer dispatch (from p2_regression_test.go)
+// ---------------------------------------------------------------------------
+
+func TestTrackedBuilderSecureClear(t *testing.T) {
+	t.Parallel()
+	tb := NewTrackedBuilder()
+	_, _ = tb.WriteString("sensitive document text")
+	tb.SecureClear()
+	if tb.Len() != 0 || tb.LastChar != 0 {
+		t.Errorf("SecureClear left len=%d lastChar=%d", tb.Len(), tb.LastChar)
+	}
+	// The builder must remain usable after SecureClear.
+	if _, _ = tb.WriteString("x"); tb.String() != "x" {
+		t.Errorf("builder unusable after SecureClear: %q", tb.String())
+	}
+}
+
+func TestGetRendererDispatch(t *testing.T) {
+	t.Parallel()
+	if _, ok := getRenderer("html").(*HTMLRenderer); !ok {
+		t.Error(`getRenderer("html") did not return HTMLRenderer`)
+	}
+	if _, ok := getRenderer("markdown").(*MarkdownRenderer); !ok {
+		t.Error(`getRenderer("markdown") did not return MarkdownRenderer`)
+	}
+	if _, ok := getRenderer("no-such-format").(*MarkdownRenderer); !ok {
+		t.Error("unknown format did not fall back to MarkdownRenderer")
+	}
+}
+
+// TestExtractWithCellTextOverride pins the cell-text override at the table
+// layer (the root package exercises it end-to-end through ReadPage's section
+// rendering; ExtractWithCellText and its appendRowCells callback branches had
+// no in-package test): cellText replaces the accessor's GetTextContent for
+// td/th cells, it is invoked with the result DISCARDED for non-cell row
+// children so shared counters stay aligned (the counter-burn contract), and
+// a nil callback renders exactly like Extract.
+func TestExtractWithCellTextOverride(t *testing.T) {
+	t.Parallel()
+
+	const markup = `<table>
+		<tr><th id="h">Head</th></tr>
+		<tr><td id="c">cell</td><template id="tpl"><a href="/x">burned</a></template></tr>
+	</table>`
+
+	var sawHeader, sawCell, sawTemplate bool
+	cellText := func(n *html.Node) string {
+		switch n.Data {
+		case "th":
+			sawHeader = true
+		case "td":
+			sawCell = true
+		case "template":
+			sawTemplate = true // counter-burn call: text discarded
+		}
+		return "CB:" + n.Data
+	}
+
+	p := NewProcessor(capTestAccessor{}, capTestWalker{})
+	tb := NewTrackedBuilder()
+	p.ExtractWithCellText(parseCapTestTable(t, markup), tb, "markdown", cellText)
+	out := tb.String()
+
+	if !strings.Contains(out, "CB:th") || !strings.Contains(out, "CB:td") {
+		t.Errorf("cell-text override did not reach the rendered cells: %q", out)
+	}
+	if !sawHeader || !sawCell || !sawTemplate {
+		t.Errorf("callback coverage: header=%v cell=%v template-burn=%v, want all true", sawHeader, sawCell, sawTemplate)
+	}
+	if strings.Contains(out, "burned") {
+		t.Errorf("template counter-burn call leaked its text into the row: %q", out)
+	}
+
+	// A nil callback takes the accessor path and matches Extract byte-for-byte.
+	tbl := parseCapTestTable(t, markup)
+	tbNil, tbPlain := NewTrackedBuilder(), NewTrackedBuilder()
+	p.ExtractWithCellText(tbl, tbNil, "markdown", nil)
+	p.Extract(tbl, tbPlain, "markdown")
+	if tbNil.String() != tbPlain.String() {
+		t.Errorf("nil cellText diverged from Extract:\n%q\n%q", tbNil.String(), tbPlain.String())
 	}
 }

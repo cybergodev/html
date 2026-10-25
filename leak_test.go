@@ -11,6 +11,32 @@ import (
 	"time"
 )
 
+// assertNoGoroutineLeak brackets workload between two goroutine censuses and
+// fails when the count grows beyond tolerance. It centralizes the
+// GC-settle-census scaffold that every goroutine leak test below used to
+// repeat inline; settle controls how long the final census waits for worker
+// goroutines to finish (100ms covers the batch/audit/sink paths, the
+// withTimeout path needs longer because its worker runs until fn completes).
+func assertNoGoroutineLeak(t *testing.T, settle time.Duration, tolerance int, workload func()) {
+	t.Helper()
+
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+	initial := runtime.NumGoroutine()
+	t.Logf("Initial goroutines: %d", initial)
+
+	workload()
+
+	runtime.GC()
+	time.Sleep(settle)
+	final := runtime.NumGoroutine()
+	t.Logf("Final goroutines: %d", final)
+
+	if final > initial+tolerance {
+		t.Errorf("Potential goroutine leak: initial=%d, final=%d (tolerance %d)", initial, final, tolerance)
+	}
+}
+
 // TestGoroutineLeakInBatchProcessing tests that batch processing doesn't leak goroutines.
 func TestGoroutineLeakInBatchProcessing(t *testing.T) {
 	cfg := DefaultConfig()
@@ -22,37 +48,20 @@ func TestGoroutineLeakInBatchProcessing(t *testing.T) {
 	}
 	defer func() { _ = processor.Close() }()
 
-	html := []byte(`<html><body><p>Test content</p></body></html>`)
+	doc := []byte(`<html><body><p>Test content</p></body></html>`)
 	contents := make([][]byte, 100)
 	for i := range contents {
-		contents[i] = html
+		contents[i] = doc
 	}
 
-	// Get initial goroutine count
-	runtime.GC()
-	time.Sleep(10 * time.Millisecond)
-	initialGoroutines := runtime.NumGoroutine()
-	t.Logf("Initial goroutines: %d", initialGoroutines)
-
-	// Run batch extraction multiple times
-	for i := 0; i < 10; i++ {
-		br := processor.ExtractBatch(contents)
-		if br.Failed > 0 {
-			t.Fatalf("Batch extraction failed: %v", br.Errors[0])
+	assertNoGoroutineLeak(t, 100*time.Millisecond, 5, func() {
+		for range 10 {
+			br := processor.ExtractBatch(contents)
+			if br.Failed > 0 {
+				t.Fatalf("Batch extraction failed: %v", br.Errors[0])
+			}
 		}
-	}
-
-	// Allow goroutines to settle
-	runtime.GC()
-	time.Sleep(100 * time.Millisecond)
-
-	finalGoroutines := runtime.NumGoroutine()
-	t.Logf("Final goroutines: %d", finalGoroutines)
-
-	// Allow some tolerance for background goroutines
-	if finalGoroutines > initialGoroutines+5 {
-		t.Errorf("Potential goroutine leak: initial=%d, final=%d", initialGoroutines, finalGoroutines)
-	}
+	})
 }
 
 // TestGoroutineLeakInBatchWithContext tests that batch processing with context doesn't leak goroutines.
@@ -66,35 +75,19 @@ func TestGoroutineLeakInBatchWithContext(t *testing.T) {
 	}
 	defer func() { _ = processor.Close() }()
 
-	html := []byte(`<html><body><p>Test content</p></body></html>`)
+	doc := []byte(`<html><body><p>Test content</p></body></html>`)
 	contents := make([][]byte, 100)
 	for i := range contents {
-		contents[i] = html
+		contents[i] = doc
 	}
 
-	// Get initial goroutine count
-	runtime.GC()
-	time.Sleep(10 * time.Millisecond)
-	initialGoroutines := runtime.NumGoroutine()
-	t.Logf("Initial goroutines: %d", initialGoroutines)
-
-	// Run batch extraction with context multiple times
-	for i := 0; i < 10; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = processor.ExtractBatchWithContext(ctx, contents)
-		cancel()
-	}
-
-	// Allow goroutines to settle
-	runtime.GC()
-	time.Sleep(100 * time.Millisecond)
-
-	finalGoroutines := runtime.NumGoroutine()
-	t.Logf("Final goroutines: %d", finalGoroutines)
-
-	if finalGoroutines > initialGoroutines+5 {
-		t.Errorf("Potential goroutine leak: initial=%d, final=%d", initialGoroutines, finalGoroutines)
-	}
+	assertNoGoroutineLeak(t, 100*time.Millisecond, 5, func() {
+		for range 10 {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = processor.ExtractBatchWithContext(ctx, contents)
+			cancel()
+		}
+	})
 }
 
 // TestGoroutineLeakInCancelledContext tests goroutine cleanup when context is cancelled.
@@ -111,27 +104,12 @@ func TestGoroutineLeakInCancelledContext(t *testing.T) {
 		contents[i] = []byte(`<html><body><p>Test</p></body></html>`)
 	}
 
-	// Get initial goroutine count
-	runtime.GC()
-	time.Sleep(10 * time.Millisecond)
-	initialGoroutines := runtime.NumGoroutine()
-	t.Logf("Initial goroutines: %d", initialGoroutines)
-
-	// Start batch with short timeout - will cancel many goroutines
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
-	_ = processor.ExtractBatchWithContext(ctx, contents)
-	cancel()
-
-	// Allow goroutines to settle
-	runtime.GC()
-	time.Sleep(100 * time.Millisecond)
-
-	finalGoroutines := runtime.NumGoroutine()
-	t.Logf("Final goroutines after cancellation: %d", finalGoroutines)
-
-	if finalGoroutines > initialGoroutines+10 {
-		t.Errorf("Potential goroutine leak after cancellation: initial=%d, final=%d", initialGoroutines, finalGoroutines)
-	}
+	assertNoGoroutineLeak(t, 100*time.Millisecond, 10, func() {
+		// Start batch with short timeout - will cancel many goroutines
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+		_ = processor.ExtractBatchWithContext(ctx, contents)
+		cancel()
+	})
 }
 
 // TestGoroutineLeakInAuditCollector tests that audit collector properly cleans up goroutines.
@@ -145,83 +123,53 @@ func TestGoroutineLeakInAuditCollector(t *testing.T) {
 		MaxRawValueLength: 100,
 	}
 
-	// Get initial goroutine count
-	runtime.GC()
-	time.Sleep(10 * time.Millisecond)
-	initialGoroutines := runtime.NumGoroutine()
-	t.Logf("Initial goroutines: %d", initialGoroutines)
-
-	// Create and use multiple collectors
-	for i := 0; i < 10; i++ {
-		collector := newAuditCollector(config)
-		for j := 0; j < 100; j++ {
-			collector.RecordBlockedTag("script")
-			collector.RecordBlockedAttr("onclick", "alert(1)")
-			collector.RecordBlockedURL("javascript:alert(1)", "xss")
+	assertNoGoroutineLeak(t, 100*time.Millisecond, 2, func() {
+		// Create and use multiple collectors
+		for i := 0; i < 10; i++ {
+			collector := newAuditCollector(config)
+			for j := 0; j < 100; j++ {
+				collector.RecordBlockedTag("script")
+				collector.RecordBlockedAttr("onclick", "alert(1)")
+				collector.RecordBlockedURL("javascript:alert(1)", "xss")
+			}
+			_ = collector.Close()
 		}
-		_ = collector.Close()
-	}
-
-	// Allow goroutines to settle
-	runtime.GC()
-	time.Sleep(100 * time.Millisecond)
-
-	finalGoroutines := runtime.NumGoroutine()
-	t.Logf("Final goroutines: %d", finalGoroutines)
-
-	if finalGoroutines > initialGoroutines+2 {
-		t.Errorf("Potential goroutine leak in audit collector: initial=%d, final=%d", initialGoroutines, finalGoroutines)
-	}
+	})
 }
 
 // TestGoroutineLeakInChannelAuditSink tests ChannelAuditSink goroutine cleanup.
 func TestGoroutineLeakInChannelAuditSink(t *testing.T) {
-	// Get initial goroutine count
-	runtime.GC()
-	time.Sleep(10 * time.Millisecond)
-	initialGoroutines := runtime.NumGoroutine()
-	t.Logf("Initial goroutines: %d", initialGoroutines)
+	assertNoGoroutineLeak(t, 100*time.Millisecond, 2, func() {
+		// Create sinks with consumers
+		for i := 0; i < 5; i++ {
+			sink := NewChannelAuditSink(100)
 
-	// Create sinks with consumers
-	for i := 0; i < 5; i++ {
-		sink := NewChannelAuditSink(100)
+			// Start consumer goroutine
+			consumerDone := make(chan struct{})
+			go func() {
+				defer close(consumerDone)
+				for range sink.Channel() {
+					// Drain channel
+				}
+			}()
 
-		// Start consumer goroutine
-		consumerDone := make(chan struct{})
-		go func() {
-			defer close(consumerDone)
-			for range sink.Channel() {
-				// Drain channel
+			// Write some entries
+			for j := 0; j < 50; j++ {
+				sink.Write(AuditEntry{EventType: AuditEventBlockedTag, Message: "test"})
 			}
-		}()
 
-		// Write some entries
-		for j := 0; j < 50; j++ {
-			sink.Write(AuditEntry{EventType: AuditEventBlockedTag, Message: "test"})
+			// Close sink - this should close the channel and stop the consumer
+			_ = sink.Close()
+
+			// Wait for consumer to finish
+			select {
+			case <-consumerDone:
+				// Consumer finished properly
+			case <-time.After(time.Second):
+				t.Error("Consumer goroutine did not finish after sink close")
+			}
 		}
-
-		// Close sink - this should close the channel and stop the consumer
-		_ = sink.Close()
-
-		// Wait for consumer to finish
-		select {
-		case <-consumerDone:
-			// Consumer finished properly
-		case <-time.After(time.Second):
-			t.Error("Consumer goroutine did not finish after sink close")
-		}
-	}
-
-	// Allow goroutines to settle
-	runtime.GC()
-	time.Sleep(100 * time.Millisecond)
-
-	finalGoroutines := runtime.NumGoroutine()
-	t.Logf("Final goroutines: %d", finalGoroutines)
-
-	if finalGoroutines > initialGoroutines+2 {
-		t.Errorf("Potential goroutine leak in channel sink: initial=%d, final=%d", initialGoroutines, finalGoroutines)
-	}
+	})
 }
 
 // TestMemoryLeakInCache tests that cache doesn't cause memory leaks.
@@ -310,44 +258,28 @@ func TestMemoryLeakInProcessorClose(t *testing.T) {
 // the background goroutine continues running until fn() completes. This test ensures
 // that after fn() completes, goroutines are properly cleaned up.
 func TestWithTimeoutGoroutineCleanup(t *testing.T) {
-	// Get initial goroutine count
-	runtime.GC()
-	time.Sleep(10 * time.Millisecond)
-	initialGoroutines := runtime.NumGoroutine()
-	t.Logf("Initial goroutines: %d", initialGoroutines)
+	assertNoGoroutineLeak(t, 200*time.Millisecond, 5, func() {
+		// Run many quick operations - these should NOT timeout
+		cfg := DefaultConfig()
+		cfg.ProcessingTimeout = 5 * time.Second
 
-	// Run many quick operations - these should NOT timeout
-	cfg := DefaultConfig()
-	cfg.ProcessingTimeout = 5 * time.Second
+		for i := 0; i < 50; i++ {
+			processor, err := New(cfg)
+			if err != nil {
+				t.Fatalf("Failed to create processor: %v", err)
+			}
 
-	for i := 0; i < 50; i++ {
-		processor, err := New(cfg)
-		if err != nil {
-			t.Fatalf("Failed to create processor: %v", err)
+			// Small content that completes quickly
+			smallHTML := []byte(`<html><body><p>Test</p></body></html>`)
+
+			_, err = processor.Extract(smallHTML)
+			_ = processor.Close()
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
 		}
-
-		// Small content that completes quickly
-		smallHTML := []byte(`<html><body><p>Test</p></body></html>`)
-
-		_, err = processor.Extract(smallHTML)
-		_ = processor.Close()
-
-		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
-		}
-	}
-
-	// Allow goroutines to settle
-	runtime.GC()
-	time.Sleep(200 * time.Millisecond)
-
-	finalGoroutines := runtime.NumGoroutine()
-	t.Logf("Final goroutines after quick ops: %d", finalGoroutines)
-
-	// Allow some tolerance for GC and timing variations
-	if finalGoroutines > initialGoroutines+5 {
-		t.Errorf("Potential goroutine leak after quick operations: initial=%d, final=%d", initialGoroutines, finalGoroutines)
-	}
+	})
 }
 
 // TestProcessorDoubleClose tests that double Close() calls are safe.
@@ -422,56 +354,41 @@ func TestConcurrentCloseAndExtract(t *testing.T) {
 // TestMultiSinkCloseGoroutineLeak tests that MultiSink properly closes all underlying sinks
 // and doesn't leak consumer goroutines.
 func TestMultiSinkCloseGoroutineLeak(t *testing.T) {
-	// Get initial goroutine count
-	runtime.GC()
-	time.Sleep(10 * time.Millisecond)
-	initialGoroutines := runtime.NumGoroutine()
+	assertNoGoroutineLeak(t, 100*time.Millisecond, 2, func() {
+		// Create multiple channel sinks
+		sinks := make([]AuditSink, 5)
+		for i := range sinks {
+			sinks[i] = NewChannelAuditSink(100)
+		}
 
-	// Create multiple channel sinks
-	sinks := make([]AuditSink, 5)
-	for i := range sinks {
-		sinks[i] = NewChannelAuditSink(100)
-	}
+		multiSink := NewMultiSink(sinks...)
 
-	multiSink := NewMultiSink(sinks...)
+		// Start consumers for all channel sinks
+		var consumerWg sync.WaitGroup
+		for _, s := range sinks {
+			sink := s.(*ChannelAuditSink)
+			consumerWg.Add(1)
+			go func() {
+				defer consumerWg.Done()
+				for range sink.Channel() {
+				}
+			}()
+		}
 
-	// Start consumers for all channel sinks
-	var consumerWg sync.WaitGroup
-	for _, s := range sinks {
-		sink := s.(*ChannelAuditSink)
-		consumerWg.Add(1)
-		go func() {
-			defer consumerWg.Done()
-			for range sink.Channel() {
-			}
-		}()
-	}
+		// Write some entries
+		for i := 0; i < 100; i++ {
+			multiSink.Write(AuditEntry{EventType: AuditEventBlockedTag})
+		}
 
-	// Write some entries
-	for i := 0; i < 100; i++ {
-		multiSink.Write(AuditEntry{EventType: AuditEventBlockedTag})
-	}
+		// Close multi sink
+		err := multiSink.Close()
+		if err != nil {
+			t.Errorf("MultiSink.Close() failed: %v", err)
+		}
 
-	// Close multi sink
-	err := multiSink.Close()
-	if err != nil {
-		t.Errorf("MultiSink.Close() failed: %v", err)
-	}
-
-	// Wait for consumers to finish
-	consumerWg.Wait()
-
-	// Allow goroutines to settle
-	runtime.GC()
-	time.Sleep(100 * time.Millisecond)
-
-	finalGoroutines := runtime.NumGoroutine()
-	t.Logf("Goroutines - initial: %d, final: %d", initialGoroutines, finalGoroutines)
-
-	// All consumer goroutines should have stopped
-	if finalGoroutines > initialGoroutines+2 {
-		t.Errorf("Potential goroutine leak in MultiSink: initial=%d, final=%d", initialGoroutines, finalGoroutines)
-	}
+		// Wait for consumers to finish
+		consumerWg.Wait()
+	})
 }
 
 // BenchmarkProcessorCreationWithClose benchmarks processor creation and close cycle.

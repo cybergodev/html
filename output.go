@@ -3,6 +3,7 @@ package html
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/cybergodev/html/internal"
 )
@@ -270,6 +271,15 @@ type jsonResult struct {
 	ProcessingTimeMS int64       `json:"processing_time_ms"`
 	WordCount        int         `json:"word_count"`
 	ReadingTimeMS    int64       `json:"reading_time_ms"`
+	Author           string      `json:"author,omitempty"`
+	// PublishedTime is a pointer so the zero time (unknown) is omitted rather
+	// than serialized as "0001-01-01T00:00:00Z".
+	PublishedTime    *time.Time `json:"published_time,omitempty"`
+	Description      string     `json:"description,omitempty"`
+	SiteName         string     `json:"site_name,omitempty"`
+	CanonicalURL     string     `json:"canonical_url,omitempty"`
+	Confidence       float64    `json:"confidence"`
+	ExtractionMethod string     `json:"extraction_method,omitempty"`
 }
 
 // MarshalJSON implements custom JSON marshaling for Result.
@@ -297,6 +307,16 @@ func (r *Result) MarshalJSON() ([]byte, error) {
 		ProcessingTimeMS: r.ProcessingTime.Milliseconds(),
 		WordCount:        r.WordCount,
 		ReadingTimeMS:    r.ReadingTime.Milliseconds(),
+		Author:           r.Author,
+		Description:      r.Description,
+		SiteName:         r.SiteName,
+		CanonicalURL:     r.CanonicalURL,
+		Confidence:       r.Confidence,
+		ExtractionMethod: r.ExtractionMethod,
+	}
+	if !r.PublishedTime.IsZero() {
+		t := r.PublishedTime
+		jr.PublishedTime = &t
 	}
 	return json.Marshal(jr)
 }

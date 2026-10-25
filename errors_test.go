@@ -417,3 +417,26 @@ func TestFileErrorEmptyPathPlaceholder(t *testing.T) {
 		t.Errorf("Error() = %q, want placeholder [file] for empty path", msg)
 	}
 }
+
+// TestPathTraversalMatchesErrInvalidFilePath pins the sentinel wrap: the
+// traversal rejection is the one FileError whose underlying error is ad-hoc,
+// and before the wrap it matched no sentinel — errors.Is was false for both
+// ErrFileNotFound and ErrInvalidFilePath, leaving string-matching on Error()
+// as the only programmatic detection.
+func TestPathTraversalMatchesErrInvalidFilePath(t *testing.T) {
+	t.Parallel()
+
+	_, err := ExtractFromFile(`../escape.html`)
+	if err == nil {
+		t.Fatal("ExtractFromFile accepted a parent-directory path")
+	}
+	if !strings.Contains(err.Error(), "path traversal") {
+		t.Fatalf("error = %v, want a path-traversal rejection", err)
+	}
+	if !errors.Is(err, ErrInvalidFilePath) {
+		t.Errorf("errors.Is(traversal, ErrInvalidFilePath) = false, want true")
+	}
+	if errors.Is(err, ErrFileNotFound) {
+		t.Errorf("errors.Is(traversal, ErrFileNotFound) = true, want false")
+	}
+}

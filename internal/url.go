@@ -14,8 +14,8 @@ func IsExternalURL(url string) bool {
 //   - "//host/path"        → returns 2 (after the leading slashes)
 //   - "host/path" or other → returns 0 (no scheme)
 //
-// This centralizes the duplicated scheme-parsing logic previously inlined in
-// ExtractDomain, ExtractBaseFromURL, NormalizeBaseURL, and asDirectoryBase.
+// This centralizes the scheme-parsing logic shared by ExtractBaseFromURL,
+// NormalizeBaseURL, ResolveURL, and asDirectoryBase.
 func schemeEnd(url string) int {
 	if idx := strings.Index(url, "://"); idx >= 0 {
 		return idx + 3
@@ -50,57 +50,16 @@ func authorityLen(s string) int {
 	return len(s)
 }
 
-// ExtractDomain extracts the host portion of a URL (e.g. "example.com" for
-// "https://example.com/path"), stripping the scheme and path. When the input
-// has no "://" or leading "//", the scheme is treated as absent and the input
-// is returned unchanged (the whole string is the "host").
-func ExtractDomain(url string) string {
-	start := schemeEnd(url)
-
-	// The domain ends at the first path, query, or fragment delimiter —
-	// previously only '/' ended it, so an authority followed directly by a
-	// query ("https://e.com?x=1") reported "e.com?x=1" as the domain.
-	end := start + authorityLen(url[start:])
-
-	// Strip userinfo ("user:pass@"): browsers ignore credentials for
-	// origin/scheme-host comparisons, and keeping them made IsDifferentDomain
-	// flag "https://user@example.com/" against "https://example.com/" as
-	// different domains. The '@' scan is confined to the authority: a literal
-	// '@' is legal unencoded in a path segment (profile URLs like "/@alice"),
-	// and scanning the whole remainder used to read such a path as userinfo,
-	// extract "alice" as the domain, and flag same-site links as external.
-	// LastIndexByte is correct because a literal '@' in a userinfo component
-	// must be percent-encoded.
-	if at := strings.LastIndexByte(url[start:end], '@'); at >= 0 {
-		start += at + 1
-	}
-
-	return url[start:end]
-}
-
 // ExtractBaseFromURL extracts the base URL (scheme://domain/) from a URL.
 // Returns the base URL including trailing slash, or empty string for invalid URLs.
+// For an external (http/https or protocol-relative) input, NormalizeBaseURL's
+// authority-truncation branch produces exactly this result — the body used to
+// be a hand copy of it that had already drifted on protocol-relative inputs.
 func ExtractBaseFromURL(url string) string {
 	if !IsExternalURL(url) {
 		return ""
 	}
-
-	start := schemeEnd(url)
-
-	// The base ends at the first path, query, or fragment delimiter after
-	// the authority. A '/' terminates the authority with a path (base keeps
-	// that slash); a '?' or '#' means the authority has no path, and the
-	// trailing slash must land after the authority ("https://e.com/")
-	// rather than inside its query or fragment ("https://e.com?ref=x/").
-	if e := authorityLen(url[start:]); e < len(url)-start {
-		if url[start+e] == '/' {
-			return url[:start+e+1]
-		}
-		return url[:start+e] + "/"
-	}
-
-	// No path found, add trailing slash
-	return url + "/"
+	return NormalizeBaseURL(url)
 }
 
 // NormalizeBaseURL ensures a base URL ends with a slash.
@@ -110,9 +69,13 @@ func NormalizeBaseURL(baseURL string) string {
 		return ""
 	}
 
-	// Skip non-HTTP URLs like data:, javascript:, mailto:, etc.
-	// Scheme comparison is case-insensitive (RFC 3986 §3.1).
-	if strings.Contains(baseURL, ":") && !hasHTTPScheme(baseURL) {
+	// Skip non-HTTP URLs like data:, javascript:, mailto:, etc. Detect the
+	// scheme by its RFC 3986 §3.1 shape (hasSchemePrefix, case-insensitive),
+	// not by the mere presence of ':': a protocol-relative base with a port
+	// or userinfo ("//static.example.com:8080/") contains ':' yet has no
+	// scheme, and the Contains check rejected it — disabling URL resolution
+	// for every link on such pages — while the port-less form worked.
+	if hasSchemePrefix(baseURL) && !hasHTTPScheme(baseURL) {
 		return ""
 	}
 
@@ -233,11 +196,17 @@ func ResolveURL(baseURL, relativeURL string) string {
 		}
 		return basePath + relativeURL
 	case '?':
+		// RFC 3986 §5.3: a query reference keeps the base path and replaces
+		// the query — the base's fragment goes too. Cut at whichever of '?'
+		// or '#' comes first: scanning for '?' alone let a '?' inside the
+		// fragment win ("http://e.com/p#f?x" + "?q=1" produced
+		// "http://e.com/p#f?q=1", a query appended after the fragment).
 		basePath := baseURL
-		if i := strings.IndexByte(basePath, '?'); i >= 0 {
-			basePath = basePath[:i]
-		} else if i := strings.IndexByte(basePath, '#'); i >= 0 {
-			basePath = basePath[:i]
+		if q := strings.IndexByte(basePath, '?'); q >= 0 {
+			basePath = basePath[:q]
+		}
+		if f := strings.IndexByte(basePath, '#'); f >= 0 {
+			basePath = basePath[:f]
 		}
 		return basePath + relativeURL
 	}
@@ -274,17 +243,4 @@ func asDirectoryBase(baseURL string) string {
 		return baseURL[:pathStart+e] + "/"
 	}
 	return baseURL + "/"
-}
-
-// IsDifferentDomain checks if two URLs have different domains.
-// Returns false if either URL is not external.
-func IsDifferentDomain(baseURL, targetURL string) bool {
-	if !IsExternalURL(baseURL) || !IsExternalURL(targetURL) {
-		return false
-	}
-
-	baseDomain := ExtractDomain(baseURL)
-	targetDomain := ExtractDomain(targetURL)
-
-	return baseDomain != targetDomain
 }

@@ -4,7 +4,6 @@ import (
 	"html"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 )
 
 // isStructureRow determines if a row contains only width definitions (no real content).
@@ -85,7 +84,7 @@ func applyRowspanGrid(tableData [][]CellData, maxCols int) [][]CellData {
 	fillText := make([]string, numRows*maxCols)
 
 	grid := make([][]CellData, numRows)
-	for r := 0; r < numRows; r++ {
+	for r := range numRows {
 		row := make([]CellData, maxCols)
 		base := r * maxCols
 		col := 0
@@ -166,7 +165,7 @@ func calculateMaxColumns(tableData [][]CellData) int {
 	// occupied[r] records columns in row r already taken by a rowspan from an
 	// earlier row. Only rows that receive a span get a non-nil map.
 	occupied := make([]map[int]bool, numRows)
-	for r := 0; r < numRows; r++ {
+	for r := range numRows {
 		occ := occupied[r]
 		col := 0
 		for _, cell := range tableData[r] {
@@ -204,30 +203,26 @@ func extractTableAsMarkdown(tableData [][]CellData, tb *TrackedBuilder, maxCols 
 	// rows it spans, instead of letting later rows' cells shift left into the
 	// wrong column. Markdown cannot express rowspan, so each spanned position
 	// repeats the originating cell's text (the Pandoc convention). This must
-	// run before width/alignment calculation, which depend on correct column
+	// run before alignment calculation, which depends on correct column
 	// positions. The HTML path is unaffected — it emits rowspan as an attribute.
 	tableData = applyRowspanGrid(tableData, maxCols)
 
 	// Pad rows to have consistent column count
 	tableData = padTableColumns(tableData, maxCols)
 
-	// Calculate column properties
+	// Calculate column properties. Cells are deliberately NOT space-padded to
+	// a common column width: every public consumer runs the walk output
+	// through CleanTextBytes, which collapses runs of spaces, so alignment
+	// padding never reached callers — it only inflated the intermediate
+	// buffer. Column alignment is expressed solely by the separator row's
+	// :--- / ---: markers below.
 	colAligns := calculateColumnAlignments(tableData, maxCols)
-	colMaxWidths := calculateMaxColumnWidths(tableData, maxCols)
 
 	// Filter out columns that are entirely empty expanded cells
 	newToOldCol := filterExpandedColumns(tableData, maxCols)
 
 	// Build arrays for included columns only
 	includedColAligns := filterArray(colAligns, newToOldCol)
-	includedColMaxWidths := filterIntArray(colMaxWidths, newToOldCol)
-
-	// Ensure minimum width for alignment markers
-	for i := range includedColMaxWidths {
-		if includedColMaxWidths[i] < 3 {
-			includedColMaxWidths[i] = 3
-		}
-	}
 
 	// Render table rows with alignment separator after the first row
 	if len(tableData) > 0 {
@@ -237,20 +232,20 @@ func extractTableAsMarkdown(tableData [][]CellData, tb *TrackedBuilder, maxCols 
 		// data row, which would otherwise mislabel real data as column headers.
 		if tableHasHeader(tableData) {
 			// Render first row (header)
-			renderMarkdownRow(tb, tableData[0], newToOldCol, includedColAligns, includedColMaxWidths)
+			renderMarkdownRow(tb, tableData[0], newToOldCol)
 			writeMarkdownSeparator(tb, includedColAligns)
 			// Render remaining rows
 			for i := 1; i < len(tableData); i++ {
-				renderMarkdownRow(tb, tableData[i], newToOldCol, includedColAligns, includedColMaxWidths)
+				renderMarkdownRow(tb, tableData[i], newToOldCol)
 			}
 		} else {
 			// No <th> anywhere: synthesize an empty header row and render every
 			// real row (including the former first row) as data.
 			emptyHeader := make([]CellData, maxCols)
-			renderMarkdownRow(tb, emptyHeader, newToOldCol, includedColAligns, includedColMaxWidths)
+			renderMarkdownRow(tb, emptyHeader, newToOldCol)
 			writeMarkdownSeparator(tb, includedColAligns)
 			for i := 0; i < len(tableData); i++ {
-				renderMarkdownRow(tb, tableData[i], newToOldCol, includedColAligns, includedColMaxWidths)
+				renderMarkdownRow(tb, tableData[i], newToOldCol)
 			}
 		}
 	}
@@ -316,7 +311,7 @@ func calculateColumnAlignments(tableData [][]CellData, maxCols int) []string {
 
 	// Determine majority alignment for each column
 	if len(tableData) > 0 {
-		for i := 0; i < maxCols; i++ {
+		for i := range maxCols {
 			colAligns[i] = determineColumnAlignment(alignCounts[i], tableData[0], i)
 		}
 	} else {
@@ -378,42 +373,15 @@ func determineColumnAlignment(counts AlignCount, firstRow []CellData, colIdx int
 	}
 }
 
-// calculateMaxColumnWidths finds the maximum text width for each column.
-// Optimized with pre-allocated slice.
-func calculateMaxColumnWidths(tableData [][]CellData, maxCols int) []int {
-	// Pre-allocate with exact capacity needed
-	colMaxWidths := make([]int, maxCols)
-	for _, row := range tableData {
-		for j := 0; j < maxCols && j < len(row); j++ {
-			text := row[j].Text
-			// writeMarkdownCellText renders each '\' and '|' as a two-byte
-			// escape sequence, so the rendered width is the rune count plus
-			// one per escapable byte. Without the adjustment, a cell
-			// containing them made its row one character wider than the
-			// padded column (the table stayed structurally valid; only the
-			// alignment the padding exists to provide was lost).
-			textLen := utf8.RuneCountInString(text) +
-				strings.Count(text, "\\") + strings.Count(text, "|")
-			if textLen > colMaxWidths[j] {
-				colMaxWidths[j] = textLen
-			}
-		}
-	}
-	return colMaxWidths
-}
-
 // filterExpandedColumns identifies columns that should be excluded.
 // Returns a list of included column indices (columns with real content).
 // Optimized with pre-allocated slice capacity.
 func filterExpandedColumns(tableData [][]CellData, maxCols int) []int {
 	// Pre-allocate with estimated capacity: assume 80% of columns are included
-	estimatedInclusions := maxCols * 4 / 5
-	if estimatedInclusions < 1 {
-		estimatedInclusions = 1
-	}
+	estimatedInclusions := max(maxCols*4/5, 1)
 	newToOldCol := make([]int, 0, estimatedInclusions)
 
-	for j := 0; j < maxCols; j++ {
+	for j := range maxCols {
 		// Check if this column has any non-expanded content
 		allExpanded := true
 		for _, row := range tableData {
@@ -442,85 +410,20 @@ func filterArray(arr []string, indices []int) []string {
 	return result
 }
 
-// filterIntArray filters an int array to include only specified indices.
-func filterIntArray(arr []int, indices []int) []int {
-	result := make([]int, len(indices))
-	for i, idx := range indices {
-		if idx < len(arr) {
-			result[i] = arr[idx]
-		}
-	}
-	return result
-}
-
-// paddingLookup provides pre-computed padding strings for small values
-// to avoid repeated strings.Repeat allocations in table rendering.
-var paddingLookup = [32]string{
-	"", " ", "  ", "   ", "    ", "     ", "      ", "       ",
-	"        ", "         ", "          ", "           ", "            ",
-	"             ", "              ", "               ", "                ",
-	"                 ", "                  ", "                   ",
-	"                    ", "                     ", "                      ",
-	"                       ", "                        ", "                         ",
-	"                          ", "                           ", "                            ",
-	"                             ", "                              ", "                               ",
-}
-
-// writePadding writes n spaces to the builder using a lookup table for small values.
-func writePadding(tb *TrackedBuilder, n int) {
-	if n <= 0 {
-		return
-	}
-	if n < len(paddingLookup) {
-		_, _ = tb.WriteString(paddingLookup[n])
-		return
-	}
-	_, _ = tb.WriteString(strings.Repeat(" ", n))
-}
-
-// renderMarkdownRow renders a single table row in Markdown format.
-func renderMarkdownRow(tb *TrackedBuilder, row []CellData, newToOldCol []int,
-	colAligns []string, colMaxWidths []int) {
-
+// renderMarkdownRow renders a single table row in Markdown format, one
+// space around each cell and no column-width padding (see
+// extractTableAsMarkdown for why padding was removed). Cell text is written
+// through writeMarkdownCellText so a literal '|' cannot end the cell early
+// and spill into the next column, and a literal '\' cannot escape the
+// following delimiter character.
+func renderMarkdownRow(tb *TrackedBuilder, row []CellData, newToOldCol []int) {
 	_, _ = tb.WriteString("| ")
 	for newJ, oldJ := range newToOldCol {
 		cellText := " "
 		if oldJ < len(row) {
 			cellText = row[oldJ].Text
 		}
-
-		maxWidth := colMaxWidths[newJ]
-		// The rendered width must count the escapes writeMarkdownCellText
-		// emits, exactly as calculateMaxColumnWidths does. Without the
-		// adjustment a cell containing a pipe or a backslash rendered one
-		// character wider per escapable byte than its column, which knocked
-		// the padding of every cell in that row out of alignment.
-		textLen := utf8.RuneCountInString(cellText) +
-			strings.Count(cellText, "\\") + strings.Count(cellText, "|")
-		pad := maxWidth - textLen
-
-		// Apply alignment-based padding. Cell text is written through
-		// writeMarkdownCellText so a literal '|' cannot end the cell early and
-		// spill into the next column, and a literal '\' cannot escape the
-		// following delimiter character.
-		switch colAligns[newJ] {
-		case ":---": // left
-			writeMarkdownCellText(tb, cellText)
-			writePadding(tb, pad)
-		case "---:": // right
-			writePadding(tb, pad)
-			writeMarkdownCellText(tb, cellText)
-		case ":--:": // center
-			leftPad := pad / 2
-			rightPad := pad - leftPad
-			writePadding(tb, leftPad)
-			writeMarkdownCellText(tb, cellText)
-			writePadding(tb, rightPad)
-		default: // left (default)
-			writeMarkdownCellText(tb, cellText)
-			writePadding(tb, pad)
-		}
-
+		writeMarkdownCellText(tb, cellText)
 		if newJ < len(newToOldCol)-1 {
 			_, _ = tb.WriteString(" | ")
 		}

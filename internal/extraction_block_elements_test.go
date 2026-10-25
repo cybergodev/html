@@ -164,7 +164,7 @@ func TestNewBlockElementsSpacing(t *testing.T) {
 		{
 			name: "thead does not add paragraph spacing",
 			html: `<table><thead><th>H1</th></thead><tbody><td>D1</td></tbody></table>`,
-			want: "| H1  |\n| --- |\n| D1  |", // Note: no trailing newlines
+			want: "| H1 |\n| --- |\n| D1 |", // Note: no trailing newlines
 			desc: "Thead should not add paragraph spacing in tables",
 		},
 		{
@@ -172,7 +172,9 @@ func TestNewBlockElementsSpacing(t *testing.T) {
 			html: `<table><tr><td>Row 1</td></tr></table><p>Text</p>`,
 			// Headerless table (no <th>): an empty header row is synthesized so
 			// the real "Row 1" is rendered as data rather than promoted to a header.
-			want: "|       |\n| --- |\n| Row 1 |\n\n\nText",
+			// Cells carry no column-width padding (removed with the padding
+			// machinery; see internal/table/render.go).
+			want: "|  |\n| --- |\n| Row 1 |\n\n\nText",
 			desc: "Table structure should not add extra paragraph spacing",
 		},
 		{

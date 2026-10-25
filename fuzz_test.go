@@ -188,3 +188,49 @@ func FuzzMediaExtraction(f *testing.F) {
 		}
 	})
 }
+
+// FuzzReadPage exercises the reader-mode pipeline — segmentation, kind-aware
+// section cleaning, [LINK:n]/[IMAGE:n] token emission, inline substitution,
+// and the token strippers behind PlainText — with arbitrary input. The
+// strippers (stripLinkTokens/stripImageTokens) and the section merge/dedup
+// logic are hand-rolled index arithmetic over attacker-shaped text, so this
+// target is their empirical no-panic guarantee, matching the SEC-003 posture
+// of the other fuzz targets.
+func FuzzReadPage(f *testing.F) {
+	seeds := []string{
+		`<html><body><header><nav><a href="/a">a</a></nav></header>` +
+			`<main><p>hi <a href="/b">b</a> <img src="i.png" alt="pic"></p></main>` +
+			`<footer>f</footer></body></html>`,
+		`<table><tr><td rowspan="3" colspan="2">s</td></tr><tr></tr></table>`,
+		`[LINK:1] literal text [LINK:] more [LINK:abc]`,
+		`[IMAGE:999] literal [IMAGE: no digits`,
+		`<div role="navigation" class="menu">menu</div>`,
+		`<base href="https://x.test/"><a href="rel">r</a>`,
+		`<main class="content hidden"><p>x</p></main>`,
+		`<aside><a href="/1">1</a> <a href="/2">2</a> <a href="/3">3</a></aside>`,
+		`<table><caption>[LINK:1]</caption><tr><td>[IMAGE:2]</td></tr></table>`,
+	}
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, input string) {
+		p, err := html.New()
+		if err != nil {
+			t.Fatalf("Failed to create processor: %v", err)
+		}
+		defer func() { _ = p.Close() }()
+
+		page, err := p.ReadPage([]byte(input))
+		if err != nil {
+			return
+		}
+		if page == nil {
+			t.Fatal("Nil ReadResult with no error")
+		}
+		// The flatteners walk whatever section set the pipeline produced
+		// (unknown kinds, empty text, links-only sections included).
+		_ = page.Render()
+		_ = page.RenderText()
+	})
+}

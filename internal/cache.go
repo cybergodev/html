@@ -77,8 +77,15 @@ func NewCache[K comparable](maxEntries int, ttl time.Duration) *Cache[K] {
 	if ttl < 0 {
 		ttl = 0
 	}
+	// The entries map carries no size hint: NewCache's callers pass a capacity
+	// LIMIT, not an expected population, and hinting with it made every
+	// Processor (default MaxCacheEntries: 2000) preallocate ~100KB of buckets
+	// at New() — paid in full by the common create-extract-Close processor and
+	// by pooled one-shot processors that never store an entry. The map grows
+	// amortized on demand instead; a cache actually filled to its limit pays a
+	// handful of rehashes over its lifetime, bounded by the entry cap.
 	c := &Cache[K]{
-		entries:    make(map[K]*cacheEntry[K], maxEntries),
+		entries:    make(map[K]*cacheEntry[K]),
 		maxEntries: maxEntries,
 		ttl:        ttl,
 	}

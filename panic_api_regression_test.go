@@ -15,6 +15,7 @@ package html
 // interfaces — and fails if the call panics instead of returning.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -173,10 +174,17 @@ func TestSEC003TypedNilErrorMethods(t *testing.T) {
 			t.Error("errors.Is(typed-nil *FileError, ErrInvalidFilePath) = false, want true")
 		}
 
-		// json.Marshal reaches MarshalJSON for a typed-nil pointer.
+		// json.Marshal reaches MarshalJSON for a typed-nil pointer and must
+		// produce the same "null" encoding/json would (absorbed from the
+		// former TestSEC003NilFileErrorJSONMatchesEncodingJSON, which pinned
+		// only this value through the same call).
 		mustNotPanic(t, "json.Marshal(typed-nil *FileError)", func() {
-			if _, err := json.Marshal(err); err != nil {
+			b, err := json.Marshal(err)
+			if err != nil {
 				t.Errorf("json.Marshal: %v", err)
+			}
+			if string(b) != "null" {
+				t.Errorf("typed-nil *FileError marshals to %q, want \"null\"", b)
 			}
 		})
 	})
@@ -214,23 +222,145 @@ func TestSEC003NilResultMarshalJSON(t *testing.T) {
 	})
 }
 
-// TestSEC003NilFileErrorJSONMatchesEncodingJSON keeps the FileError nil contract
-// aligned with encoding/json: a typed-nil pointer passed through an interface
-// still marshals to null rather than panicking or emitting an object.
-func TestSEC003NilFileErrorJSONMatchesEncodingJSON(t *testing.T) {
+// TestSEC003NilFileErrorJSONMatchesEncodingJSON was merged into the FileError
+// subtest of TestSEC003TypedNilErrorMethods above: both exercised
+// json.Marshal on a typed-nil *FileError, and the subtest now pins the
+// "null" output value the standalone test existed to check.
+
+// TestSEC003ReadPageAPISurfaceNoPanic covers the reader-mode API family that
+// postdates the original SEC-003 sweep: every exported Read* method and the
+// ReadResult flatteners must return an error (or a string) rather than panic
+// under the same hostile-call patterns the rest of this file drives — nil
+// receiver, closed processor, nil context, and empty/binary/oversize input.
+// The Read* methods wrap their bodies in recoverPanic, so a panic anywhere in
+// the reader pipeline (segmentation, token stripping, section merge) surfaces
+// as ErrInternalPanic; this test pins that no input shape bypasses it.
+func TestSEC003ReadPageAPISurfaceNoPanic(t *testing.T) {
 	t.Parallel()
 
-	var e *FileError
-	var err error = e
-	var got []byte
-	mustNotPanic(t, "json.Marshal(typed-nil *FileError)", func() {
-		b, jerr := json.Marshal(err)
-		if jerr != nil {
-			t.Fatalf("json.Marshal: %v", jerr)
+	const doc = `<html><body><header><nav><a href="/x">x</a></nav></header>` +
+		`<main><article><h1>T</h1><p>Hello <a href="/y">y</a>.</p>` +
+		`<table><tr><td>c</td></tr></table></article></main>` +
+		`<footer>f</footer></body></html>`
+
+	t.Run("nil processor methods", func(t *testing.T) {
+		t.Parallel()
+		var p *Processor
+		ctx := context.Background()
+		calls := []struct {
+			name string
+			call func() error
+		}{
+			{"ReadPage", func() error { _, err := p.ReadPage([]byte(doc)); return err }},
+			{"ReadPageWithContext", func() error { _, err := p.ReadPageWithContext(ctx, []byte(doc)); return err }},
+			{"ReadPageFromFile", func() error { _, err := p.ReadPageFromFile("no-such.html"); return err }},
+			{"ReadPageFromFileWithContext", func() error { _, err := p.ReadPageFromFileWithContext(ctx, "no-such.html"); return err }},
+			{"ReadPageToMarkdown", func() error { _, err := p.ReadPageToMarkdown([]byte(doc)); return err }},
+			{"ReadPageToMarkdownWithContext", func() error { _, err := p.ReadPageToMarkdownWithContext(ctx, []byte(doc)); return err }},
+			{"ReadPageToMarkdownText", func() error { _, err := p.ReadPageToMarkdownText([]byte(doc)); return err }},
+			{"ReadPageToMarkdownTextWithContext", func() error { _, err := p.ReadPageToMarkdownTextWithContext(ctx, []byte(doc)); return err }},
+			{"ReadPageFromFileToMarkdown", func() error { _, err := p.ReadPageFromFileToMarkdown("no-such.html"); return err }},
+			{"ReadPageFromFileToMarkdownWithContext", func() error { _, err := p.ReadPageFromFileToMarkdownWithContext(ctx, "no-such.html"); return err }},
+			{"ReadPageFromFileToMarkdownText", func() error { _, err := p.ReadPageFromFileToMarkdownText("no-such.html"); return err }},
+			{"ReadPageFromFileToMarkdownTextWithContext", func() error { _, err := p.ReadPageFromFileToMarkdownTextWithContext(ctx, "no-such.html"); return err }},
 		}
-		got = b
+		for _, c := range calls {
+			mustNotPanic(t, "(*Processor)(nil)."+c.name, func() {
+				if err := c.call(); err == nil {
+					t.Errorf("%s on nil processor returned nil error, want ErrProcessorClosed", c.name)
+				}
+			})
+		}
 	})
-	if string(got) != "null" {
-		t.Errorf("typed-nil *FileError marshals to %q, want \"null\"", got)
-	}
+
+	t.Run("package functions on hostile input", func(t *testing.T) {
+		t.Parallel()
+		oversize := make([]byte, DefaultConfig().MaxInputSize+1)
+		inputs := map[string][]byte{
+			"nil":     nil,
+			"empty":   {},
+			"blank":   []byte(" \t\n\r "),
+			"binary":  {0xFF, 0xFE, 0x00, 0x01, 0x80},
+			"literal": []byte(`[LINK:1] and [IMAGE:999] and [LINK: truncated markers`),
+		}
+		mustNotPanic(t, "ReadPage(oversize)", func() {
+			if _, err := ReadPage(oversize); err == nil {
+				t.Error("ReadPage(oversize) returned nil error, want ErrInputTooLarge")
+			}
+		})
+		for name, in := range inputs {
+			mustNotPanic(t, "ReadPage("+name+")", func() { _, _ = ReadPage(in) })
+			mustNotPanic(t, "ReadPageToMarkdown("+name+")", func() { _, _ = ReadPageToMarkdown(in) })
+			mustNotPanic(t, "ReadPageToMarkdownText("+name+")", func() { _, _ = ReadPageToMarkdownText(in) })
+		}
+		// An already-cancelled context takes the cooperative-exit path, not an
+		// error-returning guard, on every WithContext variant.
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		mustNotPanic(t, "ReadPageWithContext(cancelled)", func() { _, _ = ReadPageWithContext(cancelled, []byte(doc)) })
+		mustNotPanic(t, "ReadPageToMarkdownWithContext(cancelled)", func() { _, _ = ReadPageToMarkdownWithContext(cancelled, []byte(doc)) })
+	})
+
+	t.Run("nil context", func(t *testing.T) {
+		t.Parallel()
+		p, err := New()
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() { _ = p.Close() }()
+		// A nil Context dereferences inside recoverPanic's closure, so the
+		// recovered value must surface as ErrInternalPanic, not a crash. The
+		// nil ctx is the input under test (SA1012 is the point: callers do
+		// pass nil, matching the ExtractBatch precedent in
+		// panic_protection_test.go).
+		mustNotPanic(t, "ReadPageWithContext(nil ctx)", func() {
+			if _, err := p.ReadPageWithContext(nil, []byte(doc)); err == nil { //nolint:staticcheck // deliberately nil
+				t.Error("ReadPageWithContext(nil ctx) returned nil error, want ErrInternalPanic")
+			}
+		})
+		mustNotPanic(t, "ReadPageFromFileWithContext(nil ctx)", func() {
+			_, _ = p.ReadPageFromFileWithContext(nil, "no-such.html") //nolint:staticcheck // deliberately nil
+		})
+	})
+
+	t.Run("closed processor", func(t *testing.T) {
+		t.Parallel()
+		p, err := New()
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if err := p.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		mustNotPanic(t, "ReadPage on closed processor", func() {
+			if _, err := p.ReadPage([]byte(doc)); !errors.Is(err, ErrProcessorClosed) {
+				t.Errorf("ReadPage after Close = %v, want ErrProcessorClosed", err)
+			}
+		})
+		mustNotPanic(t, "ReadPageToMarkdownText on closed processor", func() {
+			if _, err := p.ReadPageToMarkdownText([]byte(doc)); !errors.Is(err, ErrProcessorClosed) {
+				t.Errorf("ReadPageToMarkdownText after Close = %v, want ErrProcessorClosed", err)
+			}
+		})
+	})
+
+	t.Run("ReadResult flatteners", func(t *testing.T) {
+		t.Parallel()
+		var nilResult *ReadResult
+		mustNotPanic(t, "(*ReadResult)(nil).Render", func() {
+			if s := nilResult.Render(); s != "" {
+				t.Errorf("nil ReadResult.Render() = %q, want \"\"", s)
+			}
+		})
+		mustNotPanic(t, "(*ReadResult)(nil).RenderText", func() {
+			if s := nilResult.RenderText(); s != "" {
+				t.Errorf("nil ReadResult.RenderText() = %q, want \"\"", s)
+			}
+		})
+		// A zero-value result with unknown section kinds exercises the label
+		// fallback (string(sec.Kind)) alongside the empty-text skip.
+		zero := &ReadResult{Sections: []PageSection{{}, {Kind: SectionKind("weird")}}}
+		mustNotPanic(t, "zero ReadResult.Render", func() { _ = zero.Render() })
+		mustNotPanic(t, "zero ReadResult.RenderText", func() { _ = zero.RenderText() })
+	})
 }

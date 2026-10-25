@@ -978,3 +978,158 @@ func TestWhitespacePreservation(t *testing.T) {
 		})
 	}
 }
+
+// firstElementByTag returns the first element node with the given tag in
+// document order, or nil.
+func firstElementByTag(root *html.Node, tag string) *html.Node {
+	var found *html.Node
+	WalkNodes(root, func(n *html.Node) bool {
+		if found == nil && n.Type == html.ElementNode && n.Data == tag {
+			found = n
+		}
+		return found == nil
+	})
+	return found
+}
+
+// TestTableTokenText unit-drives tableTokenText's flattening and counter
+// contract at the internal layer (the root package exercises it end-to-end
+// through table cells; these rows pin each rule directly): plain text is
+// trimmed and space-joined, anchors emit [LINK:n]…[/LINK] while burning a
+// link position, only usable images emit [IMAGE:n], raw-text subtrees are
+// skipped, and <template> differs by mode exactly as the collector does.
+func TestTableTokenText(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name       string
+		doc        string
+		chromeMode bool
+		want       string
+		wantLinks  int
+		wantImages int
+	}{
+		{
+			name:       "plain text flattened and trimmed",
+			doc:        `<div>  cell text </div>`,
+			want:       "cell text",
+			wantLinks:  0,
+			wantImages: 0,
+		},
+		{
+			name:       "anchor emits token and burns a position",
+			doc:        `<div>go <a href="/x">there</a> now</div>`,
+			want:       "go [LINK:1] there[/LINK] now",
+			wantLinks:  1,
+			wantImages: 0,
+		},
+		{
+			name:       "image with usable src emits token",
+			doc:        `<div>pic <img src="/i.png" alt="shot"> end</div>`,
+			want:       "pic [IMAGE:1] end",
+			wantLinks:  0,
+			wantImages: 1,
+		},
+		{
+			name:       "image without usable src burns nothing",
+			doc:        `<div>pic <img alt="no src"> end</div>`,
+			want:       "pic end",
+			wantLinks:  0,
+			wantImages: 0,
+		},
+		{
+			name:       "script subtree skipped",
+			doc:        `<div>a<script>evil()</script>b</div>`,
+			want:       "a b",
+			wantLinks:  0,
+			wantImages: 0,
+		},
+		{
+			name:       "template included in content mode",
+			doc:        `<div>x<template>tpl</template>y</div>`,
+			chromeMode: false,
+			want:       "x tpl y",
+			wantLinks:  0,
+			wantImages: 0,
+		},
+		{
+			name:       "template skipped in chrome mode",
+			doc:        `<div>x<template>tpl</template>y</div>`,
+			chromeMode: true,
+			want:       "x y",
+			wantLinks:  0,
+			wantImages: 0,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			doc, err := parseHTML(tt.doc)
+			if err != nil {
+				t.Fatalf("parseHTML: %v", err)
+			}
+			node := firstElementByTag(doc, "div")
+			if node == nil {
+				t.Fatal("test fixture error: div not found")
+			}
+			links, images := 0, 0
+			got := tableTokenText(node, &images, &links, tt.chromeMode)
+			if got != tt.want {
+				t.Errorf("text = %q, want %q", got, tt.want)
+			}
+			if links != tt.wantLinks {
+				t.Errorf("link counter = %d, want %d", links, tt.wantLinks)
+			}
+			if images != tt.wantImages {
+				t.Errorf("image counter = %d, want %d", images, tt.wantImages)
+			}
+		})
+	}
+
+	if got := tableTokenText(nil, nil, nil, false); got != "" {
+		t.Errorf("tableTokenText(nil) = %q, want empty", got)
+	}
+}
+
+// TestExtractChromeTextWithStructure unit-tests the chrome-region entry
+// point at the internal layer (the root package only reaches it through
+// ReadPage's chrome sections): a nil node is a no-op, a nested <nav> inside
+// the region survives (it is the region's substance, unlike the content
+// pass's skip policy), raw-text subtrees are skipped, and the shared
+// [LINK:n]/[IMAGE:n] counters stay in lockstep with the emitted tokens.
+func TestExtractChromeTextWithStructure(t *testing.T) {
+	t.Parallel()
+
+	ExtractChromeTextWithStructure(nil, table.NewTrackedBuilder(), nil, nil, "markdown") // must not panic
+
+	doc, err := parseHTML(`<html><body><nav class="site-nav">
+		<a href="/">Home</a>
+		<a href="/tech"><img src="/i.png" alt="Tech">Tech</a>
+		<script>evil()</script>
+		<nav><a href="/deep">Deep</a></nav>
+	</nav></body></html>`)
+	if err != nil {
+		t.Fatalf("parseHTML: %v", err)
+	}
+	region := firstElementByTag(doc, "nav")
+	if region == nil {
+		t.Fatal("test fixture error: nav not found")
+	}
+
+	tb := table.NewTrackedBuilder()
+	images, links := 0, 0
+	ExtractChromeTextWithStructure(region, tb, &images, &links, "markdown")
+	got := tb.String()
+
+	for _, want := range []string{"Home", "Tech", "Deep", "[LINK:", "[IMAGE:1]"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("chrome text missing %q: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "evil") {
+		t.Errorf("script text leaked into chrome region: %q", got)
+	}
+	if links < 3 || images != 1 {
+		t.Errorf("counters = links:%d images:%d, want links>=3 images:1", links, images)
+	}
+}

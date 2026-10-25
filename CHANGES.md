@@ -4,6 +4,46 @@ All notable changes to the cybergodev/html library will be documented in this fi
 
 ---
 
+## v1.5.0 - Reader Mode, Structured Metadata & Extraction Quality (2026-10-26)
+
+### Added
+- Reader Mode for LLM pipelines: `ReadPage*` family (Processor methods and package-level functions, incl. `*WithContext`, `*FromFile`, and link-free `*Text` variants) segments a page into `ReadResult` sections (header/navigation/main/aside/footer) with kind-aware cleaning; links are always preserved (`InlineLinkFormat` "none" is treated as "markdown")
+- `ReadResult.Render()`/`RenderText()` flatten sections with/without inline links; `ReadPageToMarkdown*` returns the one-document Markdown reading view; `PageSection` carries `Kind`, `Text`, `PlainText`, `Links`, `Images`, `WordCount`
+- Reader-mode dedup: repeated chrome sections (identical menus in header/footer) are dropped, main content is never deduplicated, icon-only navs survive with their links
+- Structured metadata: `Result.Author`, `PublishedTime`, `Description`, `SiteName`, `CanonicalURL` resolved from JSON-LD/OpenGraph/`<meta>`/canonical with source priority; opt out via `Config.ExtractMetadata` (default on)
+- Quality signals: `Result.Confidence` (0.2–1.0 tiered) and `ExtractionMethod` ("article"/"listing"/"body")
+- `ArticleFinder` optional interface: custom Scorers take over article selection in one pass, avoiding the O(N²) `Score` enumeration (nil verdict falls back to `<body>`)
+- Card-listing detection: a dominant container of ≥3 sibling `<article>` cards becomes the content node (`ExtractionMethod` "listing")
+- `role="presentation"`/`role="none"` tables flatten as layout shells; h1–h6 emit Markdown ATX heading markers
+- Declared-charset support for koi8-r, windows-1253/1254/1255/1256/1258, gb18030 (previously "unsupported encoding" or mojibake)
+
+### Changed
+- Title priority is now JSON-LD headline > `og:title` > `<title>` > article h1 fallbacks; metadata titles keep legitimate " - " subtitles (site-name suffix stripped only on exact match with the declared site name)
+- `<header>`/`<footer>`/`<aside>` inside primary-content containers are preserved (bylines, author blocks); the ambiguous "widget" class token no longer removes CMS content wrappers
+- CJK reading time uses 350 chars/min (200 wpm for space-separated scripts); emitted heading markers no longer inflate `WordCount`
+- `<pre>`/`<code>` preserve internal newlines, so code blocks and ASCII diagrams survive as multiple lines
+- Scoring model: block-based density, link-text-length nav penalty, CJK sentence bonus, data-grid/label-soup penalties, and score-guarded widening of the winning candidate to its content wrapper
+
+### Fixed
+- Links and images inside table cells and captions keep their URLs in output (previously flattened to bare labels)
+- Linked images render as the nested idiom `[text ![alt](img)](url)` instead of escaped literal text; decorative images drop out of link labels with alt-text fallback
+- `og:title` no longer loses to a WebSite JSON-LD node's site name
+- Documents whose anchors all carry invalid hrefs no longer leak literal `[LINK:n]` tokens; zero-width placeholders no longer leave doubled spaces
+- A non-HTTP `<base>` (about:blank, data:) no longer disables URL resolution; protocol-relative bases with a port or userinfo are accepted; query-only references resolve per RFC 3986 §5.3
+- `<video src="">`/`<audio src="">` fall back to their `<source>` children instead of dropping the element and its poster/dimensions
+- A newline after `charset=` no longer yields an empty detected charset
+- Path-traversal `FileError` now wraps `ErrInvalidFilePath`, so `errors.Is` matches as documented
+- A second `<caption>` no longer desyncs `[LINK:n]`/`[IMAGE:n]` numbering for the rest of the section; a raw `|` in a link/image URL no longer splits the rendered table cell
+- Audit hardening: `MultiSink` isolates a panicking child sink, capped in-memory retention releases evicted entries, `WriterAuditSink` emits JSON line + newline as one write
+- Reader mode: icon-only menus are no longer false-deduplicated; `[IMAGE:n]` tokens no longer leak into `PlainText`/`RenderText`
+
+### Performance
+- `New()` no longer preallocates ~107 KB of cache buckets: 107.8 KiB → 1.1 KiB (−98.9%) and 36.0 µs → 1.6 µs (−95.5%); cache-hit path −35.5%
+- Subtree-length dominance tests are allocation-free (~4.5% of allocation bytes removed on realistic documents)
+- Pretty-printed documents skip whitespace-only text-node allocation (−182 allocs/op); the media scan no longer copies its 6 KiB index per candidate byte (~60–120 MB less copying per MB of HTML)
+
+---
+
 ## v1.4.9 - Correctness, Concurrency & Resource-Limit Fixes (2026-10-22)
 
 ### Fixed

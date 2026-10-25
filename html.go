@@ -4,6 +4,13 @@
 // with automatic character encoding detection (supporting 15+ encodings including UTF-8,
 // Windows-1252, GBK, Shift_JIS, etc.).
 //
+// Reader mode (ReadPage) keeps the whole page as labeled sections — header,
+// navigation, main content, aside, footer — with inline hyperlinks rendered
+// as Markdown links or HTML anchors, for feeding a clean page to LLMs and
+// other text-only consumers:
+//
+//	markdown, err := html.ReadPageToMarkdown(htmlBytes)
+//
 // Basic usage:
 //
 //	// Simple extraction

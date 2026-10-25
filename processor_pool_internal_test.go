@@ -36,12 +36,35 @@ func withPanickingPool(t *testing.T) {
 	})
 }
 
+// drainPoolAndRetry calls fn until it reports the panicking-pool outcome.
+// Parallel tests that use the package-level functions keep handing warm
+// entries back to the shared processorPool, so a Get() issued right after a
+// drain can still receive a warm entry and never invoke the swapped,
+// panicking New. Draining (runtime.GC drops every cached entry) and retrying
+// bounds that interference window instead of letting it flake the suite.
+func drainPoolAndRetry(fn func() bool) bool {
+	for range 100 {
+		runtime.GC()
+		if fn() {
+			return true
+		}
+	}
+	return false
+}
+
 // TestGetPooledProcessorSafe_RecoversPoolNewPanic verifies the helper converts
 // a panicking pool.New into ErrInternalPanic, preserving the panic value.
 func TestGetPooledProcessorSafe_RecoversPoolNewPanic(t *testing.T) {
 	withPanickingPool(t)
 
-	p, err := getPooledProcessorSafe()
+	var p *Processor
+	var err error
+	if !drainPoolAndRetry(func() bool {
+		p, err = getPooledProcessorSafe()
+		return err != nil
+	}) {
+		t.Fatal("panicking pool.New never surfaced (warm entries kept winning the race)")
+	}
 	if p != nil {
 		t.Fatalf("expected nil processor on pool panic, got %+v", p)
 	}
@@ -63,48 +86,50 @@ func TestPackageFunctionsSurvivePoolPanic(t *testing.T) {
 
 	htmlBytes := []byte("<html><body><p>hi</p></body></html>")
 
-	t.Run("Extract", func(t *testing.T) {
-		if _, err := Extract(htmlBytes); !errors.Is(err, ErrInternalPanic) {
-			t.Fatalf("expected ErrInternalPanic, got: %v", err)
+	single := func(t *testing.T, fn func() error) {
+		t.Helper()
+		if !drainPoolAndRetry(func() bool {
+			err := fn()
+			return errors.Is(err, ErrInternalPanic)
+		}) {
+			t.Fatal("panicking pool.New never surfaced (warm entries kept winning the race)")
 		}
+	}
+
+	t.Run("Extract", func(t *testing.T) {
+		single(t, func() error { _, err := Extract(htmlBytes); return err })
 	})
 
 	t.Run("ExtractText", func(t *testing.T) {
-		if _, err := ExtractText(htmlBytes); !errors.Is(err, ErrInternalPanic) {
-			t.Fatalf("expected ErrInternalPanic, got: %v", err)
-		}
+		single(t, func() error { _, err := ExtractText(htmlBytes); return err })
 	})
 
 	t.Run("ExtractToMarkdown", func(t *testing.T) {
-		if _, err := ExtractToMarkdown(htmlBytes); !errors.Is(err, ErrInternalPanic) {
-			t.Fatalf("expected ErrInternalPanic, got: %v", err)
-		}
+		single(t, func() error { _, err := ExtractToMarkdown(htmlBytes); return err })
 	})
 
 	t.Run("ExtractToJSON", func(t *testing.T) {
-		if _, err := ExtractToJSON(htmlBytes); !errors.Is(err, ErrInternalPanic) {
-			t.Fatalf("expected ErrInternalPanic, got: %v", err)
-		}
+		single(t, func() error { _, err := ExtractToJSON(htmlBytes); return err })
 	})
 
 	t.Run("ExtractAllLinks", func(t *testing.T) {
-		if _, err := ExtractAllLinks(htmlBytes); !errors.Is(err, ErrInternalPanic) {
-			t.Fatalf("expected ErrInternalPanic, got: %v", err)
-		}
+		single(t, func() error { _, err := ExtractAllLinks(htmlBytes); return err })
 	})
 
 	t.Run("ExtractBatch", func(t *testing.T) {
-		br := ExtractBatch([][]byte{htmlBytes, htmlBytes})
-		if br.Failed != 2 {
-			t.Fatalf("expected 2 failures, got %d (successes=%d)", br.Failed, br.Success)
-		}
-		if br.Success != 0 {
-			t.Fatalf("expected 0 successes, got %d", br.Success)
-		}
-		for i, e := range br.Errors {
-			if !errors.Is(e, ErrInternalPanic) {
-				t.Errorf("item %d: expected ErrInternalPanic, got: %v", i, e)
+		if !drainPoolAndRetry(func() bool {
+			br := ExtractBatch([][]byte{htmlBytes, htmlBytes})
+			if br.Failed != 2 || br.Success != 0 {
+				return false
 			}
+			for _, e := range br.Errors {
+				if !errors.Is(e, ErrInternalPanic) {
+					return false
+				}
+			}
+			return true
+		}) {
+			t.Fatal("panicking pool.New never surfaced (warm entries kept winning the race)")
 		}
 	})
 }
@@ -128,4 +153,40 @@ func TestGetPooledProcessorTypeFallback(t *testing.T) {
 		t.Fatalf("fallback processor unusable: %v", err)
 	}
 	_ = p.Close()
+}
+
+// TestPutPooledProcessorGuards covers putPooledProcessor's degenerate inputs:
+// nil is a no-op, and a Processor that was closed during its use is discarded
+// rather than resurrected (its cache sweeper is stopped and its audit sink
+// closed — handing it back out would violate Close's no-reuse contract).
+func TestPutPooledProcessorGuards(t *testing.T) {
+	t.Parallel()
+
+	putPooledProcessor(nil) // documented no-op; must not panic
+
+	// A closed processor must be dropped by the discard branch.
+	p, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := p.Extract([]byte("<html><body><p>hi</p></body></html>")); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	putPooledProcessor(p) // closed: discarded, never reused
+
+	// A live processor takes the normal reset-and-return path.
+	p2, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New(2): %v", err)
+	}
+	if _, err := p2.Extract([]byte("<html><body><p>hi</p></body></html>")); err != nil {
+		t.Fatalf("Extract(2): %v", err)
+	}
+	putPooledProcessor(p2)
+	if got := p2.GetStatistics().TotalProcessed; got != 0 {
+		t.Errorf("returned processor kept statistics: TotalProcessed=%d, want 0 after reset", got)
+	}
 }

@@ -51,6 +51,64 @@ const mixedCaseTableDoc = "<html><body><h1>Report</h1>" +
 	"<table><tr><th colspan=\"2\">H1</th></tr><tr><td>a</td><td>b</td></tr></table>" +
 	"</body></html>"
 
+func TestTableLinkURLPipeDoesNotSplitCells(t *testing.T) {
+	t.Parallel()
+
+	// A '|' inside a substituted link URL would end the Markdown table cell
+	// at substitution time (the table escaper only sees the pre-substitution
+	// [LINK:n] text): the URL is percent-encoded so the row keeps its shape.
+	doc := `<html><body><article><table>
+		<tr><th>Link</th><th>Note</th></tr>
+		<tr><td><a href="/x?a=1|b=2">L</a></td><td>tail</td></tr>
+	</table></article></body></html>`
+
+	cfg := DefaultConfig()
+	cfg.InlineLinkFormat = "markdown"
+	cfg.MaxCacheEntries = 0
+	out, err := ExtractToMarkdown([]byte(doc), cfg)
+	if err != nil {
+		t.Fatalf("ExtractToMarkdown: %v", err)
+	}
+	if !strings.Contains(out, "[L](/x?a=1%7Cb=2)") {
+		t.Errorf("pipe in URL not percent-encoded:\n%s", out)
+	}
+	if strings.Contains(out, "a=1|b=2") {
+		t.Errorf("raw pipe survived into the rendered row:\n%s", out)
+	}
+}
+
+func TestTableSecondCaptionBurnsCounters(t *testing.T) {
+	t.Parallel()
+
+	// A second <caption> is a parse artifact (the spec closes the first on a
+	// second start tag) that is NOT rendered, but the section-wide collector
+	// still numbered its anchors. Without the counter-burn walk over it, the
+	// link AFTER the table received the caption's number and rendered with
+	// the caption's URL.
+	doc := `<html><body><article>
+		<table>
+			<caption>First caption</caption>
+			<caption><a href="/cap-link">caplink</a></caption>
+			<tr><td>cell</td></tr>
+		</table>
+		<p>See <a href="/after">after</a> the table.</p>
+	</article></body></html>`
+
+	cfg := DefaultConfig()
+	cfg.InlineLinkFormat = "markdown"
+	cfg.MaxCacheEntries = 0
+	out, err := ExtractToMarkdown([]byte(doc), cfg)
+	if err != nil {
+		t.Fatalf("ExtractToMarkdown: %v", err)
+	}
+	if !strings.Contains(out, "[after](/after)") {
+		t.Errorf("post-table link rendered with the burned caption's number:\n%s", out)
+	}
+	if strings.Contains(out, "[after](/cap-link)") {
+		t.Errorf("post-table link bound to the second caption's URL:\n%s", out)
+	}
+}
+
 func TestExtractTableFormatMixedCaseHTML(t *testing.T) {
 	t.Parallel()
 

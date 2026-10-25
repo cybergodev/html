@@ -180,6 +180,59 @@ jsonBytes, err := processor.ExtractToJSONWithContext(ctx, htmlBytes) ([]byte, er
 jsonBytes, err := processor.ExtractToJSONFromFileWithContext(ctx, filePath) ([]byte, error)
 ```
 
+#### Reader Mode
+
+Reader mode extracts a full-page structured reading view: every region
+(header, navigation, main, aside, footer) is kept as a labeled section with
+its text and inline hyperlinks, instead of selecting one article and
+discarding the rest. Its primary use is feeding clean pages to LLMs.
+
+```go
+// Structured sections (from bytes / file, with optional context)
+page, err := processor.ReadPage(htmlBytes []byte) (*ReadResult, error)
+page, err := processor.ReadPageFromFile(filePath string) (*ReadResult, error)
+page, err := processor.ReadPageWithContext(ctx context.Context, htmlBytes []byte) (*ReadResult, error)
+page, err := processor.ReadPageFromFileWithContext(ctx context.Context, filePath string) (*ReadResult, error)
+
+// One-document Markdown form, WITH inline links ([text](URL), ![alt](URL))
+markdown, err := processor.ReadPageToMarkdown(htmlBytes []byte) (string, error)
+markdown, err := processor.ReadPageFromFileToMarkdown(filePath string) (string, error)
+markdown, err := processor.ReadPageToMarkdownWithContext(ctx, htmlBytes) (string, error)
+markdown, err := processor.ReadPageFromFileToMarkdownWithContext(ctx, filePath) (string, error)
+
+// One-document Markdown form, WITHOUT inline links or images (labels as words)
+plain, err := processor.ReadPageToMarkdownText(htmlBytes []byte) (string, error)
+plain, err := processor.ReadPageFromFileToMarkdownText(filePath string) (string, error)
+plain, err := processor.ReadPageToMarkdownTextWithContext(ctx, htmlBytes) (string, error)
+plain, err := processor.ReadPageFromFileToMarkdownTextWithContext(ctx, filePath) (string, error)
+
+// Flatten a structured result either way
+linked := page.Render()      // with links
+plainDoc := page.RenderText() // without links
+```
+
+Hyperlinks are always preserved in section `Text`; `Config.InlineLinkFormat`
+selects the style (`"markdown"` → `[text](URL)`, the default; `"html"` →
+`<a href="...">text</a>`), and `"none"` — the DefaultConfig value, right for
+the Extract family — is treated as `"markdown"` in reader mode, so links
+never silently vanish from the default output. Each section also carries
+`PlainText` (the link-free variant), and the `*Text` entry points and
+`RenderText` expose it — use those when the consumer wants prose only.
+Inside link labels, images are label-aware: decorative images (empty alt,
+menu icons) are dropped, an images-only label (a logo link) renders the alt
+texts as the label, and a mixed label nests the image markdown —
+`[text ![alt](img)](url)`. (With `InlineImageFormat "none"` images emit no
+placeholders, so images-only labels keep the `Link N` fallback.)
+Relative link and image URLs are resolved against `Config.BaseURL` or a base
+detected from the document. Section cleaning is kind-aware: main regions get
+article-grade cleaning (ads, hidden nodes, nested navigation removed) while
+chrome regions keep their menus and are stripped of hidden nodes only. A
+later chrome section whose whitespace-normalized text exactly duplicates an
+earlier section of the same kind (the same menu visibly rendered twice) is
+dropped; main sections are never deduplicated.
+ReadPage does not use the extraction cache (its result type differs from
+Result's).
+
 #### Batch Processing
 
 ```go
@@ -251,6 +304,13 @@ br := html.ExtractBatchFiles(filePaths, cfg ...Config) *BatchResult
 
 // Links
 links, err := html.ExtractAllLinks(htmlBytes, cfg ...Config) ([]LinkResource, error)
+
+// Reader mode
+page, err := html.ReadPage(htmlBytes, cfg ...Config) (*ReadResult, error)
+markdown, err := html.ReadPageToMarkdown(htmlBytes, cfg ...Config) (string, error)        // with links
+plain, err := html.ReadPageToMarkdownText(htmlBytes, cfg ...Config) (string, error)       // without links
+markdown, err := html.ReadPageFromFileToMarkdown(filePath, cfg ...Config) (string, error)
+plain, err := html.ReadPageFromFileToMarkdownText(filePath, cfg ...Config) (string, error)
 ```
 
 ### BatchResult
@@ -291,15 +351,67 @@ for i, result := range br.Results {
 
 ```go
 type Result struct {
-    Text           string        // Extracted clean text
-    Title          string        // Page/article title
-    Images         []ImageInfo   // Image metadata
-    Links          []LinkInfo    // Link metadata
-    Videos         []VideoInfo   // Video metadata
-    Audios         []AudioInfo   // Audio metadata
-    ProcessingTime time.Duration // Processing duration
-    WordCount      int           // Word count
-    ReadingTime    time.Duration // Estimated reading time (200 WPM)
+    Text             string        // Extracted clean text
+    Title            string        // Page/article title (JSON-LD headline > og:title > <title>)
+    Images           []ImageInfo   // Image metadata
+    Links            []LinkInfo    // Link metadata
+    Videos           []VideoInfo   // Video metadata
+    Audios           []AudioInfo   // Audio metadata
+    ProcessingTime   time.Duration // Processing duration
+    WordCount        int           // Word count (each CJK ideograph/kana/Hangul counts as one word)
+    ReadingTime      time.Duration // Estimated reading time (200 words/min; 350 chars/min for CJK)
+    Author           string        // JSON-LD author or <meta name="author"> (ExtractMetadata)
+    PublishedTime    time.Time     // article:published_time or JSON-LD datePublished (zero = unknown)
+    Description      string        // og:description > JSON-LD description > <meta name="description">
+    SiteName         string        // og:site_name or JSON-LD publisher.name
+    CanonicalURL     string        // <link rel="canonical"> or og:url
+    Confidence       float64       // Extraction-quality signal in [0, 1] (1.0 = clean article)
+    ExtractionMethod string        // "article" | "listing" (card feed) | "body" (fallback)
+}
+```
+
+The metadata fields (`Author` … `CanonicalURL`) and the metadata-based title priority are
+populated when `Config.ExtractMetadata` is true (the default); with it false the fields
+stay empty and `Title` falls back to the `<title>` tag. See
+`examples/12_metadata_quality/` for the priority ladders and quality signals.
+
+### ReadResult
+
+Returned by the reader-mode family (`ReadPage*`). Unlike `Result`, nothing is
+discarded by kind — the page's regions are labeled, and callers decide which
+sections to keep. `Render()` flattens the sections into one document WITH
+links (title as a top-level heading, then each section under a `# <Kind>`
+heading); `RenderText()` flattens them without links.
+
+```go
+type SectionKind string // "header", "navigation", "main", "aside", "footer"
+
+const (
+    SectionHeader     SectionKind = "header"
+    SectionNavigation SectionKind = "navigation"
+    SectionMain       SectionKind = "main"
+    SectionAside      SectionKind = "aside"
+    SectionFooter     SectionKind = "footer"
+)
+
+type PageSection struct {
+    Kind      SectionKind // Region label
+    Text      string      // Region text WITH inline links (style per Config.InlineLinkFormat)
+    PlainText string      // Same words WITHOUT links/images (backs RenderText and the *Text entry points)
+    Links     []LinkInfo  // Region links in document order (positions local to the source region)
+    Images    []ImageInfo // Region images in document order, same locality rule (when PreserveImages)
+    WordCount int         // Words in PlainText (CJK-aware)
+}
+
+type ReadResult struct {
+    Title          string        // Same priority ladder as Result.Title
+    Author         string
+    PublishedTime  time.Time     // Zero time = unknown
+    Description    string
+    SiteName       string
+    CanonicalURL   string
+    Sections       []PageSection // Document order; adjacent same-kind merged; empty regions dropped
+    ProcessingTime time.Duration
 }
 ```
 
@@ -389,6 +501,11 @@ var sp html.StatsProvider = processor
 
 `Extractor` includes all content extraction, text extraction, formatted output (Markdown/JSON), batch processing, and link extraction methods. `StatsProvider` covers statistics retrieval, cache clearing, and statistics reset.
 
+Two method families are `Processor` methods outside these interfaces: the reader-mode
+family (`ReadPage*`) and the audit accessors (`GetAuditLog`/`ClearAuditLog`). Code that
+needs to mock those should define its own narrow interface over the concrete
+`*Processor` usage it relies on.
+
 ## Error Handling
 
 The library uses sentinel errors compatible with `errors.Is()`:
@@ -416,6 +533,10 @@ if err != nil {
         // Internal panic recovered (indicates a bug)
     } else if errors.Is(err, html.ErrMultipleConfigs) {
         // More than one Config provided to package-level function
+    } else if errors.Is(err, html.ErrBatchTooLarge) {
+        // Batch exceeds 10,000 items
+    } else if errors.Is(err, html.ErrTooManyConcurrentOps) {
+        // Too many concurrent one-shot (package-level) operations
     }
 }
 ```
@@ -442,8 +563,12 @@ cfg.Scorer = MyScorer{}
 processor, err := html.New(cfg)
 ```
 
-> **Note:** Only `Score` is currently consulted for custom scorers — it drives article-node
-> candidate selection. `ShouldRemove` is part of the `Scorer` interface but is not invoked
+> **Note:** Two methods are consulted on custom scorers. `Score` drives article-node
+> candidate selection; a scorer that additionally implements the optional `ArticleFinder`
+> interface (`FindArticleNode(root ContentNode) ContentNode`) takes over article-node
+> selection in a single pass — a non-nil return skips the `Score` enumeration entirely,
+> and a nil return means "no article" (the whole `<body>` is extracted).
+> `ShouldRemove` is part of the `Scorer` interface but is not invoked
 > on custom scorers by the extraction pipeline; node removal always follows the built-in
 > scorer's rules regardless of what a custom scorer returns here.
 
@@ -585,13 +710,15 @@ See the `examples/` directory for complete examples (each is a self-contained `m
 - `02_content_extraction/` - Content extraction features
 - `03_links_media/` - Link and media extraction
 - `04_performance/` - Performance optimization
-- `05_http_integration/` - HTTP server integration
+- `05_http_integration/` - HTTP integration patterns (fetching via a shared client)
 - `06_advanced_usage/` - Advanced features
 - `07_error_handling/` - Error handling patterns
 - `08_real_world/` - Real-world scenarios
 - `09_context_cancellation/` - Context cancellation and timeouts
 - `10_secure_file_processing/` - AllowedBaseDir sandbox and secure file reads
 - `11_encoding/` - Character encoding detection and override
+- `12_metadata_quality/` - Structured metadata and extraction confidence
+- `13_page_reader/` - Reader mode: full-page structured reading view for LLMs
 
 Run any one directly, e.g. `go run ./examples/01_quick_start/`, or build all at once with `go build ./examples/...`.
 

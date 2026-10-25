@@ -116,10 +116,7 @@ func (tb *TrackedBuilder) Grow(n int) {
 		return
 	}
 	// Double until enough, like strings.Builder, but honor n as a floor.
-	newCap := cap(tb.buf)
-	if newCap < 64 {
-		newCap = 64
-	}
+	newCap := max(cap(tb.buf), 64)
 	for newCap < len(tb.buf)+n {
 		newCap *= 2
 	}

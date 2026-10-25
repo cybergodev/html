@@ -1,18 +1,30 @@
 package html
 
 // regressions_timeout_test.go — regressions for the D-002/P-002 timeout and
-// ownership fixes, gathered from the former single-topic files:
+// ownership fixes, gathered from the former single-topic files (plus the
+// timeout-audit parity test from d002_quality_regression_test.go):
 //
 //   - any context.DeadlineExceeded was once rewritten to ErrProcessingTimeout
 //     whenever ProcessingTimeout > 0, losing the caller's own earlier deadline
 //     identity; the *WithContext entry points must preserve it;
 //   - with a processing timeout configured, detectEncoding must decode into a
 //     private copy (work runs on another goroutine), while the synchronous path
-//     keeps the zero-copy decode.
+//     keeps the zero-copy decode;
+//   - a processing timeout on the links path records an AuditEventTimeout
+//     entry, matching the Extract path (extractAllLinksCore previously bumped
+//     only the error counter, leaving an audit blind spot);
+//   - a UTF-8 BOM must be stripped identically on the encoding fast path and
+//     the forced-encoding slow path (moved here from the former
+//     bom_fastpath_regression_test.go — another fast-vs-slow-path parity
+//     regression alongside the detectEncoding pair);
+//   - the remaining *FromFileWithContext entry points observe a cancelled
+//     context before their uncancellable file read, matching the
+//     ExtractFromFileWithContext precedence contract.
 
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -136,5 +148,105 @@ func TestDetectEncodingKeepsZeroCopyWhenSynchronous(t *testing.T) {
 	}
 	if want := "<html><body><p>ascii only</p></body></html>"; decoded != want {
 		t.Fatalf("decoded = %q, want %q", decoded, want)
+	}
+}
+
+// TestExtractAllLinksTimeoutAudited pins the audit parity fix: a document
+// whose link extraction exceeds ProcessingTimeout must surface
+// ErrProcessingTimeout AND record a timeout audit entry, exactly as the
+// Extract path does. The deadline is 1µs so the timeout fires before the
+// parse of a many-element document can complete, independent of machine speed.
+func TestExtractAllLinksTimeoutAudited(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.MaxCacheEntries = 0
+	cfg.ProcessingTimeout = time.Microsecond
+	cfg.Audit.Enabled = true
+	cfg.Audit.LogTimeouts = true
+
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	_, err = p.ExtractAllLinks(userDeadlineDoc())
+	if !errors.Is(err, ErrProcessingTimeout) {
+		t.Fatalf("ExtractAllLinks error = %v, want ErrProcessingTimeout", err)
+	}
+
+	for _, e := range p.GetAuditLog() {
+		if e.EventType == AuditEventTimeout {
+			return
+		}
+	}
+	t.Errorf("no %s audit entry recorded for a links-path processing timeout; entries: %+v",
+		AuditEventTimeout, p.GetAuditLog())
+}
+
+// TestExtractStripsUTF8BOM is the end-to-end regression for the D-002 P0 fix:
+// a UTF-8 BOM used to survive the encoding fast path into Result.Text
+// (observed: a stray U+FEFF plus a spurious leading newline in front of
+// "hello world"), while the same bytes forced down the slow path via
+// Config.Encoding = "utf-8" came back clean.
+func TestExtractStripsUTF8BOM(t *testing.T) {
+	t.Parallel()
+
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	body := []byte("<html><body><p>hello world</p></body></html>")
+
+	in := append(append([]byte{}, bom...), body...)
+
+	// Default route: fast path (no forced encoding).
+	got, err := Extract(in)
+	if err != nil {
+		t.Fatalf("Extract(BOM doc): %v", err)
+	}
+	if strings.ContainsRune(got.Text, rune(0xFEFF)) {
+		t.Errorf("default route leaked a UTF-8 BOM into Text: %q", got.Text)
+	}
+	if want := "hello world"; got.Text != want {
+		t.Errorf("Text = %q, want %q", got.Text, want)
+	}
+
+	// Slow route (forced encoding): must agree byte-for-byte with the fast
+	// route on the same input.
+	cfg := DefaultConfig()
+	cfg.Encoding = "utf-8"
+	slow, err := Extract(in, cfg)
+	if err != nil {
+		t.Fatalf("Extract(BOM doc, forced utf-8): %v", err)
+	}
+	if slow.Text != got.Text {
+		t.Errorf("forced-encoding route Text = %q, default route = %q; want identical", slow.Text, got.Text)
+	}
+}
+
+// TestFromFileContextCancellationPrecedence pins the early-cancellation
+// ordering for the remaining *FromFileWithContext entry points whose
+// cancelled-context branch had no test: ExtractAllLinksFromFileWithContext
+// and ExtractToMarkdownFromFileWithContext (the ReadPage FromFile family is
+// covered by TestReadPageFromFileErrors / TestReadPageContextVariants in
+// read_test.go). A cancelled context must win over the file error, because
+// the file read itself is not cancellable.
+func TestFromFileContextCancellationPrecedence(t *testing.T) {
+	t.Parallel()
+
+	missing := filepath.Join(t.TempDir(), "missing.html")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	p, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	if _, err := p.ExtractAllLinksFromFileWithContext(ctx, missing); !errors.Is(err, context.Canceled) {
+		t.Errorf("ExtractAllLinksFromFileWithContext: cancelled-context error = %v, want context.Canceled", err)
+	}
+	if _, err := p.ExtractToMarkdownFromFileWithContext(ctx, missing); !errors.Is(err, context.Canceled) {
+		t.Errorf("ExtractToMarkdownFromFileWithContext: cancelled-context error = %v, want context.Canceled", err)
 	}
 }
