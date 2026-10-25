@@ -85,7 +85,7 @@ func applyRowspanGrid(tableData [][]CellData, maxCols int) [][]CellData {
 	fillText := make([]string, numRows*maxCols)
 
 	grid := make([][]CellData, numRows)
-	for r := 0; r < numRows; r++ {
+	for r := range numRows {
 		row := make([]CellData, maxCols)
 		base := r * maxCols
 		col := 0
@@ -166,7 +166,7 @@ func calculateMaxColumns(tableData [][]CellData) int {
 	// occupied[r] records columns in row r already taken by a rowspan from an
 	// earlier row. Only rows that receive a span get a non-nil map.
 	occupied := make([]map[int]bool, numRows)
-	for r := 0; r < numRows; r++ {
+	for r := range numRows {
 		occ := occupied[r]
 		col := 0
 		for _, cell := range tableData[r] {
@@ -316,7 +316,7 @@ func calculateColumnAlignments(tableData [][]CellData, maxCols int) []string {
 
 	// Determine majority alignment for each column
 	if len(tableData) > 0 {
-		for i := 0; i < maxCols; i++ {
+		for i := range maxCols {
 			colAligns[i] = determineColumnAlignment(alignCounts[i], tableData[0], i)
 		}
 	} else {
@@ -378,6 +378,17 @@ func determineColumnAlignment(counts AlignCount, firstRow []CellData, colIdx int
 	}
 }
 
+// escapedCellWidth returns the rendered width of cell text in Markdown: the
+// rune count plus one per escapable byte, because writeMarkdownCellText
+// renders each '\' and '|' as a two-byte escape sequence. Column-width
+// calculation and row padding must agree on this width or every cell holding
+// an escapable byte knocks its row's padding out of alignment — the single
+// helper exists so the two call sites cannot drift apart.
+func escapedCellWidth(text string) int {
+	return utf8.RuneCountInString(text) +
+		strings.Count(text, "\\") + strings.Count(text, "|")
+}
+
 // calculateMaxColumnWidths finds the maximum text width for each column.
 // Optimized with pre-allocated slice.
 func calculateMaxColumnWidths(tableData [][]CellData, maxCols int) []int {
@@ -385,16 +396,7 @@ func calculateMaxColumnWidths(tableData [][]CellData, maxCols int) []int {
 	colMaxWidths := make([]int, maxCols)
 	for _, row := range tableData {
 		for j := 0; j < maxCols && j < len(row); j++ {
-			text := row[j].Text
-			// writeMarkdownCellText renders each '\' and '|' as a two-byte
-			// escape sequence, so the rendered width is the rune count plus
-			// one per escapable byte. Without the adjustment, a cell
-			// containing them made its row one character wider than the
-			// padded column (the table stayed structurally valid; only the
-			// alignment the padding exists to provide was lost).
-			textLen := utf8.RuneCountInString(text) +
-				strings.Count(text, "\\") + strings.Count(text, "|")
-			if textLen > colMaxWidths[j] {
+			if textLen := escapedCellWidth(row[j].Text); textLen > colMaxWidths[j] {
 				colMaxWidths[j] = textLen
 			}
 		}
@@ -407,13 +409,10 @@ func calculateMaxColumnWidths(tableData [][]CellData, maxCols int) []int {
 // Optimized with pre-allocated slice capacity.
 func filterExpandedColumns(tableData [][]CellData, maxCols int) []int {
 	// Pre-allocate with estimated capacity: assume 80% of columns are included
-	estimatedInclusions := maxCols * 4 / 5
-	if estimatedInclusions < 1 {
-		estimatedInclusions = 1
-	}
+	estimatedInclusions := max(maxCols*4/5, 1)
 	newToOldCol := make([]int, 0, estimatedInclusions)
 
-	for j := 0; j < maxCols; j++ {
+	for j := range maxCols {
 		// Check if this column has any non-expanded content
 		allExpanded := true
 		for _, row := range tableData {
@@ -491,13 +490,9 @@ func renderMarkdownRow(tb *TrackedBuilder, row []CellData, newToOldCol []int,
 
 		maxWidth := colMaxWidths[newJ]
 		// The rendered width must count the escapes writeMarkdownCellText
-		// emits, exactly as calculateMaxColumnWidths does. Without the
-		// adjustment a cell containing a pipe or a backslash rendered one
-		// character wider per escapable byte than its column, which knocked
-		// the padding of every cell in that row out of alignment.
-		textLen := utf8.RuneCountInString(cellText) +
-			strings.Count(cellText, "\\") + strings.Count(cellText, "|")
-		pad := maxWidth - textLen
+		// emits, exactly as calculateMaxColumnWidths does (escapedCellWidth
+		// is that shared definition).
+		pad := maxWidth - escapedCellWidth(cellText)
 
 		// Apply alignment-based padding. Cell text is written through
 		// writeMarkdownCellText so a literal '|' cannot end the cell early and

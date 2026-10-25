@@ -465,7 +465,7 @@ func extractAttributeValue(tagContent, attrName string) string {
 			continue
 		}
 		match := true
-		for j := 0; j < searchLen; j++ {
+		for j := range searchLen {
 			c := tagContent[pos+j]
 			sc := search[j]
 			if c >= 'A' && c <= 'Z' {

@@ -19,8 +19,11 @@ type contentMetrics struct {
 	headingCount   int
 	textLength     int
 	linkTextLength int
-	tagCount       int
+	blockCount     int
+	linkCount      int
 	commaCount     int
+	sentenceCount  int
+	digitCount     int
 }
 
 // metricsSkipTags lists tags whose subtrees contain no extractable main-content
@@ -64,15 +67,19 @@ func collectContentMetrics(node *html.Node) contentMetrics {
 			// div around a mega-menu can outscore the real article body; when
 			// CleanContentNode then strips the wrapper's children, the
 			// extraction yields empty output.
-			if IsNonContentElement(n.Data) || metricsSkipTags(n.Data) || ShouldRemoveElement(n) {
+			if isSkipElement(n) || metricsSkipTags(n.Data) || ShouldRemoveElement(n) {
 				return false
 			}
-			metrics.tagCount++
+			if isBlockElementForScoring(n.Data) {
+				metrics.blockCount++
+			}
 			switch n.Data {
 			case "p":
 				metrics.paragraphCount++
 			case "h1", "h2", "h3", "h4", "h5", "h6":
 				metrics.headingCount++
+			case "a":
+				metrics.linkCount++
 			}
 		} else if n.Type == html.TextNode {
 			// Inline NBSP normalization: Contains is the vectorized equivalent
@@ -89,6 +96,8 @@ func collectContentMetrics(node *html.Node) contentMetrics {
 			if text != "" {
 				metrics.textLength += len(text)
 				metrics.commaCount += strings.Count(text, ",") + strings.Count(text, "，")
+				metrics.sentenceCount += countSentenceTerminators(text)
+				metrics.digitCount += countDigitBytes(text)
 
 				// Check if this text is inside a link
 				for parent := n.Parent; parent != nil; parent = parent.Parent {
@@ -106,18 +115,123 @@ func collectContentMetrics(node *html.Node) contentMetrics {
 }
 
 // calculateDensityFromMetrics calculates content density from collected metrics.
+// Density is the average text length per block element, scaled so that
+// charsPerBlockForFullDensity characters per block maps to 1.0 and clamped to
+// [0,1]. Only block-level elements are counted (not inline formatting tags), so
+// prose with heavy <span>/<em> markup is not misread as low density the way a
+// total-tag count did.
 func calculateDensityFromMetrics(m contentMetrics) float64 {
 	if m.textLength == 0 {
 		return 0
 	}
-	if m.tagCount == 0 {
+	if m.blockCount == 0 {
 		return 1.0
 	}
-	density := float64(m.textLength) / (float64(m.tagCount) * 10)
+	density := float64(m.textLength) / float64(m.blockCount) / charsPerBlockForFullDensity
 	if density > 1.0 {
 		return 1.0
 	}
 	return density
+}
+
+// countSentenceTerminators counts sentence-ending punctuation in text: the ASCII
+// sentence terminators plus the CJK forms — ideographic full stop 。(U+3002,
+// E3 80 82) and fullwidth ！(U+FF01, EF BC 81) ？(U+FF1F, EF BC 9F) — so CJK
+// prose, which carries no commas but is rich in full stops, still scores as
+// prose. It is a byte scan matching ASCII terminators directly and the CJK
+// terminators by their distinct UTF-8 lead/prefix bytes.
+func countSentenceTerminators(text string) int {
+	count := 0
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '.', '!', '?':
+			count++
+		case 0xE3:
+			// 。 U+3002 = E3 80 82.
+			if i+2 < len(text) && text[i+1] == 0x80 && text[i+2] == 0x82 {
+				count++
+			}
+			i += 2
+		case 0xEF:
+			// ！ U+FF01 = EF BC 81, ？ U+FF1F = EF BC 9F.
+			if i+2 < len(text) && text[i+1] == 0xBC {
+				switch text[i+2] {
+				case 0x81, 0x9F:
+					count++
+				}
+			}
+			i += 2
+		}
+	}
+	return count
+}
+
+// countDigitBytes counts ASCII digit bytes in text — the raw material for the
+// data-grid penalty in applyScoringRules.
+func countDigitBytes(text string) int {
+	count := 0
+	for i := 0; i < len(text); i++ {
+		if text[i] >= '0' && text[i] <= '9' {
+			count++
+		}
+	}
+	return count
+}
+
+// FindListingContainer returns the outermost element that is a listing/index
+// page's card container: at least minListingArticles direct-child <article>
+// elements whose combined link density exceeds listingArticleLinkDensity, in a
+// container that is not itself removal-marked chrome (a .related wrapper of
+// article cards is chrome, not the page's listing). Nil when no such container
+// exists — the common case on article pages.
+//
+// Card listings mark each card up as its own <article> (blog indexes, news
+// feeds, search results), so every card carries the +1000 article tag score
+// and plain candidate selection picks a single card. Recognizing the shape
+// lets the caller extract the whole list and report it as a listing instead.
+func FindListingContainer(root *html.Node) *html.Node {
+	var found *html.Node
+	WalkNodes(root, func(n *html.Node) bool {
+		if found != nil {
+			return false
+		}
+		if n.Type != html.ElementNode || !isListingContainer(n) {
+			return true
+		}
+		found = n
+		return false
+	})
+	return found
+}
+
+// isListingContainer reports whether node itself is a listing container per
+// FindListingContainer's contract.
+func isListingContainer(node *html.Node) bool {
+	articles := 0
+	for c := node.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == html.ElementNode && c.Data == "article" {
+			articles++
+		}
+	}
+	if articles < minListingArticles {
+		return false
+	}
+	// Chrome wrappers (related/recirc sections) also wrap article cards;
+	// they are removed later and must not be selected as the listing.
+	if ShouldRemoveElement(node) {
+		return false
+	}
+
+	linkText, totalText := 0, 0
+	for c := node.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type != html.ElementNode || c.Data != "article" {
+			continue
+		}
+		m := collectContentMetrics(c)
+		linkText += m.linkTextLength
+		totalText += m.textLength
+	}
+	return totalText > 0 && float64(linkText)/float64(totalText) > listingArticleLinkDensity
 }
 
 // calculateLinkDensityFromMetrics calculates link density from collected metrics.

@@ -26,7 +26,10 @@ type CellAccessor interface {
 // NodeWalker provides methods for walking the DOM tree.
 type NodeWalker interface {
 	// Walk traverses the DOM tree starting from node, calling callback for each node.
-	// The callback returns false to stop traversal, true to continue.
+	// The callback returns false to skip that node's subtree (its children are
+	// not visited); traversal continues with the node's siblings. Returning
+	// false does NOT abort the whole walk — extractTableData relies on this,
+	// pruning each processed row's children while later rows are still visited.
 	Walk(node *html.Node, callback func(*html.Node) bool)
 }
 
@@ -63,17 +66,20 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 		tableFormat = "markdown"
 	}
 
-	// Ensure blank line before table for proper Markdown parsing
-	EnsureNewline(tb)
-	if tb.LastChar == '\n' {
-		_ = tb.WriteByte('\n')
-	}
-
-	// Step 1: Extract all row data from table
+	// Step 1: Extract all row data from table. This runs before the leading
+	// blank line is written so a table with no renderable rows (no <tr>, or
+	// rows without td/th cells) emits nothing at all — a newline pair written
+	// up front inserted a paragraph break the source document did not have.
 	tableData := p.extractTableData(table, tableFormat)
 
 	if len(tableData) == 0 {
 		return
+	}
+
+	// Ensure blank line before table for proper Markdown parsing
+	EnsureNewline(tb)
+	if tb.LastChar == '\n' {
+		_ = tb.WriteByte('\n')
 	}
 
 	// Step 2: Determine maximum columns
@@ -83,11 +89,10 @@ func (p *Processor) Extract(table *html.Node, tb *TrackedBuilder, tableFormat st
 	// Markdown for unknown formats.
 	getRenderer(tableFormat).Render(tableData, tb, maxCols)
 
-	// Ensure blank line after table for proper Markdown parsing
-	_ = tb.WriteByte('\n')
-	if tb.LastChar == '\n' {
-		_ = tb.WriteByte('\n')
-	}
+	// Ensure blank line after table for proper Markdown parsing. WriteByte
+	// unconditionally records the byte in LastChar, so after the '\n' just
+	// written the second newline was unconditional — write the pair directly.
+	_, _ = tb.WriteString("\n\n")
 }
 
 // maxExpandedCells bounds the AGGREGATE number of colspan placeholder cells a
@@ -211,10 +216,7 @@ func (p *Processor) appendRowCells(dst []CellData, rowNode *html.Node) []CellDat
 			continue
 		}
 
-		colspan := p.cellAccessor.GetColSpan(child)
-		if colspan < 1 {
-			colspan = 1
-		}
+		colspan := max(p.cellAccessor.GetColSpan(child), 1)
 
 		dst = append(dst, CellData{
 			Text:            sanitizeCellText(p.cellAccessor.GetTextContent(child)),

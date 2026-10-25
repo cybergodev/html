@@ -1,14 +1,18 @@
 package html
 
 // regressions_timeout_test.go — regressions for the D-002/P-002 timeout and
-// ownership fixes, gathered from the former single-topic files:
+// ownership fixes, gathered from the former single-topic files (plus the
+// timeout-audit parity test from d002_quality_regression_test.go):
 //
 //   - any context.DeadlineExceeded was once rewritten to ErrProcessingTimeout
 //     whenever ProcessingTimeout > 0, losing the caller's own earlier deadline
 //     identity; the *WithContext entry points must preserve it;
 //   - with a processing timeout configured, detectEncoding must decode into a
 //     private copy (work runs on another goroutine), while the synchronous path
-//     keeps the zero-copy decode.
+//     keeps the zero-copy decode;
+//   - a processing timeout on the links path records an AuditEventTimeout
+//     entry, matching the Extract path (extractAllLinksCore previously bumped
+//     only the error counter, leaving an audit blind spot).
 
 import (
 	"context"
@@ -137,4 +141,38 @@ func TestDetectEncodingKeepsZeroCopyWhenSynchronous(t *testing.T) {
 	if want := "<html><body><p>ascii only</p></body></html>"; decoded != want {
 		t.Fatalf("decoded = %q, want %q", decoded, want)
 	}
+}
+
+// TestExtractAllLinksTimeoutAudited pins the audit parity fix: a document
+// whose link extraction exceeds ProcessingTimeout must surface
+// ErrProcessingTimeout AND record a timeout audit entry, exactly as the
+// Extract path does. The deadline is 1µs so the timeout fires before the
+// parse of a many-element document can complete, independent of machine speed.
+func TestExtractAllLinksTimeoutAudited(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.MaxCacheEntries = 0
+	cfg.ProcessingTimeout = time.Microsecond
+	cfg.Audit.Enabled = true
+	cfg.Audit.LogTimeouts = true
+
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	_, err = p.ExtractAllLinks(userDeadlineDoc())
+	if !errors.Is(err, ErrProcessingTimeout) {
+		t.Fatalf("ExtractAllLinks error = %v, want ErrProcessingTimeout", err)
+	}
+
+	for _, e := range p.GetAuditLog() {
+		if e.EventType == AuditEventTimeout {
+			return
+		}
+	}
+	t.Errorf("no %s audit entry recorded for a links-path processing timeout; entries: %+v",
+		AuditEventTimeout, p.GetAuditLog())
 }

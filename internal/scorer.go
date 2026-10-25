@@ -63,7 +63,13 @@ func DefaultScoringConfig() *ScoringConfig {
 			"menu": strongNegativeScore, "ad": strongNegativeScore, "advertisement": strongNegativeScore,
 		},
 		NegativeMediumPatterns: map[string]int{
-			"widget": mediumNegativeScore, "related": mediumNegativeScore, "share": mediumNegativeScore,
+			// "widget" is deliberately absent: the token is ambiguous — it names
+			// real ad/recirculation widgets, but also CMS content containers such
+			// as Drupal/NIR "nir-widget" / "block--…__widget", which wrap the
+			// primary content. Removing those stripped the entire page body (see
+			// Enphase investor events page). "ad"/"advertisement"/"social" carry
+			// the same signal for genuine widgets without the false positives.
+			"related": mediumNegativeScore, "share": mediumNegativeScore,
 			"social": mediumNegativeScore, "meta": mediumNegativeScore, "tag": mediumNegativeScore,
 			"category": mediumNegativeScore,
 		},
@@ -78,13 +84,27 @@ func DefaultScoringConfig() *ScoringConfig {
 			"ad": true, "ads": true, "advertisement": true,
 			"social": true, "share": true, "sharing": true,
 			"related": true, "recommend": true,
-			"widget": true, "plugin": true,
-			"promo": true, "promotion": true,
+			// "widget" is deliberately absent for the same reason as in
+			// NegativeMediumPatterns above: CMS content blocks (nir-widget,
+			// block--…__widget) are primary content, not removable chrome.
+			"plugin": true,
+			"promo":  true, "promotion": true,
 			"banner": true, "sponsor": true,
 			// Sitemap/site-map/site_map match standard delimited class/id values.
 			// Prefixed/suffixed forms (divSiteMap, sitemap2) are caught by
 			// SubstringRemovePatterns below, since word boundaries fail there.
 			"sitemap": true, "site-map": true, "site_map": true,
+
+			// Navigation trails and consent/subscription/promo chrome. Each
+			// token is word-bounded and names page furniture that never holds
+			// article prose; the riskier candidates ("premium", "skip") are
+			// deliberately absent until eval evidence justifies them.
+			"breadcrumb": true, "breadcrumbs": true,
+			"cookie": true, "gdpr": true, "consent": true,
+			"newsletter": true, "subscribe": true, "signup": true,
+			"modal": true, "overlay": true, "popup": true, "toast": true,
+			"trending": true, "popular": true, "recirc": true,
+			"outbrain": true, "taboola": true, "disqus": true,
 		},
 		// Substring matches for navigation markers that reliably indicate
 		// non-primary content regardless of surrounding characters. "sitemap"
@@ -223,6 +243,10 @@ func buildRemoveSubstrPatterns(config *ScoringConfig) []string {
 
 // NewDefaultScorerWithConfig creates a new DefaultScorer with custom configuration.
 // If config is nil, the default configuration is used.
+//
+// Test/calibration surface: production code always builds the default
+// configuration; this constructor is exercised by scoring_test.go to tune
+// ScoringConfig against the fixture corpus.
 func NewDefaultScorerWithConfig(config *ScoringConfig) *DefaultScorer {
 	if config == nil {
 		config = DefaultScoringConfig()
@@ -343,27 +367,60 @@ func (s *DefaultScorer) applyScoringRules(node *html.Node, metrics contentMetric
 		score = int(float64(score) * lowDensityMultiplier)
 	}
 
-	// Penalize high link density (likely navigation/menu/sitemap). The penalty
-	// is gated on absolute text length: nav bars and tag clouds are link-dense
-	// AND short, whereas main content that legitimately wraps prose or cards
-	// in <a> (landing pages, portfolio grids) is link-dense but substantial.
-	// Without this gate, a card-layout container is crushed by
-	// highLinkDensityPenalty and the article extractor picks a tiny sibling
-	// (e.g. a hero block) instead, discarding most of the page.
+	// Penalize high link density when the links are navigation-like: many
+	// short links. The old gate on absolute text length (textLength < 500)
+	// both crushed link-wrapped card grids whose card text stayed under 500
+	// chars and let through long tag clouds. Gating on average link-text length
+	// instead — nav bars and tag clouds are many short links ("Home", "About"),
+	// card grids wrap long prose — preserves the card-grid fix without the
+	// absolute-length blind spot. The penalty is applied only when the node has
+	// any links and is still gated on text length so a genuinely long article
+	// body (which may legitimately be link-dense) is never crushed.
 	linkDensity := calculateLinkDensityFromMetrics(metrics)
-	if metrics.textLength < linkDensityPenaltyTextThreshold {
-		if linkDensity > highLinkDensityThreshold {
-			score = int(float64(score) * highLinkDensityPenalty)
-		} else if linkDensity > mediumLinkDensityThreshold {
-			score = int(float64(score) * mediumLinkDensityPenalty)
-		} else if linkDensity > lowLinkDensityThreshold {
-			score = int(float64(score) * lowLinkDensityPenalty)
+	if metrics.linkCount > 0 && linkDensity > lowLinkDensityThreshold {
+		navLike := metrics.linkTextLength/metrics.linkCount < navLinkTextThreshold
+		if navLike || metrics.textLength < linkDensityPenaltyTextThreshold {
+			if linkDensity > highLinkDensityThreshold {
+				score = int(float64(score) * highLinkDensityPenalty)
+			} else if linkDensity > mediumLinkDensityThreshold {
+				score = int(float64(score) * mediumLinkDensityPenalty)
+			} else if linkDensity > lowLinkDensityThreshold {
+				score = int(float64(score) * lowLinkDensityPenalty)
+			}
+		}
+	}
+
+	// Text-quality features (P2). Both are gated on substantial text so short
+	// fragments (a heading, a caption, a table cell row) are never penalized.
+	if textLength >= longTextThreshold {
+		// Data-grid penalty: text that is mostly digits is tabular or numeric
+		// chrome (price grids, stat cards, screener tables), not prose. Real
+		// prose rarely exceeds 20% digits; the threshold leaves headroom for
+		// finance or data journalism.
+		if float64(metrics.digitCount)/float64(textLength) > highDigitRatioThreshold {
+			score = int(float64(score) * dataGridPenalty)
+		}
+		// Label-soup penalty: 200+ characters with (nearly) no sentence
+		// punctuation or commas is a run of labels and titles — tag clouds,
+		// keyword lists, link-card titles — rather than running prose. CJK
+		// prose is covered too: 。！？ feed sentenceCount.
+		if punct := metrics.commaCount + metrics.sentenceCount; punct == 0 ||
+			float64(punct)/float64(textLength) < minProsePunctDensity {
+			score = int(float64(score) * labelSoupPenalty)
 		}
 	}
 
 	// Bonus for comma-rich content (likely prose)
 	if metrics.commaCount > commaBonusThreshold {
 		score += metrics.commaCount * commaBonusMultiplier
+	}
+
+	// Bonus for sentence-dense content (prose with real sentence structure).
+	// This strengthens the weak comma-count prose signal, especially for CJK
+	// text, which carries no ASCII commas but terminates sentences with fullwidth
+	// full stops (。！？).
+	if metrics.sentenceCount > sentenceBonusThreshold {
+		score += metrics.sentenceCount * sentenceBonusMultiplier
 	}
 
 	return score
@@ -412,6 +469,10 @@ func (c *candidateCollector) record(node *html.Node, score int) {
 // scoreWithMetrics applies the same guards (IsNonContentElement, "p") and rules,
 // and the folded metrics match collectContentMetrics(n). Equivalence is locked by
 // TestScoreArticleCandidatesMatchesNaiveLoop.
+//
+// Test/calibration surface: production extraction goes through
+// FindBestArticleNode (the map-free single pass); this method survives as the
+// equivalence anchor for that test and for scorer tuning.
 func (s *DefaultScorer) ScoreArticleCandidates(root *html.Node) map[*html.Node]int {
 	candidates := make(map[*html.Node]int, 32)
 	s.foldAndScore(root, false, &candidateCollector{candidates: candidates})
@@ -423,10 +484,66 @@ func (s *DefaultScorer) ScoreArticleCandidates(root *html.Node) map[*html.Node]i
 // folds best-candidate tracking directly into the bottom-up scoring pass, so the
 // map allocation that ScoreArticleCandidates requires is never made — the caller
 // (extractArticleNode) only needs the winning node, never the full candidate set.
+//
+// The raw winner is then widened by climbToContentWrapper: a winning block
+// whose parent scores at least as well, is not chrome, and whose text the
+// block dominates is almost always one fragment of an article split across
+// siblings under that wrapper — the wrapper is the article. This generalizes
+// the single-level expandToArticleCluster patch to any depth.
 func (s *DefaultScorer) FindBestArticleNode(root *html.Node) *html.Node {
 	cc := &candidateCollector{bestScore: -1}
 	s.foldAndScore(root, false, cc)
-	return cc.bestNode
+	if cc.bestNode == nil {
+		return nil
+	}
+	return s.climbToContentWrapper(cc.bestNode, cc.bestScore)
+}
+
+// climbToContentWrapper widens best upward while every step is safe. A step to
+// the parent requires ALL of:
+//
+//   - the parent is an element other than <body>/<html> (the body fallback is
+//     the caller's decision, never a scored selection) and is not itself
+//     removal-marked chrome;
+//   - dominance: best already holds at least half the parent's text — the
+//     parent adds at most a sibling fragment of the same article, not a
+//     competing section (this also bounds the chain logarithmically: each
+//     step can at most double the text, so the hard step cap is a backstop);
+//   - the parent does not score below the current node: wrappers dragged
+//     down by their extra chrome (link density, label-soup penalties) stop
+//     the climb, and equal scores climb — ties prefer the wider ancestor,
+//     whose chrome CleanContentNode strips afterwards.
+//
+// Ancestor scores are computed lazily (collectContentMetrics + scoreWithMetrics
+// per step) rather than via a candidates map, keeping the scoring fold
+// allocation-free; nested ancestor subtrees shrink, so the whole climb costs
+// a small multiple of the final subtree.
+func (s *DefaultScorer) climbToContentWrapper(best *html.Node, bestScore int) *html.Node {
+	for range maxScoreClimbSteps {
+		parent := best.Parent
+		if parent == nil || parent.Type != html.ElementNode {
+			break
+		}
+		switch parent.Data {
+		case "body", "html":
+			return best
+		}
+		if s.ShouldRemove(parent) {
+			break
+		}
+		// Length-only dominance test: TextContentLength is the allocation-free
+		// twin of len(GetTextContent(...)) (see helpers.go), and each climb step
+		// previously materialized two whole-subtree strings just to compare them.
+		if TextContentLength(best)*2 < TextContentLength(parent) {
+			break
+		}
+		parentScore := s.scoreWithMetrics(parent, collectContentMetrics(parent))
+		if parentScore <= 0 || parentScore < bestScore {
+			break
+		}
+		best, bestScore = parent, parentScore
+	}
+	return best
 }
 
 // foldAndScore computes node's subtree metrics bottom-up and records a score for
@@ -445,16 +562,20 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, cc *candi
 		return contentMetrics{}
 	}
 
-	isSkip := node.Type == html.ElementNode && (IsNonContentElement(node.Data) || metricsSkipTags(node.Data) || s.ShouldRemove(node))
+	isSkip := node.Type == html.ElementNode && (isSkipElement(node) || metricsSkipTags(node.Data) || s.ShouldRemove(node))
 
 	var m contentMetrics
 	if node.Type == html.ElementNode && !isSkip {
-		m.tagCount++
+		if isBlockElementForScoring(node.Data) {
+			m.blockCount++
+		}
 		switch node.Data {
 		case "p":
 			m.paragraphCount++
 		case "h1", "h2", "h3", "h4", "h5", "h6":
 			m.headingCount++
+		case "a":
+			m.linkCount++
 		}
 		if node.Data == "a" {
 			insideLink = true
@@ -464,12 +585,15 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, cc *candi
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
 		cm := s.foldAndScore(child, insideLink, cc)
 		if !isSkip {
-			m.tagCount += cm.tagCount
+			m.blockCount += cm.blockCount
 			m.paragraphCount += cm.paragraphCount
 			m.headingCount += cm.headingCount
+			m.linkCount += cm.linkCount
 			m.textLength += cm.textLength
 			m.linkTextLength += cm.linkTextLength
 			m.commaCount += cm.commaCount
+			m.sentenceCount += cm.sentenceCount
+			m.digitCount += cm.digitCount
 		}
 	}
 
@@ -489,6 +613,8 @@ func (s *DefaultScorer) foldAndScore(node *html.Node, insideLink bool, cc *candi
 			textLen := len(text)
 			m.textLength += textLen
 			m.commaCount += strings.Count(text, ",") + strings.Count(text, "，")
+			m.sentenceCount += countSentenceTerminators(text)
+			m.digitCount += countDigitBytes(text)
 			if insideLink {
 				m.linkTextLength += textLen
 			}
@@ -570,6 +696,114 @@ func (s *DefaultScorer) matchesRemovalPatterns(lowerVal string) bool {
 	return false
 }
 
+var hiddenClassTokens = [...]string{
+	"hidden",
+	"hide",
+	"is-hidden",
+	"sr-only",
+	"visually-hidden",
+	"d-none",
+	"invisible",
+}
+
+// hiddenResponsiveSuffixes are the Bootstrap 3 responsive visibility breakpoint
+// suffixes: class="hidden-sm" means "hidden only on small screens" and is VISIBLE
+// on larger ones, so stripping it would drop legitimately visible content. The
+// "-up"/"-down" forms ("hidden-md-up" = hidden on medium and up) are the same
+// family and are included alongside the plain breakpoint. When the token
+// "hidden" (or "hide") is immediately followed by one of these as a bounded
+// token, it is a responsive class, not an always-hidden class.
+var hiddenResponsiveSuffixes = [...]string{
+	"xs", "sm", "md", "lg", "xl", "print",
+	"xs-up", "sm-up", "md-up", "lg-up", "xl-up",
+	"xs-down", "sm-down", "md-down", "lg-down", "xl-down",
+}
+
+// isResponsiveHiddenSuffix reports whether lowerVal, at the position just past a
+// matched "hidden"/"hide" token, continues with a responsive-visibility suffix
+// ("-sm", "-md", ...). The suffix must itself be bounded so "-small" (a real word
+// that merely starts with "sm") is not confused with the breakpoint "sm".
+func isResponsiveHiddenSuffix(lowerVal string, end int) bool {
+	if end+2 > len(lowerVal) || lowerVal[end] != '-' {
+		return false
+	}
+	rest := lowerVal[end+1:]
+	for _, suffix := range hiddenResponsiveSuffixes {
+		if len(rest) < len(suffix) {
+			continue
+		}
+		if rest[:len(suffix)] != suffix {
+			continue
+		}
+		// The suffix must be bounded: end of string, or a non-alphanumeric
+		// boundary ("hidden-sm ", "hidden-md-up"). A following letter/digit would
+		// mean a longer word ("hidden-smaller") that is not a breakpoint.
+		after := len(suffix)
+		if after >= len(rest) {
+			return true
+		}
+		c := rest[after]
+		if !isAlphaNumericByte(c) {
+			return true
+		}
+	}
+	return false
+}
+
+// hiddenClassScanClass maps each byte to a dense bucket id (1+) for the
+// hiddenClassTokens buckets, or 0 when no token begins with that byte. It is the
+// same one-byte dispatch idiom as removeScanClass (and mediaScanClass in
+// media.go): ShouldRemove consults it per byte of a class/id value so the whole
+// hidden-token set is evaluated in one pass, without a strings.Index scan per
+// token per attribute.
+var hiddenClassScanClass, hiddenClassScanBuckets = func() ([256]uint8, [][]string) {
+	var index [256][]string
+	for _, token := range hiddenClassTokens {
+		if token == "" {
+			continue
+		}
+		index[token[0]] = append(index[token[0]], token)
+	}
+	return densifyFirstByteIndex(index)
+}()
+
+// matchesHiddenClassToken reports whether lowerVal (a lowercased class or id
+// attribute value) contains a class token that reliably denotes a hidden
+// element. Unlike matchesRemovalPatterns, no leading word boundary is required:
+// tokens such as "d-none" (Bootstrap) and "sr-only" are complete class names.
+// A trailing boundary IS required (end-of-string or a non-alphanumeric byte), so
+// a token cannot fire inside a longer word ("hiddenize" is not "hidden"). The
+// "hidden"/"hide" tokens are additionally exempted when they carry a Bootstrap 3
+// responsive-visibility suffix (hidden-sm, ...), which means "hidden only on
+// that breakpoint" — visible elsewhere.
+func matchesHiddenClassToken(lowerVal string) bool {
+	for i := 0; i < len(lowerVal); i++ {
+		class := hiddenClassScanClass[lowerVal[i]]
+		if class == 0 {
+			continue
+		}
+		for _, token := range hiddenClassScanBuckets[class-1] {
+			if !strings.HasPrefix(lowerVal[i:], token) {
+				continue
+			}
+			end := i + len(token)
+			if end < len(lowerVal) && isAlphaNumericByte(lowerVal[end]) {
+				continue // token continues into a longer word ("hiddenize")
+			}
+			if (token == "hidden" || token == "hide") && isResponsiveHiddenSuffix(lowerVal, end) {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// isAlphaNumericByte reports whether c is an ASCII letter or digit.
+func isAlphaNumericByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
 // ShouldRemove determines if a node should be removed from the content tree.
 func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 	if node == nil || node.Type != html.ElementNode {
@@ -580,7 +814,15 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 		return false
 	}
 
-	if IsNonContentElement(node.Data) {
+	if hardNonContent(node.Data) {
+		return true
+	}
+	// A soft landmark (header/footer/aside) outside a primary-content container
+	// is page chrome and must be stripped; inside <article>/<main> it is article
+	// furniture (byline, author footer, pull-quote) and is kept. This mirrors
+	// isSkipElement, which the extraction and scoring walks use for the same
+	// distinction, so ShouldRemove cannot strip a node that extraction keeps.
+	if isSoftLandmark(node.Data) && !insidePrimaryContent(node) {
 		return true
 	}
 
@@ -600,6 +842,19 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 				continue
 			}
 			lowerVal := strings.ToLower(attr.Val)
+			// A hidden-element class token (hidden, sr-only, d-none, ...) marks
+			// content that is visually absent — consent walls, folded "read more"
+			// regions, SEO filler — and must be stripped. On primary-content
+			// containers (<article>/<main>) this class check is skipped by the
+			// guard above; the unambiguous hidden ATTRIBUTE and style cases below
+			// still fire on them. It is independent of the content-area-signal
+			// guard below: a plain content wrapper with an explicit hidden class
+			// is hidden even when its class also carries a content-area signal.
+			// It runs as a substring test (no word boundary) so hyphenated tokens
+			// like "d-none" and camelCase "isHidden" forms are caught.
+			if matchesHiddenClassToken(lowerVal) {
+				return true
+			}
 			// A non-semantic element (div, section, ...) whose class/id
 			// contains both a content-area signal ("content", "article")
 			// and a removal pattern ("sidebar", "nav", ...) describes a CSS
@@ -623,6 +878,10 @@ func (s *DefaultScorer) ShouldRemove(node *html.Node) bool {
 			}
 		case "hidden":
 			return true
+		case "aria-hidden":
+			if strings.EqualFold(strings.TrimSpace(attr.Val), "true") {
+				return true
+			}
 		}
 	}
 	return false
@@ -804,7 +1063,15 @@ func (s *DefaultScorer) scoreAttributes(n *html.Node) int {
 		switch attr.Key {
 		case "class", "id":
 			lowerVal := strings.ToLower(attr.Val)
-			score += s.calculatePatternScore(lowerVal)
+			attributeScore := s.calculatePatternScore(lowerVal)
+			if attr.Key == "id" {
+				// An id is page-unique and names the element's role; a class
+				// is one of many styling hooks on the element. Weight id
+				// matches double (the Readability convention): id="content"
+				// says more about the node than class="content-utility-text".
+				attributeScore *= 2
+			}
+			score += attributeScore
 		case "role":
 			lowerVal := strings.ToLower(attr.Val)
 			switch lowerVal {
@@ -825,6 +1092,14 @@ func (s *DefaultScorer) scoreAttributes(n *html.Node) int {
 // categories at scorer construction, so a single match adds the same total the
 // per-category matches would have added together. Uses fixed-size arrays to
 // avoid heap allocation.
+//
+// CONSTRAINT: only patterns whose first byte is an ASCII letter or digit are
+// reachable — buckets are consulted solely for the alphanumeric characters
+// present in value. Scoring patterns in a custom ScoringConfig must therefore
+// start with an ASCII alphanumeric byte (the default configuration's all do);
+// a pattern starting with any other byte — "-", "…", or a CJK lead byte such
+// as the "导" of "导航" — is silently never matched. The removal-pattern path
+// (matchesRemovalPatterns) dispatches on every byte and has no such limit.
 func (s *DefaultScorer) calculatePatternScore(value string) int {
 	if len(value) == 0 {
 		return 0

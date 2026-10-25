@@ -73,7 +73,15 @@ const (
 	linkMapCap        = 64 // Initial capacity for link deduplication map
 
 	// Processing thresholds
-	wordsPerMinute = 200 // Average reading speed for reading time estimation
+	wordsPerMinute    = 200 // Average reading speed for reading time estimation
+	cjkCharsPerMinute = 350 // Reading speed for CJK text, in characters per minute
+
+	// Extraction-confidence thresholds (see computeExtractionConfidence in
+	// extract.go). Internal tuning constants, not exported.
+	confidentTextChars  = 200  // extracted chars that make an article extraction "substantial"
+	confidentBodyRatio  = 0.05 // minimum share of body text an article extraction should cover
+	paywallScanChars    = 800  // leading chars scanned for consent/paywall boilerplate
+	paywallTextMaxChars = 600  // extractions longer than this are not treated as paywalled
 )
 
 // ============================================================================
@@ -108,8 +116,14 @@ type Config struct {
 
 	// === Content Extraction ===
 	ExtractArticle bool // Enables article extraction mode. When true, identifies and extracts main content. Default: true.
-	PreserveImages bool // Controls whether images are preserved in output. Default: true.
-	PreserveLinks  bool // Controls whether links are preserved in output. Default: true.
+	// ExtractMetadata controls whether structured metadata (JSON-LD, OpenGraph
+	// <meta> tags, rel=canonical) is collected to populate Result.Author,
+	// Result.PublishedTime, Result.Description, Result.SiteName,
+	// Result.CanonicalURL, and the metadata-based title priority (JSON-LD
+	// headline / og:title ahead of the <title> tag). Default: true.
+	ExtractMetadata bool
+	PreserveImages  bool // Controls whether images are preserved in output. Default: true.
+	PreserveLinks   bool // Controls whether links are preserved in output. Default: true.
 	// PreserveVideos controls whether video elements are extracted. Default: true.
 	// Note: URLs that appear only in raw HTML outside media elements (inside
 	// script JSON, comments, etc.) are additionally scanned only for documents
@@ -164,11 +178,12 @@ func DefaultConfig() Config {
 		Audit:              DefaultAuditConfig(),
 
 		// Content Extraction
-		ExtractArticle: true,
-		PreserveImages: true,
-		PreserveLinks:  true,
-		PreserveVideos: true,
-		PreserveAudios: true,
+		ExtractArticle:  true,
+		ExtractMetadata: true,
+		PreserveImages:  true,
+		PreserveLinks:   true,
+		PreserveVideos:  true,
+		PreserveAudios:  true,
 
 		// Output Formats
 		InlineImageFormat: "none",
@@ -322,9 +337,44 @@ type Result struct {
 	// WordCount is the number of whitespace-separated words in Text; each CJK
 	// ideograph, kana, or Hangul syllable additionally counts as one word.
 	WordCount int `json:"word_count"`
-	// ReadingTime is the estimated reading time based on WordCount. It is omitted from
-	// JSON and serialized as reading_time_ms by MarshalJSON.
+	// ReadingTime is the estimated reading time based on WordCount, using
+	// separate per-script rates (200 words/min for space-separated words,
+	// 350 characters/min for CJK). It is omitted from JSON and serialized as
+	// reading_time_ms by MarshalJSON.
 	ReadingTime time.Duration `json:"-"`
+
+	// Author is the article author from JSON-LD author or <meta name="author">,
+	// joined with ", " when several are declared. Empty when absent. It is
+	// omitted from JSON when empty.
+	Author string `json:"author,omitempty"`
+	// PublishedTime is the publication timestamp from article:published_time or
+	// JSON-LD datePublished, parsed to time.Time. The zero time means unknown.
+	// It is omitted from JSON when zero (omitzero).
+	PublishedTime time.Time `json:"published_time,omitzero"`
+	// Description is the page summary from og:description, JSON-LD description,
+	// or <meta name="description">, in that priority. It is omitted from JSON
+	// when empty.
+	Description string `json:"description,omitempty"`
+	// SiteName is the publishing site's name from og:site_name or JSON-LD
+	// publisher.name. It is omitted from JSON when empty.
+	SiteName string `json:"site_name,omitempty"`
+	// CanonicalURL is the document's canonical location from <link
+	// rel="canonical"> or og:url. It is omitted from JSON when empty.
+	CanonicalURL string `json:"canonical_url,omitempty"`
+	// Confidence is a coarse extraction-quality signal in [0, 1]: 1.0 means an
+	// article node was identified with substantial text covering a sane share
+	// of the page; lower tiers flag body fallback, very short output, or
+	// consent/paywall boilerplate (see computeExtractionConfidence for the
+	// exact tiers). It lets pipeline callers decide when to fall back or flag
+	// a document for review.
+	Confidence float64 `json:"confidence"`
+	// ExtractionMethod reports how Text was produced: "article" when the
+	// scorer identified a main-content node, "listing" when the page was
+	// recognized as a card listing/index (Text is the whole card list), and
+	// "body" when extraction fell back to the full <body> (no candidate scored
+	// above zero, or ExtractArticle is false). It is omitted from JSON when
+	// empty.
+	ExtractionMethod string `json:"extraction_method,omitempty"`
 }
 
 // ImageInfo holds information about an extracted image.

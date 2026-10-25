@@ -592,6 +592,7 @@ See the `examples/` directory for complete examples (each is a self-contained `m
 - `09_context_cancellation/` - Context cancellation and timeouts
 - `10_secure_file_processing/` - AllowedBaseDir sandbox and secure file reads
 - `11_encoding/` - Character encoding detection and override
+- `12_metadata_quality/` - Structured metadata and extraction confidence
 
 Run any one directly, e.g. `go run ./examples/01_quick_start/`, or build all at once with `go build ./examples/...`.
 

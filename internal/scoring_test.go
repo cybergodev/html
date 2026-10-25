@@ -328,6 +328,76 @@ func TestCountTagsNil(t *testing.T) {
 	}
 }
 
+// TestBlockDensityIgnoresInlineMarkup guards the P1 density redefinition: content
+// density counts block elements, not inline formatting tags, so prose with heavy
+// <span>/<em> markup is not misread as low density. Two subtrees with identical
+// visible text — one plain, one wrapped in inline tags — must have equal density.
+func TestBlockDensityIgnoresInlineMarkup(t *testing.T) {
+	t.Parallel()
+
+	plain, err := parseHTML(`<div><p>This is a plain sentence with ordinary prose content.</p></div>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	formatted, err := parseHTML(`<div><p><span>This</span> <em>is</em> <span>a</span> <strong>plain</strong> <span>sentence</span> <em>with</em> <span>ordinary</span> <strong>prose</strong> <em>content</em><b>.</b></p></div>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plainDensity := CalculateContentDensity(plain)
+	formattedDensity := CalculateContentDensity(formatted)
+
+	if plainDensity != formattedDensity {
+		t.Errorf("inline markup skewed density: plain=%f formatted=%f (want equal)", plainDensity, formattedDensity)
+	}
+}
+
+// TestCountSentenceTerminators pins the sentence-counting helper, including the
+// CJK fullwidth terminators (。！？) that carry the prose signal for CJK text,
+// which has no ASCII commas.
+func TestCountSentenceTerminators(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		text string
+		want int
+	}{
+		{"empty", "", 0},
+		{"no terminators", "plain text without punctuation", 0},
+		{"ascii period", "one. two. three.", 3},
+		{"mixed ascii", "a! b? c.", 3},
+		{"cjk full stop", "第一句。第二句。", 2},
+		{"fullwidth exclaim and question", "真的吗？太好了！", 2},
+		{"ellipsis counts each dot", "wait...", 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := countSentenceTerminators(tc.text); got != tc.want {
+				t.Errorf("countSentenceTerminators(%q) = %d, want %d", tc.text, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCJKProseGetsSentenceBonus verifies the sentence bonus lifts a CJK prose
+// block (which has no ASCII commas) so it scores as content rather than being
+// short-text-penalized like a tag cloud. This is the end-to-end effect of the
+// sentenceCount metric for non-Latin prose.
+func TestCJKProseGetsSentenceBonus(t *testing.T) {
+	t.Parallel()
+
+	doc, err := parseHTML(`<div><p>这是第一段正文内容。这里有几个完整的句子作为统计信号。</p><p>这是第二段正文内容。同样包含句号来体现正文特征。</p><p>第三段也在这里。继续提供句号信号。</p></div>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	score := ScoreContentNode(findScoreElement(doc, "div", ""))
+	if score <= 0 {
+		t.Errorf("CJK prose scored %d, want > 0", score)
+	}
+}
+
 func TestIsNonContentElement(t *testing.T) {
 	t.Parallel()
 
@@ -538,6 +608,70 @@ func TestShouldRemoveElement(t *testing.T) {
 			name: "sidebar child still removed inside content wrapper",
 			html: `<div class="sidebar">nav links</div>`,
 			want: true,
+		},
+		{
+			// Class-based hiding (not the hidden attribute or inline style) marks
+			// visually absent content — consent walls, folded "read more" regions,
+			// SEO filler — that must not leak into extracted text.
+			name: "hidden class token",
+			html: `<div class="hidden">content</div>`,
+			want: true,
+		},
+		{
+			name: "bootstrap d-none class",
+			html: `<div class="d-none">content</div>`,
+			want: true,
+		},
+		{
+			name: "visually-hidden class",
+			html: `<div class="visually-hidden">content</div>`,
+			want: true,
+		},
+		{
+			name: "sr-only class",
+			html: `<div class="sr-only">content</div>`,
+			want: true,
+		},
+		{
+			name: "hidden token within longer class list",
+			html: `<div class="container is-hidden">content</div>`,
+			want: true,
+		},
+		{
+			name: "aria-hidden true",
+			html: `<div aria-hidden="true">content</div>`,
+			want: true,
+		},
+		{
+			name: "aria-hidden false is not hidden",
+			html: `<div aria-hidden="false">content</div>`,
+			want: false,
+		},
+		{
+			// "hidden" inside an unrelated word must not trigger: the token list
+			// is prefix-matched, and no token begins with these bytes except at a
+			// true token start. Guarded so a careless future token ("hid", ...)
+			// cannot silently widen this to a substring match over "schoold..." etc.
+			name: "hidden as part of unrelated word",
+			html: `<div class="not-hiddenize">content</div>`,
+			want: false,
+		},
+		{
+			// Bootstrap 3 responsive visibility: "hidden-sm" means hidden only on
+			// small screens, VISIBLE on larger ones — it must NOT be stripped.
+			name: "responsive hidden-sm is visible elsewhere",
+			html: `<div class="hidden-sm">content</div>`,
+			want: false,
+		},
+		{
+			name: "responsive hidden-md-up is visible elsewhere",
+			html: `<div class="hidden-md-up">content</div>`,
+			want: false,
+		},
+		{
+			name: "responsive hidden-lg-down is visible elsewhere",
+			html: `<div class="hidden-lg-down">content</div>`,
+			want: false,
 		},
 		{
 			// Sitemap blocks are large link directories, never main content.
@@ -1323,6 +1457,9 @@ func TestScoreArticleCandidatesMatchesNaiveLoop(t *testing.T) {
 		{"literal 00a0 text", `<html><body><div class="wrap">` + strings.Repeat("00a0 ", 12) + `</div></body></html>`},
 		{"skip tag subtrees with candidates", `<html><head><title>t</title></head><body><script>x</script><style>x</style><nav>n</nav><svg><text>s</text></svg><math><mi>m</mi></math><aside>a</aside><footer>f</footer><article><p>real, comma, content.</p></article></body></html>`},
 		{"comma rich prose", `<html><body><article><p>one, two, three, four, five, six.</p><p>` + "，" + `fullwidth` + "，" + `test。</p></article></body></html>`},
+		{"sentence dense prose", `<html><body><article><p>First sentence ends here. Second sentence ends here too! A third? Yes.</p><p>Another paragraph of prose with a full stop.</p></article></body></html>`},
+		{"link count metrics", `<html><body><div><a href="/a">A</a><a href="/b">B</a><a href="/c">C</a><p>text</p></div></body></html>`},
+		{"block count inline markup", `<html><body><article><p>text with <span>inline</span> and <em>emphasis</em>.</p></article></body></html>`},
 		{"nested deep", `<html><body><div><div><div><section><p>deep, text.</p></section></div></div></div></body></html>`},
 		{"empty body", `<html><body></body></html>`},
 		{"mixed inline and block", `<html><body><article><h2>Head</h2><p>text with <a href="/l">a link</a> and <em>emphasis</em>.</p><ul><li>one</li><li>two</li></ul></article></body></html>`},

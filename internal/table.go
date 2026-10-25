@@ -9,45 +9,35 @@ import (
 )
 
 // htmlCellAccessor implements table.CellAccessor using the existing helper functions.
+// The nil-node contract (defaults for every method) lives in the delegated
+// helpers themselves — getCellAlign, getColSpan/getRowSpan (via getCellSpan),
+// getCellWidth, and GetTextContent each nil-guard with the same default — so
+// the adapter adds no guard layer of its own; a nil node flows through to the
+// helper that owns the behavior.
 type htmlCellAccessor struct{}
 
 // GetAlignment implements table.CellAccessor.
 func (a *htmlCellAccessor) GetAlignment(node *html.Node) table.CellAlignment {
-	if node == nil {
-		return table.AlignDefault
-	}
 	return getCellAlign(node)
 }
 
 // GetColSpan implements table.CellAccessor.
 func (a *htmlCellAccessor) GetColSpan(node *html.Node) int {
-	if node == nil {
-		return 1
-	}
 	return getColSpan(node)
 }
 
 // GetRowSpan implements table.CellAccessor.
 func (a *htmlCellAccessor) GetRowSpan(node *html.Node) int {
-	if node == nil {
-		return 1
-	}
 	return getRowSpan(node)
 }
 
 // GetWidth implements table.CellAccessor.
 func (a *htmlCellAccessor) GetWidth(node *html.Node) string {
-	if node == nil {
-		return ""
-	}
 	return getCellWidth(node)
 }
 
 // GetTextContent implements table.CellAccessor.
 func (a *htmlCellAccessor) GetTextContent(node *html.Node) string {
-	if node == nil {
-		return ""
-	}
 	return GetTextContent(node)
 }
 

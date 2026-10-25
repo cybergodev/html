@@ -827,3 +827,174 @@ func TestIsBoundaryChar(t *testing.T) {
 		})
 	}
 }
+
+// TestHeadingMarker pins the ATX marker table: h1–h6 map to their '#'-run
+// prefixes and every other tag maps to "" (blockListPrefix falls through to
+// the padding heuristic for those).
+func TestHeadingMarker(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		tag  string
+		want string
+	}{
+		{"h1", "# "},
+		{"h2", "## "},
+		{"h3", "### "},
+		{"h4", "#### "},
+		{"h5", "##### "},
+		{"h6", "###### "},
+		{"p", ""},
+		{"div", ""},
+		{"", ""},
+		{"H1", ""}, // case-sensitive: only lowercase tags come from the parser
+	}
+	for _, tt := range tests {
+		if got := headingMarker(tt.tag); got != tt.want {
+			t.Errorf("headingMarker(%q) = %q, want %q", tt.tag, got, tt.want)
+		}
+	}
+}
+
+// TestBlockListPrefixDispatch pins blockListPrefix's dispatch order: <li> and
+// <dd> markers, heading markers, and the padding-left fallback, plus the
+// nil/non-element guards.
+func TestBlockListPrefixDispatch(t *testing.T) {
+	t.Parallel()
+
+	if got := blockListPrefix(nil); got != "" {
+		t.Errorf("blockListPrefix(nil) = %q, want %q", got, "")
+	}
+	text := &html.Node{Type: html.TextNode, Data: "li"}
+	if got := blockListPrefix(text); got != "" {
+		t.Errorf("blockListPrefix(text node) = %q, want %q", got, "")
+	}
+
+	doc, err := html.Parse(strings.NewReader(`<body>
+<ol><li class="second">two</li><li class="first">one</li></ol>
+<ul><li class="uitem">bullet</li></ul>
+<dl><dd class="def">definition</dd></dl>
+<h2 class="head">Head</h2>
+<div class="padded" style="padding-left:24pt">indented</div>
+<div class="plain">plain</div>
+</body>`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	cases := []struct {
+		class string
+		want  string
+	}{
+		{"second", "1. "},  // document-first <li> of the <ol>
+		{"first", "2. "},   // ordinal counts preceding <li> siblings
+		{"uitem", "- "},    // <ul> marker
+		{"def", ": "},      // <dd> definition marker
+		{"head", "## "},    // heading marker
+		{"padded", "  - "}, // padding-left 24pt → level-1 heuristic (getListPrefix)
+		{"plain", ""},      // no prefix applies
+	}
+	for _, tt := range cases {
+		var node *html.Node
+		WalkNodes(doc, func(n *html.Node) bool {
+			if node != nil {
+				return false
+			}
+			if n.Type == html.ElementNode {
+				for _, attr := range n.Attr {
+					if attr.Key == "class" && attr.Val == tt.class {
+						node = n
+						return false
+					}
+				}
+			}
+			return true
+		})
+		if node == nil {
+			t.Fatalf("no element with class %q", tt.class)
+		}
+		if got := blockListPrefix(node); got != tt.want {
+			t.Errorf("blockListPrefix(%s) = %q, want %q", tt.class, got, tt.want)
+		}
+	}
+}
+
+// TestDefinitionPrefixNesting pins the <dd> marker's two-spaces-per-<dl>
+// indentation.
+func TestDefinitionPrefixNesting(t *testing.T) {
+	t.Parallel()
+
+	doc, err := html.Parse(strings.NewReader(`<body><dl><dl><dd class="deep">inner</dd></dl><dd class="shallow">outer</dd></dl><p class="notdd">x</p></body>`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	find := func(class string) *html.Node {
+		var node *html.Node
+		WalkNodes(doc, func(n *html.Node) bool {
+			if node != nil {
+				return false
+			}
+			if n.Type == html.ElementNode {
+				for _, attr := range n.Attr {
+					if attr.Key == "class" && attr.Val == class {
+						node = n
+						return false
+					}
+				}
+			}
+			return true
+		})
+		return node
+	}
+	if got := definitionPrefix(find("shallow")); got != ": " {
+		t.Errorf("definitionPrefix(one dl) = %q, want %q", got, ": ")
+	}
+	if got := definitionPrefix(find("deep")); got != "  : " {
+		t.Errorf("definitionPrefix(nested dl) = %q, want %q", got, "  : ")
+	}
+	if got := definitionPrefix(find("notdd")); got != "" {
+		t.Errorf("definitionPrefix(non-dd) = %q, want %q", got, "")
+	}
+	if got := definitionPrefix(nil); got != "" {
+		t.Errorf("definitionPrefix(nil) = %q, want %q", got, "")
+	}
+}
+
+// TestImgHasValidSrc pins the placeholder-lockstep guard: only an <img> whose
+// src passes IsValidURL counts, mirroring parseImageNode's acceptance.
+func TestImgHasValidSrc(t *testing.T) {
+	t.Parallel()
+
+	if imgHasValidSrc(nil) {
+		t.Error("imgHasValidSrc(nil) = true, want false")
+	}
+
+	doc, err := html.Parse(strings.NewReader(`<body><img class="none" alt="a"><img class="empty" src=""><img class="frag" src="#anchor"><img class="ok" src="/pic.png"></body>`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := map[string]bool{"none": false, "empty": false, "frag": false, "ok": true}
+	for class, wantVal := range want {
+		var node *html.Node
+		WalkNodes(doc, func(n *html.Node) bool {
+			if node != nil {
+				return false
+			}
+			if n.Type == html.ElementNode && n.Data == "img" {
+				for _, attr := range n.Attr {
+					if attr.Key == "class" && attr.Val == class {
+						node = n
+						return false
+					}
+				}
+			}
+			return true
+		})
+		if node == nil {
+			t.Fatalf("no <img class=%q>", class)
+		}
+		if got := imgHasValidSrc(node); got != wantVal {
+			t.Errorf("imgHasValidSrc(%s) = %v, want %v", class, got, wantVal)
+		}
+	}
+}

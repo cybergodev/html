@@ -30,21 +30,45 @@ func ExtractTextWithStructureAndImages(node *html.Node, tb *table.TrackedBuilder
 	if node == nil {
 		return
 	}
-	if node.Type == html.ElementNode && IsNonContentElement(node.Data) {
+	if isSkipElement(node) {
 		return
 	}
 
-	extractTextWithStructure(node, tb, imageCounter, linkCounter, tableFormat, nil, 0)
+	extractTextWithStructure(node, tb, imageCounter, linkCounter, tableFormat, nil, 0, false)
 }
 
-func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCounter *int, linkCounter *int, tableFormat string, parentBlock *html.Node, depth int) {
+func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCounter *int, linkCounter *int, tableFormat string, parentBlock *html.Node, depth int, inPre bool) {
 	if node == nil {
 		return
 	}
-	if node.Type == html.ElementNode && IsNonContentElement(node.Data) {
+	if isSkipElement(node) {
 		return
 	}
 	if node.Type == html.TextNode {
+		if inPre {
+			// Inside <pre> (and its <code> subtree) newlines and internal
+			// whitespace are structural — code blocks and ASCII diagrams. Write
+			// the text verbatim so line breaks survive; only NBSP is folded to a
+			// regular space (a raw U+00A0 would be visually misleading in code).
+			// CleanTextBytes later keeps the line structure while trimming each
+			// line's trailing spaces.
+			if data := strings.ReplaceAll(node.Data, nbspString, " "); data != "" {
+				_, _ = tb.WriteString(data)
+			}
+			return
+		}
+		// A whitespace-only text node (the newlines and indentation between
+		// pretty-printed tags) contributes nothing downstream: normalization
+		// maps it to ASCII spaces, which the TrimSpace below reduces to "", so
+		// neither branch writes anything. TrimSpace treats NBSP (U+00A0) as
+		// whitespace, matching every byte the normalizer could produce from
+		// such input, so checking it first is behavior-identical and skips
+		// normalizeText's pooled-buffer pass plus its fresh string per node —
+		// on pretty-printed pages that is one allocation per inter-tag gap.
+		if strings.TrimSpace(node.Data) == "" {
+			return
+		}
+
 		// Single-pass text normalization: handles NBSP, entities, and line breaks
 		textData := normalizeText(node.Data)
 
@@ -123,7 +147,7 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 			return
 		}
 		if node.Data == "table" {
-			if containsNestedTable(node) {
+			if isLayoutTable(node) {
 				// Layout table: this <table> wraps other <table> elements in its
 				// cells purely for visual layout (common on financial sites such
 				// as Finviz, where the whole page is nested layout tables).
@@ -213,8 +237,9 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 			}
 		}
 
+		childInPre := inPre || node.Data == "pre"
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, node, depth+1)
+			extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, node, depth+1, childInPre)
 		}
 		// Add closing link tag after processing children
 		if node.Data == "a" && linkCounter != nil {
@@ -235,7 +260,7 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 		}
 	} else {
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, parentBlock, depth+1)
+			extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, parentBlock, depth+1, inPre)
 		}
 	}
 }
@@ -266,6 +291,59 @@ func containsNestedTable(tableNode *html.Node) bool {
 		return true
 	})
 	return found
+}
+
+// isLayoutTable reports whether tableNode should be treated as a visual-layout
+// shell rather than a data table.
+//
+// Two independent signals:
+//
+//   - an explicit ARIA role of presentation/none declares the table structure
+//     presentational (screen readers skip it), which is the strongest signal a
+//     page can give — it applies with or without nested tables;
+//   - a nested <table> AND no meaningful direct text of its own (outside the
+//     nested tables): a cell that carries its own prose next to an embedded
+//     table is a genuine data table and must still render.
+//
+// Legacy presentational attributes (border="0", cellpadding, cellspacing) are
+// deliberately NOT signals: borderless styling is the modern default for real
+// data tables, so those attributes cannot distinguish layout from data.
+func isLayoutTable(tableNode *html.Node) bool {
+	if hasPresentationalRole(tableNode) {
+		return true
+	}
+	if !containsNestedTable(tableNode) {
+		return false
+	}
+	// Collect the direct text of tableNode that lies OUTSIDE any nested <table>
+	// subtree. If there is a non-trivial amount, the outer table is data.
+	var directText int
+	WalkNodes(tableNode, func(n *html.Node) bool {
+		if n != tableNode && n.Type == html.ElementNode && n.Data == "table" {
+			return false // skip nested table subtrees
+		}
+		if n.Type == html.TextNode {
+			directText += len(strings.TrimSpace(n.Data))
+		}
+		return true
+	})
+	return directText < layoutTableDirectTextThreshold
+}
+
+// hasPresentationalRole reports whether node carries role="presentation" or
+// role="none" (case-insensitive), the ARIA declaration that an element's
+// structure is purely visual.
+func hasPresentationalRole(node *html.Node) bool {
+	for _, attr := range node.Attr {
+		if attr.Key != "role" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(attr.Val)) {
+		case "presentation", "none":
+			return true
+		}
+	}
+	return false
 }
 
 // CleanContentNode removes non-content elements from the node tree.

@@ -18,6 +18,8 @@
 |------|------|
 | 🚀 **一行代码提取** | 单个函数调用即可从 HTML 提取纯净文本 |
 | 🔍 **智能文章检测** | 使用评分算法识别主要内容 |
+| 📋 **元数据提取** | 作者、发布时间、描述、站点名、规范链接 |
+| 🎚️ **提取置信度** | 每次提取附带质量信号(文章 / 列表页 / 回退 / 付费墙检测) |
 | 🌐 **自动编码检测** | 支持 UTF-8、Windows-1252、GBK、Shift_JIS 等 |
 | 🔄 **批量处理** | 支持 Worker Pool 和 Context 的并行提取 |
 | 📦 **多种输出格式** | 文本、Markdown、JSON |
@@ -717,6 +719,7 @@ go run ./examples/01_quick_start/
 | [09_context_cancellation](examples/09_context_cancellation) | 上下文取消与超时 |
 | [10_secure_file_processing](examples/10_secure_file_processing) | AllowedBaseDir 沙箱与安全文件读取 |
 | [11_encoding](examples/11_encoding) | 字符编码检测与覆盖 |
+| [12_metadata_quality](examples/12_metadata_quality) | 结构化元数据(JSON-LD/OpenGraph)与提取置信度 |
 
 ---
 

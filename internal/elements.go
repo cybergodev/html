@@ -33,6 +33,30 @@ func IsKnownInlineNamespacePrefix(prefix string) bool {
 
 // IsBlockElement returns true if the tag is a known block-level element.
 // Block elements add newlines and paragraph spacing.
+//
+// isBlockElementForScoring reports whether a tag is a block-level element that
+// should count toward a candidate's blockCount. It is deliberately narrower than
+// IsBlockElement: table-cell wrappers (td/th/tr) and structural shells
+// (body/html/head) contribute no block worth dividing text by, and counting them
+// skewed the density denominator on table-heavy and deeply-nested pages.
+//
+// (The doc comment that used to sit here described IsBlockElement but was
+// physically attached to this function; it has moved to IsBlockElement below.)
+func isBlockElementForScoring(tag string) bool {
+	switch tag {
+	case "p", "div", "pre", "blockquote",
+		"h1", "h2", "h3", "h4", "h5", "h6",
+		"article", "section", "main",
+		"ul", "ol", "li", "dl", "dt", "dd",
+		"figure", "figcaption", "address", "form", "fieldset",
+		"details", "summary", "center", "canvas":
+		return true
+	}
+	return false
+}
+
+// IsBlockElement reports whether the tag is a known block-level element.
+// Block elements add newlines and paragraph spacing.
 func IsBlockElement(tag string) bool {
 	switch tag {
 	// Text containers; headings; semantic HTML5 sections; lists; tables; forms;
@@ -95,12 +119,124 @@ func IsInlineElement(tag string) bool {
 // WebForms, JSF, JSP) wrap the entire page body in a single <form>; marking it
 // non-content would cause ShouldRemove/CleanContentNode and the text extractor
 // to drop the whole page body.
+//
+// The header/footer/aside entries here are the *categorical* classification:
+// they are page chrome by default. Whether a specific <header>/<footer>/<aside>
+// node is actually dropped is decided by isSkipElement, which keeps them when
+// they nest inside a primary-content container (<article>/<main>) where they
+// are article furniture (byline, author footer, pull-quote) rather than chrome.
 func IsNonContentElement(tag string) bool {
 	switch tag {
 	case "script", "style", "noscript", "nav", "aside", "footer", "header":
 		return true
 	}
 	return false
+}
+
+// hardNonContent reports whether tag is categorically non-content and must be
+// skipped on every extraction/scoring walk regardless of position: raw-text and
+// embedding elements plus <nav>. <nav> stays hard even though it can nest inside
+// an <article>: menus there are still navigation, not prose.
+func hardNonContent(tag string) bool {
+	switch tag {
+	case "script", "style", "noscript", "nav":
+		return true
+	}
+	return false
+}
+
+// isSoftLandmark reports whether tag is a semantic landmark whose content may be
+// article furniture (byline <header>, author <footer>, pull-quote <aside>) when
+// it sits inside a primary-content container, but is page chrome when it does not.
+func isSoftLandmark(tag string) bool {
+	switch tag {
+	case "header", "footer", "aside":
+		return true
+	}
+	return false
+}
+
+// primaryContentClassTokens are the positive class/id tokens that mark a
+// non-semantic element as a CMS content wrapper in the spirit of <article>.
+// They are deliberately narrower than the scorer's full positive set: "content",
+// "text", "page", and "blog"/"news"/"detail" are excluded because they also name
+// page-level chrome ("page-header", "main-content-wrapper" around a whole layout,
+// "blog-nav"), where treating the wrapper as primary content would wrongly keep
+// a page-level <footer>/<header>. The tokens kept here are the ones that almost
+// always name the article body itself: "article", "post", "story", "entry",
+// "body", "main".
+var primaryContentClassTokens = [...]string{
+	"article", "post", "story", "entry", "body", "main",
+}
+
+// hasPrimaryContentClassToken reports whether node's class or id attribute
+// contains any primaryContentClassToken as a word-bounded match. It backs the
+// div-based extension of insidePrimaryContent.
+func hasPrimaryContentClassToken(node *html.Node) bool {
+	if node == nil || node.Type != html.ElementNode {
+		return false
+	}
+	for _, attr := range node.Attr {
+		if attr.Key != "class" && attr.Key != "id" {
+			continue
+		}
+		lowerVal := strings.ToLower(attr.Val)
+		for _, token := range primaryContentClassTokens {
+			if hasWordBoundary(lowerVal, token, boundaryStandard) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isPositiveContentContainer reports whether node is a non-semantic element
+// whose class/id carries a primary-content token. It is the div-based analogue
+// of isPrimaryContentContainer: semantic tags and ARIA roles are checked there;
+// class tokens are checked here so insidePrimaryContent can stop at the right
+// wrapper.
+func isPositiveContentContainer(node *html.Node) bool {
+	return hasPrimaryContentClassToken(node)
+}
+
+// insidePrimaryContent reports whether node is nested inside a primary-content
+// container: a semantic <article>/<main> (or role=main/article), or a
+// non-semantic element whose class/id carries a primary-content token
+// (article/post/story/entry/body/main). The walk stops at the first
+// hard-non-content or soft-landmark ancestor, so a <footer> inside a page-level
+// <header> is not mistaken for article furniture, and a positive-token wrapper
+// that lies inside a page-level landmark is not reached.
+func insidePrimaryContent(node *html.Node) bool {
+	for p := node.Parent; p != nil; p = p.Parent {
+		if p.Type != html.ElementNode {
+			continue
+		}
+		if hardNonContent(p.Data) || isSoftLandmark(p.Data) {
+			return false
+		}
+		if isPrimaryContentContainer(p) || isPositiveContentContainer(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSkipElement reports whether extraction and scoring must skip node entirely:
+// it is hard non-content, or a soft landmark (header/footer/aside) that lies
+// outside a primary-content container. This is the single contextual skip
+// predicate shared by the text extraction, the scoring metric fold, and
+// ShouldRemove, so a landmark inside <article> is preserved consistently by
+// every pass. Previously IsNonContentElement dropped header/footer/aside
+// unconditionally, silently discarding bylines, author footers, and pull-quotes
+// inside real articles.
+func isSkipElement(node *html.Node) bool {
+	if node == nil || node.Type != html.ElementNode {
+		return false
+	}
+	if hardNonContent(node.Data) {
+		return true
+	}
+	return isSoftLandmark(node.Data) && !insidePrimaryContent(node)
 }
 
 // IsParagraphLevelBlockElement returns true if the element is a block element that should
@@ -192,7 +328,9 @@ func ShouldTreatNamespaceTagAsInline(node *html.Node) bool {
 				textNodeCount++
 				textLength += len(text)
 			}
-			// Count newlines in original text (before trimming)
+			// Count newlines in original text (before trimming). Deliberately
+			// OUTSIDE the text != "" guard — see the matching loop in
+			// ShouldTreatAsBlockElement for the intentional asymmetry.
 			newlineCount += strings.Count(child.Data, "\n")
 		}
 	}
@@ -272,7 +410,12 @@ func ShouldTreatAsBlockElement(node *html.Node) bool {
 			if text != "" {
 				hasTextContent = true
 				textLength += len(text)
-				// Count newlines in original text (before trimming)
+				// Count newlines in original text (before trimming). Deliberately
+				// INSIDE the text != "" guard, unlike
+				// ShouldTreatNamespaceTagAsInline's loop: a block decision should
+				// not hinge on line breaks that live only in whitespace-only text
+				// nodes, while an inline decision treats any newline as
+				// multi-line content.
 				newlineCount += strings.Count(child.Data, "\n")
 			}
 		}

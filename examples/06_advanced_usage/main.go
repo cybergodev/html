@@ -10,7 +10,8 @@ import (
 	"github.com/cybergodev/html"
 )
 
-// This example demonstrates advanced features: custom scorers, audit logging, and security configuration.
+// This example demonstrates advanced features: custom scorers, single-pass
+// article finding, audit logging, and security configuration.
 func main() {
 	fmt.Println("=== Advanced Features ===")
 	fmt.Println()
@@ -41,9 +42,39 @@ func main() {
 	fmt.Printf("Content length: %d chars\n\n", len(result.Text))
 
 	// ============================================================
-	// 2. Audit System (Security Logging)
+	// 2. Single-Pass Article Finding (ArticleFinder)
 	// ============================================================
-	fmt.Println("2. Audit System (Security Logging)")
+	fmt.Println("2. Single-Pass Article Finding (ArticleFinder)")
+	fmt.Println("----------------------------------------------")
+
+	// A Scorer may additionally implement html.ArticleFinder to take over
+	// article-node selection with its own search, bypassing the per-node
+	// Score enumeration entirely — the fix for the O(elements × Score-cost)
+	// blowup a subtree-walking Score would cause on large pages. Returning
+	// nil falls back to extracting the whole <body>.
+	finderCfg := html.DefaultConfig()
+	finderCfg.Scorer = roleMainScorer{}
+	finderProcessor, err := html.New(finderCfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = finderProcessor.Close() }()
+
+	finderHTML := `<html><body>
+		<div id="promo"><p>Promo block the finder never selects.</p></div>
+		<div role="main"><h2>Main Region</h2><p>The finder picked this node in a single pass.</p></div>
+	</body></html>`
+
+	finderResult, err := finderProcessor.Extract([]byte(finderHTML))
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Picked text: %s\n\n", finderResult.Text)
+
+	// ============================================================
+	// 3. Audit System (Security Logging)
+	// ============================================================
+	fmt.Println("3. Audit System (Security Logging)")
 	fmt.Println("-----------------------------------")
 
 	// Configure processor with audit (entries stored internally).
@@ -81,9 +112,9 @@ func main() {
 	}
 
 	// ============================================================
-	// 3. Audit Sinks (Output Destinations)
+	// 4. Audit Sinks (Output Destinations)
 	// ============================================================
-	fmt.Println("\n3. Audit Sinks (Custom Output)")
+	fmt.Println("\n4. Audit Sinks (Custom Output)")
 	fmt.Println("------------------------------")
 
 	// Demo: WriterAuditSink writing to a buffer
@@ -155,9 +186,9 @@ drain:
 	fmt.Println("Or use GetAuditLog() to read entries from internal storage.")
 
 	// ============================================================
-	// 4. Security Configuration
+	// 5. Security Configuration
 	// ============================================================
-	fmt.Println("\n4. Security Configuration")
+	fmt.Println("\n5. Security Configuration")
 	fmt.Println("-------------------------")
 
 	// High security config
@@ -185,9 +216,9 @@ drain:
 	fmt.Printf("  Audit events captured (audit enabled by default): %d\n", len(secureProcessor.GetAuditLog()))
 
 	// ============================================================
-	// 5. File Processing Patterns
+	// 6. File Processing Patterns
 	// ============================================================
-	fmt.Println("\n5. File Processing Patterns")
+	fmt.Println("\n6. File Processing Patterns")
 	fmt.Println("----------------------------")
 
 	fmt.Println("Single file:")
@@ -202,9 +233,9 @@ drain:
 	fmt.Println("  result := processor.ExtractBatchFilesWithContext(ctx, paths)")
 
 	// ============================================================
-	// 6. Extractor Interface (Decoupling & Testability)
+	// 7. Extractor Interface (Decoupling & Testability)
 	// ============================================================
-	fmt.Println("\n6. Extractor Interface")
+	fmt.Println("\n7. Extractor Interface")
 	fmt.Println("---------------------")
 
 	// html.Extractor bundles every extraction method; *Processor implements
@@ -225,9 +256,9 @@ drain:
 	fmt.Println("Related: html.StatsProvider (GetStatistics, ClearCache, ResetStatistics)")
 
 	// ============================================================
-	// 7. Types for Custom Scorers
+	// 8. Types for Custom Scorers
 	// ============================================================
-	fmt.Println("\n7. Types for Custom Scorers")
+	fmt.Println("\n8. Types for Custom Scorers")
 	fmt.Println("---------------------------")
 	fmt.Println("The package provides types for implementing custom Scorers:")
 	fmt.Println("  • html.ContentNode - Interface for node access (Type, Data, AttrValue, etc.)")
@@ -240,12 +271,45 @@ drain:
 	// ============================================================
 	fmt.Println("\n=== Advanced Features Summary ===")
 	fmt.Println("1. Custom Scorers: Implement html.Scorer interface for domain-specific extraction")
-	fmt.Println("2. Audit System: Monitor security events and blocked content")
-	fmt.Println("3. Audit Sinks: Multiple output destinations for audit logs")
-	fmt.Println("4. Security Configs: Use HighSecurityConfig() for sensitive data processing")
-	fmt.Println("5. File Operations: Single file, batch, and context-aware processing")
-	fmt.Println("6. Extractor Interface: Depend on html.Extractor, test with stubs")
-	fmt.Println("7. Types for Scorers: ContentNode and NodeAttr for custom implementations")
+	fmt.Println("2. ArticleFinder: Optional single-pass article-node selection on a Scorer")
+	fmt.Println("3. Audit System: Monitor security events and blocked content")
+	fmt.Println("4. Audit Sinks: Multiple output destinations for audit logs")
+	fmt.Println("5. Security Configs: Use HighSecurityConfig() for sensitive data processing")
+	fmt.Println("6. File Operations: Single file, batch, and context-aware processing")
+	fmt.Println("7. Extractor Interface: Depend on html.Extractor, test with stubs")
+	fmt.Println("8. Types for Scorers: ContentNode and NodeAttr for custom implementations")
+}
+
+// roleMainScorer implements html.Scorer and, additionally, html.ArticleFinder:
+// article selection becomes a single pass looking for role="main", and the
+// Score/ShouldRemove methods below are never consulted. Returning nil from
+// FindArticleNode would fall back to extracting the whole <body>.
+type roleMainScorer struct{}
+
+// Score satisfies html.Scorer; unused when FindArticleNode is implemented.
+func (roleMainScorer) Score(html.ContentNode) int { return 0 }
+
+// ShouldRemove satisfies html.Scorer; unused when FindArticleNode is implemented.
+func (roleMainScorer) ShouldRemove(html.ContentNode) bool { return false }
+
+// FindArticleNode returns the first element carrying role="main".
+func (roleMainScorer) FindArticleNode(root html.ContentNode) html.ContentNode {
+	var found html.ContentNode
+	var walk func(html.ContentNode)
+	walk = func(n html.ContentNode) {
+		if n == nil || found != nil {
+			return
+		}
+		if n.Type() == "element" && n.AttrValue("role") == "main" {
+			found = n
+			return
+		}
+		for c := n.FirstChild(); c != nil; c = c.NextSibling() {
+			walk(c)
+		}
+	}
+	walk(root)
+	return found
 }
 
 // ArticleScorer is a custom scorer that prioritizes article content.

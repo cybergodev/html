@@ -345,7 +345,7 @@ func CleanTextBytes(text []byte) string {
 					needsCompress := false
 					if anyCompressible {
 						prevSp := false
-						for j := 0; j < contentLen; j++ {
+						for j := range contentLen {
 							c := contentPart[j]
 							if c == '\t' {
 								needsCompress = true
@@ -482,12 +482,20 @@ func WalkNodes(node *html.Node, fn func(*html.Node) bool) {
 // FindElementByTag returns the first element node with the given tag name found
 // in a pre-order traversal of doc, or nil if none exists.
 //
-// Every caller looks for a document-level landmark — <body> (extractArticleNode's
-// fallback) or <base> (link base-URL detection). The walk stops at the first
-// match and is bounded by the parse that produced the tree.
+// Callers look for document-level landmarks — <body> (extractArticleNode's
+// fallback) or <base> (link base-URL detection) — and the article-title
+// fallback looks for the first <h1> inside the selected article node, where
+// several may exist. The walk stops descending once a match is found: fn
+// returning false prunes the subtree, and the result!=nil guard prunes every
+// later branch, so no later match can overwrite the first (the previous
+// implementation overwrote result on every match and returned the LAST
+// occurrence — invisible while every caller searched for page-unique tags).
 func FindElementByTag(doc *html.Node, tagName string) *html.Node {
 	var result *html.Node
 	WalkNodes(doc, func(n *html.Node) bool {
+		if result != nil {
+			return false
+		}
 		if n.Type == html.ElementNode && n.Data == tagName {
 			result = n
 			return false
@@ -505,7 +513,7 @@ func GetTextContent(node *html.Node) string {
 	}
 
 	// Fast path: an element whose only child is a single text node that needs no
-	// normalization (no newline, '&', or NBSP) yields just the trimmed text — no
+	// normalization (no newline or NBSP) yields just the trimmed text — no
 	// tree walk, pooled buffer, or closure. GetTextContent is the hottest
 	// allocator in extraction (invoked once per <a>, table cell, and title
 	// candidate), and the common <a>link</a> / <td>cell</td> shape hits this path,
@@ -628,6 +636,127 @@ func GetTextContent(node *html.Node) string {
 	return string(*bp)
 }
 
+// TextContentLength returns the byte length GetTextContent(node) would
+// produce, without materializing the concatenated string. Callers that only
+// compare text lengths (article-vs-parent dominance, listing dominance, the
+// confidence body ratio) previously allocated a whole-subtree string per call
+// via GetTextContent and used nothing but its len(); this twin computes the
+// same length with zero allocations.
+//
+// Equivalence contract: for every node, TextContentLength(n) ==
+// len(GetTextContent(n)). The traversal mirrors GetTextContent's general path
+// exactly — same subtree skips, same edge trims, same inter-node space rules —
+// with the buffer replaced by a running total and each text node's normalized
+// length computed by scan (normalizedLength) instead of by building the
+// normalized string. TestTextContentLengthMatchesGetTextContent pins the two
+// together; any behavior change to GetTextContent must be mirrored here.
+func TextContentLength(node *html.Node) int {
+	if node == nil {
+		return 0
+	}
+
+	// Fast path: mirror GetTextContent's single-text-child fast path.
+	if node.Type == html.ElementNode {
+		if c := node.FirstChild; c != nil && c.NextSibling == nil && c.Type == html.TextNode {
+			if data := c.Data; !textNeedsNormalization(data) {
+				return len(trimASCIISpaceAndNBSP(data))
+			}
+		}
+	}
+
+	total := 0
+	prevEndedWithSpace := false
+
+	WalkNodes(node, func(n *html.Node) bool {
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "script", "style", "noscript":
+				return false
+			}
+		}
+		if n.Type == html.TextNode {
+			data := n.Data
+			dataLen := len(data)
+			if dataLen == 0 {
+				return true
+			}
+
+			start := 0
+			for start < dataLen {
+				c := data[start]
+				if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+					start++
+				} else if c == 0xC2 && start+1 < dataLen && data[start+1] == 0xA0 {
+					start += 2
+				} else {
+					break
+				}
+			}
+			if start >= dataLen {
+				prevEndedWithSpace = true
+				return true
+			}
+			end := dataLen - 1
+			for end > start {
+				c := data[end]
+				if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+					end--
+				} else if c == 0xA0 && end > start && data[end-1] == 0xC2 {
+					end -= 2
+				} else {
+					break
+				}
+			}
+
+			startedWithSpace := start > 0
+			endedWithSpace := end < dataLen-1
+
+			// trimmed is nonempty and starts/ends with non-whitespace bytes
+			// (the loops above stopped there), so its normalized form is never
+			// empty — mirroring GetTextContent's `if text != ""` guard, which
+			// is therefore always true here, kept as a defensive mirror.
+			textLen := normalizedLength(data[start : end+1])
+			if textLen > 0 {
+				needsSpace := prevEndedWithSpace
+				if !needsSpace && total > 0 {
+					needsSpace = startedWithSpace
+				}
+				if total > 0 && needsSpace {
+					total++
+				}
+				total += textLen
+			}
+			prevEndedWithSpace = endedWithSpace
+		}
+		return true
+	})
+	return total
+}
+
+// normalizedLength returns len(normalizeText(s)) computed by byte scan:
+// normalizeText maps '\n' to ' ' (1→1), drops '\r' (1→0), and folds the NBSP
+// pair (2→1); every other byte passes through unchanged. textNeedsNormalization
+// tests exactly these triggers, so for trigger-free input this equals len(s).
+func normalizedLength(s string) int {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\r':
+			// dropped by normalizeText
+		case 0xC2:
+			if i+1 < len(s) && s[i+1] == 0xA0 {
+				n++ // NBSP pair folds to one space
+				i++
+			} else {
+				n++
+			}
+		default:
+			n++
+		}
+	}
+	return n
+}
+
 // IsValidURL checks if a URL is valid and safe for processing.
 // This is a centralized URL validation function with size limits for security.
 func IsValidURL(url string) bool {
@@ -687,7 +816,7 @@ func IsValidURL(url string) bool {
 	}
 
 	// Validate non-data URLs: check for dangerous characters
-	for i := 0; i < urlLen; i++ {
+	for i := range urlLen {
 		b := url[i]
 		if b < 32 || b == 127 || b == '<' || b == '>' || b == '"' || b == '\'' {
 			return false
@@ -931,8 +1060,12 @@ func definitionPrefix(node *html.Node) string {
 
 // blockListPrefix returns the Markdown prefix (marker + indentation) to emit
 // before a block element's content. <li> nodes use DOM-based list markers,
-// <dd> nodes use the definition marker; other indented blocks fall back to
-// the padding-left heuristic. Returns "" when no prefix applies.
+// <dd> nodes use the definition marker, h1–h6 use their ATX heading marker
+// (headings are structural content: without the marker, heading levels
+// silently collapse into plain paragraphs in the structured text output,
+// which already carries Markdown list markers and table syntax); other
+// indented blocks fall back to the padding-left heuristic. Returns "" when
+// no prefix applies.
 func blockListPrefix(node *html.Node) string {
 	if node == nil || node.Type != html.ElementNode {
 		return ""
@@ -943,9 +1076,32 @@ func blockListPrefix(node *html.Node) string {
 	case "dd":
 		return definitionPrefix(node)
 	}
+	if marker := headingMarker(node.Data); marker != "" {
+		return marker
+	}
 	paddingLeft := extractPaddingLeft(node)
 	if paddingLeft > 0 {
 		return getListPrefix(paddingLeft)
+	}
+	return ""
+}
+
+// headingMarker returns the Markdown ATX prefix for a heading tag
+// ("# " for h1 through "###### " for h6), or "" for other tags.
+func headingMarker(tag string) string {
+	switch tag {
+	case "h1":
+		return "# "
+	case "h2":
+		return "## "
+	case "h3":
+		return "### "
+	case "h4":
+		return "#### "
+	case "h5":
+		return "##### "
+	case "h6":
+		return "###### "
 	}
 	return ""
 }

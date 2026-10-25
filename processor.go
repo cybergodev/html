@@ -50,7 +50,32 @@ type Scorer interface {
 	// Higher scores indicate more likely main content.
 	Score(node ContentNode) int
 	// ShouldRemove determines if a node should be removed from the content tree.
+	//
+	// LIMITATION: in the current implementation this method is consulted only
+	// when the built-in DefaultScorer is in use. When a custom Scorer is
+	// configured, Score (and the optional ArticleFinder hook) drive article
+	// selection, but the node-removal pass during content cleaning still
+	// applies the built-in scorer's removal rules — a custom ShouldRemove does
+	// not influence which nodes are stripped (see examples/06_advanced_usage).
 	ShouldRemove(node ContentNode) bool
+}
+
+// ArticleFinder is an optional interface a Scorer can implement to take over
+// article-node selection with its own search. Without it, every non-inline
+// element of the document is enumerated and scored via Score — safe, but
+// O(elements × Score-cost), which is quadratic for scorers that re-walk
+// subtrees (see the complexity contract on Scorer). A single-pass
+// implementation walks the tree once and returns its pick directly.
+//
+// FindArticleNode receives the document root and returns the article-root
+// element, or nil when no element qualifies (the caller then falls back to
+// <body>, matching the built-in scorer's semantics). The returned node must
+// be one reached from root through the ContentNode traversal methods; the
+// adapter values this library passes are copyable and comparable, so they
+// can be cached and returned as-is. A node of any other implementation is
+// ignored and the default enumeration runs instead.
+type ArticleFinder interface {
+	FindArticleNode(root ContentNode) ContentNode
 }
 
 // scorerAdapter adapts the public Scorer interface to the internal Scorer interface.

@@ -31,7 +31,7 @@ func ExampleExtract() {
 	fmt.Printf("%q\n", result.Text)
 	// Output:
 	// Go 1.26 released
-	// "Go 1.26 released\n\nThe new release is available now."
+	// "# Go 1.26 released\n\nThe new release is available now."
 }
 
 // ExampleExtractText demonstrates the one-liner plain-text API. Navigation,
@@ -49,7 +49,7 @@ func ExampleExtractText() {
 	}
 	fmt.Printf("%q\n", text)
 	// Output:
-	// "Hello World\n\nContent here..."
+	// "# Hello World\n\nContent here..."
 }
 
 // ExampleNew demonstrates configuring a Processor via DefaultConfig for

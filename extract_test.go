@@ -3,7 +3,10 @@ package html
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+
+	"golang.org/x/net/html"
 )
 
 // TestContainsASCIIFold pins the boundary behavior of the unexported
@@ -224,4 +227,144 @@ func TestProcessorNilGuardMethods(t *testing.T) {
 	p.ClearAuditLog()   // must not panic
 	p.ClearCache()      // must not panic
 	p.ResetStatistics() // must not panic
+}
+
+// findElementByClass walks root depth-first and returns the first element
+// node whose class attribute equals class.
+func findElementByClass(root *html.Node, class string) *html.Node {
+	var found *html.Node
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if found != nil || n == nil {
+			return
+		}
+		if n.Type == html.ElementNode {
+			for _, attr := range n.Attr {
+				if attr.Key == "class" && attr.Val == class {
+					found = n
+					return
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(root)
+	return found
+}
+
+// TestExpandToArticleClusterGuards drives the cluster-widening guard chain
+// (extract.go) directly on parsed nodes. The end-to-end behavior is pinned by
+// article_test.go; this unit test reaches every individual guard branch so a
+// future edit cannot silently disable one of them.
+func TestExpandToArticleClusterGuards(t *testing.T) {
+	t.Parallel()
+
+	p, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	parse := func(t *testing.T, markup string) *html.Node {
+		t.Helper()
+		doc, err := html.Parse(strings.NewReader(markup))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return doc
+	}
+
+	t.Run("nil node returns nil", func(t *testing.T) {
+		if got := p.expandToArticleCluster(nil); got != nil {
+			t.Errorf("expandToArticleCluster(nil) = %v, want nil", got)
+		}
+	})
+
+	t.Run("role=article container returned unchanged", func(t *testing.T) {
+		doc := parse(t, `<body><div role="article" class="best"><p>text</p></div></body>`)
+		best := findElementByClass(doc, "best")
+		if got := p.expandToArticleCluster(best); got != best {
+			t.Error("role=article node was widened although it already delimits the article")
+		}
+	})
+
+	t.Run("body-level parent not widened", func(t *testing.T) {
+		doc := parse(t, `<body><div class="best"><p>`+strings.Repeat("word ", 30)+`</p></div></body>`)
+		best := findElementByClass(doc, "best")
+		if got := p.expandToArticleCluster(best); got != best {
+			t.Error("node directly under <body> was widened")
+		}
+	})
+
+	t.Run("chrome parent not widened", func(t *testing.T) {
+		doc := parse(t, `<body><nav><div class="best"><p>`+strings.Repeat("word ", 30)+`</p></div></nav></body>`)
+		best := findElementByClass(doc, "best")
+		if got := p.expandToArticleCluster(best); got != best {
+			t.Error("node with a removal-marked parent (<nav>) was widened")
+		}
+	})
+
+	t.Run("dominance guard blocks rival sibling", func(t *testing.T) {
+		// The sibling holds far more text than best, so best does not dominate
+		// the parent: competing sections, not a split article.
+		doc := parse(t, `<body><div class="wrap"><div class="best"><p>tiny block</p></div>`+
+			`<div><p>`+strings.Repeat("rival ", 200)+`</p></div></div></body>`)
+		best := findElementByClass(doc, "best")
+		if got := p.expandToArticleCluster(best); got != best {
+			t.Error("node widened although a rival sibling holds most of the parent text")
+		}
+	})
+
+	t.Run("short or inline siblings block widening", func(t *testing.T) {
+		// The only sibling is a short block (< minArticleSiblingChars of text)
+		// plus an inline <span>: neither qualifies, so no widening.
+		doc := parse(t, `<body><div class="wrap"><div class="best"><p>`+strings.Repeat("word ", 30)+`</p></div>`+
+			`<div><p>short</p></div><span>inline</span></div></body>`)
+		best := findElementByClass(doc, "best")
+		if got := p.expandToArticleCluster(best); got != best {
+			t.Error("node widened although no content-bearing block sibling exists")
+		}
+	})
+
+	t.Run("content sibling under wrapper widens to parent", func(t *testing.T) {
+		doc := parse(t, `<body><div class="wrap"><div class="best"><p>`+strings.Repeat("word ", 60)+`</p></div>`+
+			`<div><p>`+strings.Repeat("sibling ", 10)+`</p></div></div></body>`)
+		best := findElementByClass(doc, "best")
+		parent := findElementByClass(doc, "wrap")
+		if got := p.expandToArticleCluster(best); got != parent {
+			t.Error("split-article shape was not widened to the content wrapper")
+		}
+	})
+}
+
+// TestContainsLowConfidencePhrase drives the paywall/consent phrase scan
+// directly, including the rune-boundary back-off on inputs longer than
+// paywallScanChars (800) that the public API only reaches incidentally.
+func TestContainsLowConfidencePhrase(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"short matching phrase", "Please subscribe to continue reading this article.", true},
+		{"short non-matching text", "The quarterly report covers three regions.", false},
+		{"empty text", "", false},
+		{"phrase beyond the scan window of a long text", strings.Repeat("x", 900) + " we use cookies and track you", false},
+		{"phrase inside the scan window of a long text", strings.Repeat("x", 700) + " accept to continue " + strings.Repeat("y", 200), true},
+		// A CJK lead-in longer than the byte cap forces the rune-boundary
+		// back-off loop before the phrase is scanned.
+		{"multibyte lead-in beyond the window", strings.Repeat("中文内容", 250) + " subscribe to read more", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := containsLowConfidencePhrase(tt.text); got != tt.want {
+				t.Errorf("containsLowConfidencePhrase(len=%d) = %v, want %v", len(tt.text), got, tt.want)
+			}
+		})
+	}
 }

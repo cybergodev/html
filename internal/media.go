@@ -61,49 +61,39 @@ var (
 		"bilibili.com/",
 	}
 
-	// mediaPatterns groups every media signature — file extensions (".mp4", ".mp3",
-	// ...) and embed-host patterns ("youtube.com/embed/", ...) — by its first byte.
-	// HasMediaReference uses it to find any signature in a single allocation-free
-	// pass, checking only the few signatures that start with the byte at the current
-	// position instead of scanning once per pattern.
-	//
-	// Each signature is indexed under BOTH ASCII cases of its first byte (e.g. under
-	// both 'y' and 'Y'), so the scan looks up its bucket directly without a
-	// per-byte case-fold branch. The match itself (asciiFoldHasPrefix) is still
-	// case-insensitive over the whole signature.
-	mediaPatterns [256][]string
-
 	// mediaScanClass maps each byte to a dense bucket id (1+) for the
-	// mediaPatterns buckets that begin with it, or 0 when no signature starts
+	// signature buckets that begin with it, or 0 when no signature starts
 	// with that byte. The HasMediaReference scan consults this single
 	// one-byte table per input byte: the previous two-step lookup (a presence
-	// bitmap followed by a 24-byte slice-header load from the 4 KiB
-	// mediaPatterns table) cost four memory loads per byte and measured ~1GB/s;
-	// the class table keeps the common reject path to one load plus a branch.
+	// bitmap followed by a 24-byte slice-header load from a 4 KiB first-byte
+	// table) cost four memory loads per byte and measured ~1GB/s; the class
+	// table keeps the common reject path to one load plus a branch.
 	mediaScanClass [256]uint8
 
-	// mediaScanBuckets[id-1] is the mediaPatterns bucket assigned class id.
+	// mediaScanBuckets[id-1] is the signature bucket assigned class id.
 	mediaScanBuckets [][]string
 )
 
 func init() {
+	// mediaPatterns groups every media signature — file extensions (".mp4",
+	// ".mp3", ...) and embed-host patterns ("youtube.com/embed/", ...) — by
+	// its first byte. It is build-only state: init densifies it into
+	// mediaScanClass/mediaScanBuckets below and nothing reads it afterwards,
+	// so it lives here rather than as package-level dead weight. Each
+	// signature is indexed under BOTH ASCII cases of its first byte (e.g.
+	// under both 'y' and 'Y'), so the scan looks up its bucket directly
+	// without a per-byte case-fold branch; the match itself
+	// (asciiFoldHasPrefix) is still case-insensitive over the whole signature.
+	var mediaPatterns [256][]string
+
 	addSignature := func(sig string) {
 		if sig == "" {
 			return
 		}
-		first := sig[0]
-		// All signatures are lowercase by construction, but handle either case
-		// defensively: index under the byte itself and its ASCII-case counterpart.
-		mediaPatterns[first] = append(mediaPatterns[first], sig)
-		var other byte
-		if first >= 'a' && first <= 'z' {
-			other = first - 32
-		} else if first >= 'A' && first <= 'Z' {
-			other = first + 32
-		}
-		if other != 0 {
-			mediaPatterns[other] = append(mediaPatterns[other], sig)
-		}
+		// All signatures are lowercase by construction, but registerDualCase
+		// handles either case defensively: under the byte itself and its
+		// ASCII-case counterpart.
+		registerDualCase(&mediaPatterns, sig)
 	}
 	for ext := range videoExtensions {
 		addSignature(ext)
@@ -219,8 +209,9 @@ func hasEmbedPattern(url string) bool {
 // and ASCII case-insensitive.
 //
 // It performs a single pass over the content, dispatching on the current byte to the
-// small set of signatures that begin with that byte (see mediaPatterns). This finds
-// both file extensions and embed-host patterns in one traversal.
+// small set of signatures that begin with that byte (see mediaScanClass and
+// mediaScanBuckets). This finds both file extensions and embed-host patterns in one
+// traversal.
 //
 // It is a *necessary condition* for the regex-based and raw-HTML media scans in the
 // public package to produce any result: a video/audio regex match, or an
@@ -232,8 +223,7 @@ func hasEmbedPattern(url string) bool {
 // extension even when immediately followed by other characters, so any occurrence must
 // be treated as a potential match to avoid a false negative.
 func HasMediaReference(content string) bool {
-	n := len(content)
-	for i := 0; i < n; i++ {
+	for i := range len(content) {
 		// mediaScanClass (pre-indexed under both ASCII cases of each
 		// signature's first byte) rejects non-candidate bytes with a single
 		// one-byte table load before the bucket lookup below.
@@ -249,7 +239,7 @@ func HasMediaReference(content string) bool {
 }
 
 // asciiFoldHasPrefix reports whether s begins with prefix, ignoring ASCII case.
-// prefix is assumed lowercase (the mediaPatterns entries are, by construction).
+// prefix is assumed lowercase (the media signature entries are, by construction).
 func asciiFoldHasPrefix(s, prefix string) bool {
 	if len(s) < len(prefix) {
 		return false
@@ -285,6 +275,25 @@ var mediaURLRunAllowed = func() [256]bool {
 	return allowed
 }()
 
+// registerDualCase appends entry to its first-byte bucket idx[first] and, for
+// an ASCII letter, under the opposite case as well, so scans can look the
+// bucket up directly without a per-byte case-fold branch. It backs both
+// first-byte indexes in this file (init's signature table and
+// indexURLExtensions), which previously spelled the case-pair logic out twice.
+func registerDualCase(idx *[256][]string, entry string) {
+	first := entry[0]
+	idx[first] = append(idx[first], entry)
+	var other byte
+	if first >= 'a' && first <= 'z' {
+		other = first - 32
+	} else if first >= 'A' && first <= 'Z' {
+		other = first + 32
+	}
+	if other != 0 {
+		idx[other] = append(idx[other], entry)
+	}
+}
+
 // indexURLExtensions builds a first-byte index over the extensions (without the
 // leading '.') of an extension→MIME map, registering each under both ASCII
 // cases of its first byte so the scanner dispatches without a case-fold branch.
@@ -295,17 +304,7 @@ func indexURLExtensions(exts map[string]string) [256][]string {
 		if e == "" {
 			continue
 		}
-		first := e[0]
-		idx[first] = append(idx[first], e)
-		var other byte
-		if first >= 'a' && first <= 'z' {
-			other = first - 32
-		} else if first >= 'A' && first <= 'Z' {
-			other = first + 32
-		}
-		if other != 0 {
-			idx[other] = append(idx[other], e)
-		}
+		registerDualCase(&idx, e)
 	}
 	return idx
 }

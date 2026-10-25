@@ -686,3 +686,44 @@ func TestCacheEvictOneEmptyList(t *testing.T) {
 		t.Errorf("evictOne on empty cache should not change Len, got %d", c.Len())
 	}
 }
+
+// TestCacheLRUEvictionOrder pins the eviction policy end to end: at capacity,
+// the least-recently-Get/Set entry is evicted, and a Get refreshes an entry's
+// recency so it survives the next eviction. This exercises the
+// moveToFront/addToFront/removeNode/evictOne chain in its intended order.
+func TestCacheLRUEvictionOrder(t *testing.T) {
+	t.Parallel()
+
+	c := NewCache[string](2, 0)
+	c.Set("a", 1)
+	c.Set("b", 2)
+
+	// Touch "a" so "b" becomes the least recently used.
+	if got := c.Get("a"); got != 1 {
+		t.Fatalf("Get(a) = %v, want 1", got)
+	}
+
+	// Inserting "c" at capacity must evict "b", not "a".
+	c.Set("c", 3)
+	if got := c.Get("b"); got != nil {
+		t.Errorf("Get(b) = %v after b should have been evicted as LRU", got)
+	}
+	if got := c.Get("a"); got != 1 {
+		t.Errorf("Get(a) after eviction = %v, want 1 (Get refreshed recency)", got)
+	}
+	if got := c.Get("c"); got != 3 {
+		t.Errorf("Get(c) = %v, want 3", got)
+	}
+	if c.Len() != 2 {
+		t.Errorf("Len = %d, want 2", c.Len())
+	}
+
+	// Overwriting an existing key must not grow the cache or evict.
+	c.Set("a", 10)
+	if c.Len() != 2 {
+		t.Errorf("Len after overwrite = %d, want 2", c.Len())
+	}
+	if got := c.Get("a"); got != 10 {
+		t.Errorf("Get(a) after overwrite = %v, want 10", got)
+	}
+}

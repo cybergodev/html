@@ -126,10 +126,7 @@ func extractCharsetFromBytes(data []byte) string {
 	}
 
 	// Limit search area to first 1024 bytes
-	maxSearch := 1024
-	if dataLen < maxSearch {
-		maxSearch = dataLen
-	}
+	maxSearch := min(dataLen, 1024)
 
 	// Look for <meta charset="..."> using byte comparison. HTML5 allows ASCII
 	// whitespace around the '=', so skip any between the attribute name and
@@ -179,7 +176,7 @@ func asciiIndexIgnoreCaseBytes(data, pattern []byte) int {
 	// Simple search for byte slices
 	for i := 0; i <= dataLen-patternLen; i++ {
 		match := true
-		for j := 0; j < patternLen; j++ {
+		for j := range patternLen {
 			dc := data[i+j]
 			pc := pattern[j]
 			// Fast ASCII lowercase conversion
@@ -350,23 +347,14 @@ func (ed *EncodingDetector) DetectCharsetBasic(data []byte) string {
 	}
 
 	// Pre-compute sample size once
-	sampleSize := 1024
-	if dataLen < sampleSize {
-		sampleSize = dataLen
-	}
+	sampleSize := min(dataLen, 1024)
 	sample := data[:sampleSize]
 
-	// Fast path: Check if sample is pure ASCII (no high bytes)
-	// Pure ASCII is valid UTF-8 and doesn't need charset conversion
-	isPureASCII := true
-	for i := 0; i < sampleSize; i++ {
-		if sample[i]&0x80 != 0 {
-			isPureASCII = false
-			break
-		}
-	}
-
-	if isPureASCII {
+	// Fast path: a pure-ASCII sample (no high bytes) is valid UTF-8 and needs
+	// no charset conversion. isPureASCII is the same helper scoreUTF8 uses —
+	// its 64-bit word-at-a-time scan replaced a byte loop that had drifted
+	// from the optimized twin defined in this file.
+	if isPureASCII(sample) {
 		// For pure ASCII, we still need to check meta tags for declared encoding
 		// Use byte-based extraction to avoid string allocation
 		if declaredCharset := extractCharsetFromBytes(sample); declaredCharset != "" {
@@ -419,9 +407,14 @@ func (ed *EncodingDetector) DetectCharsetBasic(data []byte) string {
 // falling back to the default documented on MaxSampleSize when unset (<=0). It
 // centralizes the bound shared by DetectCharsetSmart and tryAllEncodings so the
 // two sampling paths cannot drift.
+//
+// The 1MB cap mirrors SetMaxSampleSize's documented maximum: MaxSampleSize is
+// an exported field a caller can set directly, so clamping only in the setter
+// left the documented bound unenforced for a hand-built EncodingDetector.
 func (ed *EncodingDetector) sampleSizeOrDefault() int {
+	const maxSize = 1024 * 1024 // 1MB, matches SetMaxSampleSize
 	if ed.MaxSampleSize > 0 {
-		return ed.MaxSampleSize
+		return min(ed.MaxSampleSize, maxSize)
 	}
 	return 10240
 }
@@ -896,7 +889,7 @@ func isPureASCII(data []byte) bool {
 	// This defensive check ensures we don't read beyond allocated memory.
 	// For small slices, fall back to safe byte-by-byte checking.
 	if n < 8 {
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if data[i] >= 0x80 {
 				return false
 			}
@@ -1173,13 +1166,10 @@ func calculatePrintableRatio(data []byte) float64 {
 	}
 
 	// Sample-based analysis for large data to avoid full scan
-	sampleSize := dataLen
-	if sampleSize > 4096 {
-		sampleSize = 4096
-	}
+	sampleSize := min(dataLen, 4096)
 
 	printable := 0
-	for i := 0; i < sampleSize; i++ {
+	for i := range sampleSize {
 		if isPrintable(data[i]) {
 			printable++
 		}

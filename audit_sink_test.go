@@ -824,8 +824,11 @@ func TestAuditCollectorRecordDepthViolation(t *testing.T) {
 
 // TestScorerAdapterCoverage covers scorerAdapter.ShouldRemove (0%) by using a
 // custom scorer whose ShouldRemove is configured to exercise the adapter's
-// delegation path. The adapter's ShouldRemove is called by the internal scoring
-// pipeline when removing non-content nodes during article extraction.
+// delegation path. Note: the adapter's ShouldRemove is NOT called by the
+// production pipeline — removal decisions are hardwired to the default scorer
+// (see the LIMITATION note on the public Scorer interface) — so the t.Log below
+// is the expected outcome; the test exists to keep the delegation path compiled
+// and covered should that change.
 func TestScorerAdapterCoverage(t *testing.T) {
 	t.Parallel()
 
@@ -1275,4 +1278,38 @@ func TestSEC003SinkConstructorsNoPanic(t *testing.T) {
 			t.Errorf("DroppedCount() = %d, want 0", got)
 		}
 	})
+}
+
+// TestSinkWriteDegenerateReceivers collects the nil-receiver and nil-inner
+// branches of the sink Write methods: every exported sink type must tolerate
+// a nil receiver and (where a list is involved) a nil inner sink without
+// panicking — the same SEC-003 contract the constructors and Close already
+// carry.
+func TestSinkWriteDegenerateReceivers(t *testing.T) {
+	t.Parallel()
+
+	entry := AuditEntry{EventType: AuditEventBlockedTag, Level: AuditLevelInfo}
+
+	var loggerSink *LoggerAuditSink
+	loggerSink.Write(entry) // nil receiver — must not panic
+
+	var zeroLogger LoggerAuditSink // zero value: nil logger field
+	zeroLogger.Write(entry)
+
+	var channelSink *ChannelAuditSink
+	channelSink.Write(entry) // nil receiver — must not panic
+
+	var writerSink *WriterAuditSink
+	writerSink.Write(entry) // nil receiver — must not panic
+
+	var multi *MultiSink
+	multi.Write(entry) // nil receiver — must not panic
+
+	// A MultiSink holding a nil inner sink must skip it, not panic, while the
+	// real sink still receives the entry.
+	rec := &p3RecordingSink{}
+	NewMultiSink(nil, rec).Write(entry)
+	if len(rec.entries) != 1 {
+		t.Errorf("entry not delivered past a nil inner sink: %+v", rec.entries)
+	}
 }

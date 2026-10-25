@@ -31,11 +31,8 @@ const (
 
 // poolDebug enables debug logging for pool corruption detection.
 // This is intentionally not exported - it's for internal debugging only.
-// To enable, modify this variable to true before using the pool.
-//
-// Example (in test code):
-//
-//	internal.SetPoolDebug(true, log.Printf)
+// It cannot be assigned directly (atomic.Bool): enable it through
+// SetPoolDebug(true, logger), as the tests do.
 var poolDebug atomic.Bool
 
 // poolSecureClear enables secure clearing of pooled objects before reuse.

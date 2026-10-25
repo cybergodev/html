@@ -18,6 +18,8 @@
 |---------|-------------|
 | 🚀 **One-Line Extraction** | Extract clean text from HTML in a single function call |
 | 🔍 **Smart Article Detection** | Identifies main content using scoring algorithms |
+| 📋 **Metadata Extraction** | author, published time, description, site name, canonical URL |
+| 🎚️ **Extraction Confidence** | Per-document quality signal (article / listing / fallback / paywall detection) |
 | 🌐 **Auto Encoding Detection** | Handles UTF-8, Windows-1252, GBK, Shift_JIS, etc. |
 | 🔄 **Batch Processing** | Parallel extraction with Worker Pool and Context support |
 | 📦 **Multiple Output Formats** | Text, Markdown, JSON |
@@ -75,7 +77,7 @@ func main() {
         log.Fatal(err)
     }
     fmt.Println(text)
-    // Output: "Hello World\n\nContent here..."
+    // Output: "# Hello World\n\nContent here..."
 }
 ```
 
@@ -717,6 +719,7 @@ go run ./examples/01_quick_start/
 | [09_context_cancellation](examples/09_context_cancellation) | Context cancellation and timeouts |
 | [10_secure_file_processing](examples/10_secure_file_processing) | AllowedBaseDir sandbox and secure file reads |
 | [11_encoding](examples/11_encoding) | Character encoding detection and override |
+| [12_metadata_quality](examples/12_metadata_quality) | Structured metadata (JSON-LD/OpenGraph) and extraction confidence |
 
 ---
 

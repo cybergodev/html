@@ -1,8 +1,9 @@
 package html_test
 
 // regressions_test.go — regression tests for the D-002 fixes, verified
-// through the public API (folded from the former p1_regression_test.go and
-// p2_regression_test.go):
+// through the public API (folded from the former p1_regression_test.go,
+// p2_regression_test.go, dataurl_case_regression_test.go, and
+// placeholder_regression_test.go):
 //   - ResolveURL: scheme-bearing references (mailto:, tel:) are absolute and
 //     must not be concatenated onto the base; protocol-relative bases must
 //     survive /path resolution.
@@ -16,6 +17,14 @@ package html_test
 //     processor instead of dropping them.
 //   - raw-HTML attribute values are entity-decoded so media URLs extracted
 //     from sanitizer-removed tags match their DOM-extracted counterparts.
+//   - RFC 3986 case-insensitive data: URL schemes: "DATA:text/html,…" is
+//     rejected from link extraction exactly like "data:text/html,…", while a
+//     whitelisted "DATA:image/png" image survives sanitization.
+//   - the inline placeholder contract between the text pass and
+//     extractImagesAndLinks: dispatched tables burn [IMAGE:n]/[LINK:n]
+//     positions for their subtree, and enabling only one of
+//     InlineImageFormat/InlineLinkFormat must not leak the other kind's
+//     literal tokens into Text.
 
 import (
 	"strings"
@@ -267,4 +276,181 @@ func TestExtractToMarkdownForwardsAudit(t *testing.T) {
 	if !sawBlockedTag {
 		t.Error("Extract sanitize events missing from GetAuditLog")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// data: URL scheme case-insensitivity (from dataurl_case_regression_test.go)
+// ---------------------------------------------------------------------------
+
+// TestScriptableDataURLCaseInsensitive verifies that uppercase/mixed-case
+// scriptable data URLs are rejected from link extraction exactly like their
+// lowercase form.
+func TestScriptableDataURLCaseInsensitive(t *testing.T) {
+	t.Parallel()
+
+	p, err := html.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+
+	doc := `<html><body>
+<a href="DATA:text/html,%3Cscript%3Ealert(1)%3E/script%3E">evil-upper</a>
+<a href="Data:image/svg+xml,%3Csvg%3E">svg-mixed</a>
+<a href="data:text/html,%3Cscript%3Ealert(1)%3E/script%3E">evil-lower</a>
+<a href="https://go.dev">safe</a>
+</body></html>`
+	links, err := p.ExtractAllLinks([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 1 || links[0].URL != "https://go.dev" {
+		for _, l := range links {
+			low := strings.ToLower(l.URL)
+			if strings.HasPrefix(low, "data:text/html") || strings.HasPrefix(low, "data:image/svg") {
+				t.Errorf("scriptable data URL returned by ExtractAllLinks: %s", l.URL)
+			}
+		}
+		t.Errorf("expected only the safe link, got %v", links)
+	}
+}
+
+// TestUppercaseSafeDataURLImageExtracted verifies the functionality half of
+// the fix: browsers accept "DATA:" schemes, so a whitelisted media type in
+// any case must survive sanitization and appear in Images.
+func TestUppercaseSafeDataURLImageExtracted(t *testing.T) {
+	t.Parallel()
+
+	cfg := html.DefaultConfig()
+	cfg.BaseURL = "https://site.com/page"
+	p, err := html.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+
+	res, err := p.Extract([]byte(`<html><body><img src="DATA:image/png;base64,iVBORw0KGgo=" alt="dot"></body></html>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Images) != 1 || res.Images[0].URL != "DATA:image/png;base64,iVBORw0KGgo=" {
+		t.Errorf("uppercase safe data-URL image not extracted: %+v", res.Images)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Inline placeholder contract (from placeholder_regression_test.go)
+// ---------------------------------------------------------------------------
+
+// TestTableDoesNotShiftInlinePlaceholders extracts a document whose table
+// cells contain an image and a link between two paragraph-level elements.
+// Before the fix, the table's elements were numbered by
+// extractImagesAndLinks but never by the text pass, so every placeholder
+// after the table substituted the wrong entry (the outro image rendered the
+// table's image, and the table's link never appeared).
+func TestTableDoesNotShiftInlinePlaceholders(t *testing.T) {
+	t.Parallel()
+
+	cfg := html.DefaultConfig()
+	cfg.InlineImageFormat = "markdown"
+	cfg.InlineLinkFormat = "markdown"
+	p, err := html.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+
+	doc := `<html><body>
+<p>Intro <img src="/a.png" alt="A"></p>
+<table><tr><td><img src="/b.png" alt="B"></td><td><a href="https://table.example/t">T</a></td></tr></table>
+<p>Outro <img src="/c.png" alt="C"> <a href="https://outro.example/o">O</a></p>
+</body></html>`
+	res, err := p.Extract([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The outro elements must reference C and O — not the table's B/T.
+	if !strings.Contains(res.Text, "![C](/c.png)") {
+		t.Errorf("outro image markdown missing: %q", res.Text)
+	}
+	if !strings.Contains(res.Text, "[O](https://outro.example/o)") {
+		t.Errorf("outro link markdown missing: %q", res.Text)
+	}
+	if strings.Contains(res.Text, "![B](/b.png)") {
+		t.Errorf("table-cell image substituted into inline text: %q", res.Text)
+	}
+	if strings.Contains(res.Text, "[T](https://table.example/t)") {
+		t.Errorf("table-cell link substituted into inline text: %q", res.Text)
+	}
+
+	// Positions in the structured results must still cover the table cells.
+	var sawB, sawT bool
+	for _, img := range res.Images {
+		if img.URL == "/b.png" {
+			sawB = true
+		}
+	}
+	for _, link := range res.Links {
+		if link.URL == "https://table.example/t" {
+			sawT = true
+		}
+	}
+	if !sawB || !sawT {
+		t.Errorf("table-cell image/link missing from structured results: images=%v links=%v", res.Images, res.Links)
+	}
+}
+
+// TestMixedInlineFormatsDoNotLeakPlaceholders guards the literal-token leak:
+// with only one format enabled, the other kind's [IMAGE:n]/[LINK:n] tokens
+// had no formatter to consume them and survived verbatim into Text.
+func TestMixedInlineFormatsDoNotLeakPlaceholders(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body><p>Hello <a href="https://go.dev">Go</a> <img src="a.png" alt="pic"></p></body></html>`
+
+	t.Run("image markdown only", func(t *testing.T) {
+		t.Parallel()
+		cfg := html.DefaultConfig()
+		cfg.InlineImageFormat = "markdown" // InlineLinkFormat stays "none"
+		p, err := html.New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = p.Close() }()
+		res, err := p.Extract([]byte(doc))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(res.Text, "[LINK:") || strings.Contains(res.Text, "[/LINK]") {
+			t.Errorf("literal link placeholder leaked: %q", res.Text)
+		}
+		if !strings.Contains(res.Text, "![pic](a.png)") {
+			t.Errorf("image markdown missing: %q", res.Text)
+		}
+		if !strings.Contains(res.Text, "Go") {
+			t.Errorf("link text lost: %q", res.Text)
+		}
+	})
+
+	t.Run("link markdown only", func(t *testing.T) {
+		t.Parallel()
+		cfg := html.DefaultConfig()
+		cfg.InlineLinkFormat = "markdown" // InlineImageFormat stays "none"
+		p, err := html.New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = p.Close() }()
+		res, err := p.Extract([]byte(doc))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(res.Text, "[IMAGE:") {
+			t.Errorf("literal image placeholder leaked: %q", res.Text)
+		}
+		if !strings.Contains(res.Text, "[Go](https://go.dev)") {
+			t.Errorf("link markdown missing: %q", res.Text)
+		}
+	})
 }
