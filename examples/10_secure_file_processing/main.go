@@ -86,9 +86,26 @@ func main() {
 	fmt.Println()
 
 	// ============================================================
-	// 3. Missing file → ErrFileNotFound
+	// 3. Paths containing ".." are rejected as traversal attempts
 	// ============================================================
-	fmt.Println("3. Missing file")
+	fmt.Println("3. Path traversal")
+	fmt.Println("-----------------")
+
+	// A relative path whose leading ".." survives cleaning escapes the
+	// working directory upward; it is rejected before any file is opened,
+	// regardless of AllowedBaseDir (and the full path is redacted in the
+	// error message).
+	_, err = processor.ExtractFromFile(filepath.Join("..", "outside", "secret.html"))
+	if errors.Is(err, html.ErrInvalidFilePath) {
+		fmt.Printf("  ✓ refused: %v\n", err)
+		fmt.Println("  ✓ errors.Is(err, html.ErrInvalidFilePath)")
+	}
+	fmt.Println()
+
+	// ============================================================
+	// 4. Missing file → ErrFileNotFound
+	// ============================================================
+	fmt.Println("4. Missing file")
 	fmt.Println("---------------")
 	_, err = processor.ExtractFromFile(filepath.Join(base, "does-not-exist.html"))
 	if errors.Is(err, html.ErrFileNotFound) {
@@ -97,9 +114,9 @@ func main() {
 	fmt.Println()
 
 	// ============================================================
-	// 4. Batch files (same sandbox applies to each)
+	// 5. Batch files (same sandbox applies to each)
 	// ============================================================
-	fmt.Println("4. Batch files")
+	fmt.Println("5. Batch files")
 	fmt.Println("--------------")
 	batch := processor.ExtractBatchFiles([]string{
 		insideA, insideB, // ok
@@ -134,7 +151,7 @@ func makeSandbox() (base string, cleanup func(), err error) {
 		filepath.Join(base, "nested"),
 		filepath.Join(tmp, "outside"),
 	} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
 			cleanup()
 			return "", nil, err
 		}
@@ -149,7 +166,7 @@ func makeSandbox() (base string, cleanup func(), err error) {
 		filepath.Join(tmp, "outside", "secret.html"): "<html><body><p>This file lives OUTSIDE the sandbox.</p></body></html>",
 	}
 	for path, content := range files {
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			cleanup()
 			return "", nil, err
 		}

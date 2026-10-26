@@ -14,7 +14,7 @@ import (
 // writeInt writes a non-negative integer to the builder without allocating a string.
 func writeInt(tb *table.TrackedBuilder, n int) {
 	if n < 10 {
-		_ = tb.WriteByte(byte('0' + n))
+		_ = tb.WriteByte(byte('0' + n)) //nolint:gosec // G115: bounded by the n<10 guard above, so '0'+n <= '9'
 		return
 	}
 	var buf [20]byte
@@ -358,14 +358,22 @@ func pendingListMarkerLine(tb *table.TrackedBuilder) bool {
 	case '-', '*', '+', ':':
 		i--
 	default:
-		j := i
+		// An ordered marker ends the line with "N.": require the '.', then at
+		// least one digit to its left, then a line start. The previous scan
+		// required the char BEFORE the digits to be a '.', matching
+		// ".<digits>" — a shape no marker writer produces, so the "N." that
+		// listItemPrefix writes never registered as pending.
+		if b[i-1] != '.' {
+			return false
+		}
+		j := i - 1
 		for j > 0 && b[j-1] >= '0' && b[j-1] <= '9' {
 			j--
 		}
-		if j == i || j == 0 || b[j-1] != '.' {
+		if j == i-1 {
 			return false
 		}
-		i = j - 1
+		i = j
 	}
 	for i > 0 && (b[i-1] == ' ' || b[i-1] == '\t') {
 		i--
@@ -390,23 +398,28 @@ func pendingListMarkerLine(tb *table.TrackedBuilder) bool {
 // Unlike the linear text pass, this flattener never emits newlines (a
 // markdown table row is one line); whitespace between fragments collapses to
 // single spaces.
+//
+// The scratch is a pooled, capacity-retaining []byte rather than a fresh
+// strings.Builder per cell: tableTokenText runs once per table cell and
+// caption on this path, and the builder's Grow(64) was one allocation each.
+// string(*bp) copies at exact size, so nothing aliases the pooled buffer.
 func tableTokenText(node *html.Node, imageCounter, linkCounter *int, chromeMode bool) string {
 	if node == nil {
 		return ""
 	}
-	var b strings.Builder
-	b.Grow(64)
-	writeTokenText(&b, node, imageCounter, linkCounter, chromeMode)
-	return strings.TrimSpace(b.String())
+	bp := GetByteBuf()
+	defer PutByteBuf(bp)
+	writeTokenText(bp, node, imageCounter, linkCounter, chromeMode)
+	return strings.TrimSpace(string(*bp))
 }
 
 // writeTokenText is tableTokenText's recursive worker.
-func writeTokenText(b *strings.Builder, node *html.Node, imageCounter, linkCounter *int, chromeMode bool) {
+func writeTokenText(bp *[]byte, node *html.Node, imageCounter, linkCounter *int, chromeMode bool) {
 	switch node.Type {
 	case html.TextNode:
 		if text := strings.TrimSpace(node.Data); text != "" {
-			ensureTokenSpace(b)
-			b.WriteString(text)
+			ensureTokenSpace(bp)
+			*bp = append(*bp, text...)
 		}
 		return
 	case html.CommentNode, html.DoctypeNode:
@@ -425,44 +438,41 @@ func writeTokenText(b *strings.Builder, node *html.Node, imageCounter, linkCount
 		case "a":
 			if linkCounter != nil {
 				*linkCounter++
-				ensureTokenSpace(b)
-				b.WriteString("[LINK:")
-				b.WriteString(strconv.Itoa(*linkCounter))
-				b.WriteString("]")
+				ensureTokenSpace(bp)
+				*bp = append(*bp, "[LINK:"...)
+				*bp = strconv.AppendInt(*bp, int64(*linkCounter), 10)
+				*bp = append(*bp, ']')
 				for child := node.FirstChild; child != nil; child = child.NextSibling {
-					writeTokenText(b, child, imageCounter, linkCounter, chromeMode)
+					writeTokenText(bp, child, imageCounter, linkCounter, chromeMode)
 				}
-				b.WriteString("[/LINK]")
+				*bp = append(*bp, "[/LINK]"...)
 				return
 			}
 		case "img":
 			if imageCounter != nil && imgHasValidSrc(node) {
 				*imageCounter++
-				ensureTokenSpace(b)
-				b.WriteString("[IMAGE:")
-				b.WriteString(strconv.Itoa(*imageCounter))
-				b.WriteString("]")
+				ensureTokenSpace(bp)
+				*bp = append(*bp, "[IMAGE:"...)
+				*bp = strconv.AppendInt(*bp, int64(*imageCounter), 10)
+				*bp = append(*bp, ']')
 				return
 			}
 			return
 		case "br":
-			ensureTokenSpace(b)
+			ensureTokenSpace(bp)
 			return
 		}
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			writeTokenText(b, child, imageCounter, linkCounter, chromeMode)
+			writeTokenText(bp, child, imageCounter, linkCounter, chromeMode)
 		}
 	}
 }
 
 // ensureTokenSpace appends a single separating space when needed so flattened
 // fragments never run together and never double-space.
-func ensureTokenSpace(b *strings.Builder) {
-	if b.Len() > 0 {
-		last := b.String()[b.Len()-1]
-		if last != ' ' {
-			b.WriteByte(' ')
-		}
+func ensureTokenSpace(bp *[]byte) {
+	if b := *bp; len(b) > 0 && b[len(b)-1] != ' ' {
+		*bp = append(b, ' ')
 	}
 }
 
@@ -568,7 +578,8 @@ func CleanContentNode(node *html.Node) *html.Node {
 // exists to preserve. The root node itself is never removed (callers decide
 // its fate; read.go tests section roots with IsHiddenElementReader /
 // IsHiddenElementReaderStrict). The Extract path keeps applying its hidden
-// semantics through ShouldRemove's IsHiddenElement, unchanged.
+// semantics through DefaultScorer.ShouldRemove (class token, style, hidden
+// attribute, aria-hidden), unchanged.
 func RemoveHiddenElementsReader(node *html.Node) *html.Node {
 	return pruneDescendants(node, IsHiddenElementReader)
 }

@@ -381,7 +381,7 @@ func (p *Processor) extractFromFileWithFormats(filePath, imageFormat, linkFormat
 	if p == nil || p.closed.Load() {
 		return nil, ErrProcessorClosed
 	}
-	data, err := p.validateAndReadFile(filePath)
+	data, err := p.validateAndReadFile(filePath, "ExtractToMarkdownFromFile")
 	if err != nil {
 		return nil, err
 	}
@@ -410,7 +410,7 @@ func (p *Processor) extractFromFileWithFormatsWithContext(ctx context.Context, f
 		return nil, ctx.Err()
 	default:
 	}
-	data, err := p.validateAndReadFile(filePath)
+	data, err := p.validateAndReadFile(filePath, "ExtractToMarkdownFromFile")
 	if err != nil {
 		return nil, err
 	}

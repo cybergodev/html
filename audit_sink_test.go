@@ -224,6 +224,10 @@ func TestLevelFilteredSink(t *testing.T) {
 			[]AuditLevel{AuditLevelInfo, AuditLevelWarning, AuditLevelCritical}, 2},
 		{"min=Critical filters below", AuditLevelCritical,
 			[]AuditLevel{AuditLevelInfo, AuditLevelWarning, AuditLevelCritical}, 1},
+		// The threshold is case-insensitively normalized (row folded in from
+		// minor_fixes_regression_test.go's TestLevelFilteredSinkNormalizesCase).
+		{"capitalized minLevel still normalizes", "Critical",
+			[]AuditLevel{AuditLevelInfo, AuditLevelCritical}, 1},
 	}
 
 	for _, tt := range tests {
@@ -855,35 +859,9 @@ func TestAuditCollectorRecordDepthViolation(t *testing.T) {
 // (see the LIMITATION note on the public Scorer interface) — so the t.Log below
 // is the expected outcome; the test exists to keep the delegation path compiled
 // and covered should that change.
-func TestScorerAdapterCoverage(t *testing.T) {
-	t.Parallel()
-
-	// Scorer that returns a very low Score and true for ShouldRemove on
-	// nav/header/footer/sidebar elements, so the internal pipeline exercises
-	// the adapter's ShouldRemove delegation.
-	var shouldRemoveCalled bool
-	cfg := DefaultConfig()
-	cfg.ExtractArticle = true
-	cfg.Scorer = &removingScorer{shouldRemoveCalled: &shouldRemoveCalled}
-
-	p, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() failed: %v", err)
-	}
-	defer func() { _ = p.Close() }()
-
-	_, _ = p.Extract([]byte(`<html><body>
-		<nav><a href="/">Home</a></nav>
-		<article><p>Main content paragraph.</p></article>
-		<footer>Copyright</footer>
-	</body></html>`))
-
-	// The scorer's ShouldRemove should have been called at least once through
-	// the adapter during article extraction.
-	if !shouldRemoveCalled {
-		t.Log("ShouldRemove was not called through adapter — internal scoring may bypass custom scorer for removal decisions")
-	}
-}
+// Removed TestScorerAdapterCoverage: its only "assertion" was a t.Log on the
+// failure path (the test could not fail); the adapter's delegation is pinned
+// deterministically by TestScorerAdapterDirect below.
 
 // removingScorer is a test scorer that tracks whether ShouldRemove is called.
 type removingScorer struct {
@@ -1333,9 +1311,9 @@ func TestSinkWriteDegenerateReceivers(t *testing.T) {
 
 	// A MultiSink holding a nil inner sink must skip it, not panic, while the
 	// real sink still receives the entry.
-	rec := &p3RecordingSink{}
+	rec := &recordingSink{}
 	NewMultiSink(nil, rec).Write(entry)
-	if len(rec.entries) != 1 {
+	if rec.count() != 1 {
 		t.Errorf("entry not delivered past a nil inner sink: %+v", rec.entries)
 	}
 }
@@ -1436,5 +1414,32 @@ func TestCloseReturnsAuditSinkError(t *testing.T) {
 		t.Error("Close() = nil, want the audit sink's close error")
 	} else if !strings.Contains(err.Error(), "sink close failed") {
 		t.Errorf("Close() = %v, want the sink's close error", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Logger sink marshal-failure boundary ([FIX-001] boundary additions)
+// ---------------------------------------------------------------------------
+
+// TestLoggerAuditSinkMarshalFailure pins Write's json.Marshal error branch:
+// an entry carrying an unmarshalable Metadata value must reach the logger as
+// the "Failed to marshal audit entry" diagnostic instead of panicking or
+// being silently dropped.
+func TestLoggerAuditSinkMarshalFailure(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	sink := NewLoggerAuditSinkWithWriter(&buf)
+	defer func() { _ = sink.Close() }()
+
+	sink.Write(AuditEntry{
+		EventType: AuditEventBlockedTag,
+		Level:     AuditLevelInfo,
+		Metadata:  map[string]interface{}{"bad": make(chan int)},
+	})
+
+	out := buf.String()
+	if !strings.Contains(out, "Failed to marshal audit entry") {
+		t.Errorf("Write(unmarshalable entry) logged %q, want the marshal-failure diagnostic", out)
 	}
 }

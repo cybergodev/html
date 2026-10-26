@@ -68,41 +68,30 @@ func TestExtractWithEncodingDetection(t *testing.T) {
 			t.Errorf("Expected %q, got: %s", expected, result.Text)
 		}
 	})
-}
 
-// TestExtractToMarkdownEncoding tests automatic encoding detection in ExtractToMarkdown
-func TestExtractToMarkdownEncoding(t *testing.T) {
-	t.Run("Windows-1252 to Markdown", func(t *testing.T) {
-		testFile := "dev_test/Source Files/a2025q310-qexx311.html"
-		if _, err := os.Stat(testFile); os.IsNotExist(err) {
-			t.Skip("Test file not found")
-		}
+	t.Run("UTF-8 file detected correctly", func(t *testing.T) {
+		// From-file variant (moved from file_io_test.go's
+		// TestFileEncodingDetection; its "UTF-8 BOM handled" sibling was
+		// subsumed by the stronger fast/slow-parity BOM regression,
+		// TestExtractStripsUTF8BOM in regressions_internal_test.go).
+		htmlContent := `<html><head><meta charset="UTF-8"></head><body><p>UTF-8 Content: 你好</p></body></html>`
+		tmpFile := writeTempHTML(t, htmlContent)
 
-		htmlBytes, _ := os.ReadFile(testFile)
-
-		cfg := html.MarkdownConfig()
-		p, err := html.New(cfg)
+		result, err := html.ExtractFromFile(tmpFile)
 		if err != nil {
-			t.Fatalf("New() failed: %v", err)
+			t.Fatalf("ExtractFromFile failed: %v", err)
 		}
-		defer func() { _ = p.Close() }()
-
-		markdown, err := p.ExtractToMarkdown(htmlBytes)
-		if err != nil {
-			t.Fatalf("ExtractToMarkdown failed: %v", err)
-		}
-
-		// Verify UTF-8 conversion
-		if !strings.Contains(markdown, "registrant's") {
-			t.Errorf("Expected UTF-8 apostrophes in markdown")
-		}
-
-		// Verify no garbled text
-		if strings.Contains(markdown, "\ufffd") {
-			t.Error("Found replacement character in markdown")
+		if !strings.Contains(result.Text, "你好") {
+			t.Errorf("Should preserve Chinese characters, got: %s", result.Text)
 		}
 	})
+}
 
+// TestExtractToMarkdownEncoding tests automatic encoding detection in
+// ExtractToMarkdown. (The former dev_test-fixture Windows-1252 subtest was
+// removed: it asserted the same "registrant's" decode as
+// TestExtractWithEncodingDetection through a wrapper sharing one detect path.)
+func TestExtractToMarkdownEncoding(t *testing.T) {
 	t.Run("UTF-8 to Markdown", func(t *testing.T) {
 		htmlContent := `<html><body><p>Hello 世界 © 2025</p></body></html>`
 		htmlBytes := []byte(htmlContent)
@@ -129,27 +118,10 @@ func TestExtractToMarkdownEncoding(t *testing.T) {
 	})
 }
 
-// TestExtractText tests automatic encoding detection in ExtractText
+// TestExtractText tests automatic encoding detection in ExtractText. (The
+// former dev_test-fixture Windows-1252 subtest was removed for the same
+// reason as in TestExtractToMarkdownEncoding above.)
 func TestExtractText(t *testing.T) {
-	t.Run("Windows-1252 text extraction", func(t *testing.T) {
-		testFile := "dev_test/Source Files/a2025q310-qexx311.html"
-		if _, err := os.Stat(testFile); os.IsNotExist(err) {
-			t.Skip("Test file not found")
-		}
-
-		htmlBytes, _ := os.ReadFile(testFile)
-
-		text, err := html.ExtractText(htmlBytes)
-		if err != nil {
-			t.Fatalf("ExtractText failed: %v", err)
-		}
-
-		// Verify UTF-8
-		if !strings.Contains(text, "registrant's") {
-			t.Errorf("Expected UTF-8 apostrophes")
-		}
-	})
-
 	t.Run("UTF-8 text extraction", func(t *testing.T) {
 		htmlContent := `<html><body><p>Hello 世界 — Test</p></body></html>`
 		htmlBytes := []byte(htmlContent)

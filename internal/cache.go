@@ -271,11 +271,15 @@ func (c *Cache[K]) Clear() {
 // The cleanup goroutine runs at the specified interval until StopCleanup is
 // called. If interval is 0, DefaultCacheCleanupInterval is used.
 //
-// This method is idempotent - calling it multiple times has no additional effect.
+// This method is idempotent - calling it multiple times has no additional
+// effect. Idempotency relies on a one-shot sync.Once: after StopCleanup has
+// been called, that Once is spent, so a subsequent StartCleanup starts no
+// goroutine and returns a no-op cancel func. A stopped Cache cannot restart
+// its sweeper; create a new Cache instead.
 //
-// Concurrency: StartCleanup, StopCleanup, and RestartCleanup are serialized
-// per Cache instance (cleanupMu covers the Once.Do below and the Once reset
-// in RestartCleanup), so they are safe to call concurrently with each other.
+// Concurrency: StartCleanup and StopCleanup are serialized per Cache
+// instance (cleanupMu covers the Once.Do below), so they are safe to call
+// concurrently with each other.
 //
 // IMPORTANT: The cleanup goroutine holds a reference to the Cache, so the
 // Cache can never be garbage-collected (and no finalizer could ever run)
@@ -298,12 +302,9 @@ func (c *Cache[K]) StartCleanup(interval time.Duration) context.CancelFunc {
 // startCleanupLocked starts the cleanup goroutine; c.cleanupMu must be held.
 // The interval is clamped here so every public entry point shares one policy.
 //
-// cleanupMu is held across the Once.Do as well: RestartCleanup resets
-// cleanupOnce under this same lock, so anchoring Do() inside the critical
-// section is what makes a concurrent StartCleanup/RestartCleanup pair
-// race-free (Do would otherwise read the cleanupOnce field while
-// RestartCleanup writes it). The Do closure runs with the lock already
-// held and therefore must not re-acquire it.
+// cleanupMu is held across the Once.Do as well, so a concurrent StopCleanup
+// cannot interleave with the goroutine bookkeeping here. The Do closure runs
+// with the lock already held and therefore must not re-acquire it.
 func (c *Cache[K]) startCleanupLocked(interval time.Duration) context.CancelFunc {
 	if interval <= 0 {
 		interval = DefaultCacheCleanupInterval
@@ -358,46 +359,13 @@ func (c *Cache[K]) StopCleanup() {
 }
 
 // stopCleanupLocked cancels a running cleanup goroutine; c.cleanupMu must be
-// held. Cancel runs under the lock (the previous public method canceled after
-// unlocking) so a RestartCleanup holding the lock observes a fully stopped
-// cleaner before it resets the Once. The cleanup goroutine itself never takes
-// cleanupMu, so canceling under it cannot deadlock.
+// held. The cleanup goroutine itself never takes cleanupMu, so canceling
+// under it cannot deadlock.
 func (c *Cache[K]) stopCleanupLocked() {
 	if cancel := c.cleanupCancel; cancel != nil {
 		c.cleanupCancel = nil
 		cancel()
 	}
-}
-
-// RestartCleanup stops any running cleanup goroutine and starts a new one. It
-// is the public lifecycle primitive for a Cache whose sweeper has been stopped
-// (e.g. via StopCleanup, or Close on an owning Processor) but whose expired
-// entries should keep being evicted.
-//
-// The internal processor pool previously called this when returning a processor
-// to the pool after Close(); that path was dead on every real execution and has
-// been removed, so RestartCleanup currently has no in-module production caller.
-// It is retained as part of the Cache API for callers that manage the cleanup
-// lifecycle directly (and is exercised by TestCacheRestartCleanup).
-//
-// Concurrency: StartCleanup, StopCleanup, and RestartCleanup are serialized
-// per Cache instance via cleanupMu (which covers both the cleanupOnce reset
-// below and StartCleanup's Once.Do), so they are safe to call concurrently
-// with each other on the same Cache.
-func (c *Cache[K]) RestartCleanup(interval time.Duration) {
-	c.cleanupMu.Lock()
-	defer c.cleanupMu.Unlock()
-	// Atomic under the lock: stop, reset the Once, start. The previous
-	// three-step sequence released the lock between the steps, so a
-	// concurrent StartCleanup could slip in between the stop and the Once
-	// reset — its goroutine's cancel func was then overwritten by the start
-	// below, and that first goroutine (holding its Cache reference) leaked
-	// for good. Holding cleanupMu across all three steps makes the restart
-	// one indivisible transition, honoring the documented "safe to call
-	// concurrently" contract.
-	c.stopCleanupLocked()
-	c.cleanupOnce = sync.Once{}
-	c.startCleanupLocked(interval)
 }
 
 // cleanupExpired removes all expired entries from the cache.

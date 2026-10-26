@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"golang.org/x/net/html"
 )
@@ -566,6 +567,18 @@ func TestSanitizeStyleValue(t *testing.T) {
 			want:  "",
 		},
 		{
+			// CSS permits whitespace between a property name and its colon;
+			// the former plain substring match missed these spellings.
+			name:  "behavior with whitespace before colon blocked",
+			input: "color: red; behavior : url(evil.htc)",
+			want:  "",
+		},
+		{
+			name:  "moz-binding with whitespace before colon blocked",
+			input: "width: 100px; -moz-binding\t: url(evil.xml#xss)",
+			want:  "",
+		},
+		{
 			name:  "javascript in style blocked",
 			input: "background: javascript:alert(1)",
 			want:  "",
@@ -1104,5 +1117,206 @@ func TestIsPlainPrintableASCIIPartitions(t *testing.T) {
 	}
 	if isPlainPrintableASCII("") {
 		t.Error("empty string must not be plain printable ASCII")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Audit-mode sanitization boundaries (from boundary_gaps_test.go)
+// ---------------------------------------------------------------------------
+
+// recordingAudit captures blocked-tag events for SanitizeHTMLWithAudit tests.
+type recordingAudit struct {
+	tags []string
+}
+
+func (r *recordingAudit) RecordBlockedTag(tag string)      { r.tags = append(r.tags, tag) }
+func (r *recordingAudit) RecordBlockedAttr(string, string) {}
+func (r *recordingAudit) RecordBlockedURL(string, string)  {}
+
+// Compile-time check that recordingAudit satisfies the recorder interface.
+var _ AuditRecorder = (*recordingAudit)(nil)
+
+// TestNoOpAuditRecorder pins that the no-op recorder accepts every call and
+// records nothing — the guarantee sanitization relies on when audit is off.
+func TestNoOpAuditRecorder(t *testing.T) {
+	t.Parallel()
+
+	var r AuditRecorder = NoOpAuditRecorder{}
+	r.RecordBlockedTag("script")
+	r.RecordBlockedAttr("onclick", "evil()")
+	r.RecordBlockedURL("javascript:alert(1)", "javascript scheme")
+
+	// No panic and no observable state is the entire contract.
+}
+
+// TestSanitizeHTMLWithAuditBoundaries covers the empty-input early return and
+// the body extraction path of SanitizeHTMLWithAudit, asserting that blocked
+// tags are reported through the recorder.
+func TestSanitizeHTMLWithAuditBoundaries(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty input returns empty", func(t *testing.T) {
+		t.Parallel()
+		if got := SanitizeHTMLWithAudit("", &recordingAudit{}); got != "" {
+			t.Errorf("SanitizeHTMLWithAudit(\"\") = %q, want empty", got)
+		}
+	})
+
+	t.Run("dangerous tags removed and reported", func(t *testing.T) {
+		t.Parallel()
+		audit := &recordingAudit{}
+		got := SanitizeHTMLWithAudit(
+			`<p>keep <b>this</b></p><script>alert(1)</script>`, audit)
+
+		if strings.Contains(got, "<script>") || strings.Contains(got, "alert(1)") {
+			t.Errorf("script tag survived sanitization: %q", got)
+		}
+		if !strings.Contains(got, "keep") {
+			t.Errorf("benign content was dropped: %q", got)
+		}
+		found := false
+		for _, tag := range audit.tags {
+			if tag == "script" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("blocked <script> removal was not reported; got %v", audit.tags)
+		}
+	})
+
+	t.Run("NoOp recorder keeps sanitization silent", func(t *testing.T) {
+		t.Parallel()
+		// Contract note: SanitizeHTMLWithAudit requires a non-nil recorder —
+		// a nil interface panics on the first blocked tag (sanitize.go calls
+		// audit.RecordBlockedTag unconditionally). SanitizeHTML satisfies
+		// this by always passing NoOpAuditRecorder{}; callers that want no
+		// auditing must do the same.
+		got := SanitizeHTMLWithAudit(`<p>content</p><script>x</script>`, NoOpAuditRecorder{})
+		if strings.Contains(got, "<script>") {
+			t.Errorf("script tag survived sanitization: %q", got)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Audit-URL truncation and srcset/ping sanitization (from p2_regression_test.go)
+// ---------------------------------------------------------------------------
+
+// TestTruncateAuditURLRuneSafe pins that audit-URL truncation never splits a
+// multi-byte rune and leaves short URLs untouched.
+func TestTruncateAuditURLRuneSafe(t *testing.T) {
+	t.Parallel()
+	url := strings.Repeat("中", 300)
+	got := TruncateAuditURL(url)
+	if !utf8.ValidString(got) {
+		t.Errorf("TruncateAuditURL produced invalid UTF-8: %q", got)
+	}
+	if TruncateAuditURL("short") != "short" {
+		t.Error("TruncateAuditURL altered a short URL")
+	}
+}
+
+type p2CountingRecorder struct{ blockedURLs int }
+
+func (r *p2CountingRecorder) RecordBlockedTag(string)          {}
+func (r *p2CountingRecorder) RecordBlockedAttr(string, string) {}
+func (r *p2CountingRecorder) RecordBlockedURL(string, string)  { r.blockedURLs++ }
+
+// TestSrcsetAndPingSanitized pins that javascript: srcset candidates and
+// scriptable data: ping values are audited/blocked while legitimate srcset
+// lists pass through unchanged.
+func TestSrcsetAndPingSanitized(t *testing.T) {
+	t.Parallel()
+	rec := &p2CountingRecorder{}
+	SanitizeHTMLWithAudit(`<img src="ok.png" srcset="javascript:alert(1) 1x">`, rec)
+	if rec.blockedURLs == 0 {
+		t.Error("javascript: srcset value was not audited/blocked")
+	}
+	rec2 := &p2CountingRecorder{}
+	SanitizeHTMLWithAudit(`<a href="ok.html" ping="data:text/html,x">y</a>`, rec2)
+	if rec2.blockedURLs == 0 {
+		t.Error("scriptable data: ping value was not audited/blocked")
+	}
+	rec3 := &p2CountingRecorder{}
+	out := SanitizeHTMLWithAudit(`<img src="ok.png" srcset="a.png 1x, b.png 2x">`, rec3)
+	if rec3.blockedURLs != 0 || !strings.Contains(out, `srcset="a.png 1x, b.png 2x"`) {
+		t.Errorf("legitimate srcset altered or blocked: %q (blocked=%d)", out, rec3.blockedURLs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Reader-mode DOM sanitizer boundaries ([FIX-001] boundary additions)
+// ---------------------------------------------------------------------------
+
+// TestSanitizeDOMReaderBoundaries pins the nil-document guard and the
+// reader-mode <button> unwrap contract: a button inside a kept chrome region
+// loses its control surface but preserves the visible label text.
+func TestSanitizeDOMReaderBoundaries(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil document is a no-op", func(t *testing.T) {
+		t.Parallel()
+		SanitizeDOMReader(nil, NoOpAuditRecorder{}) // must not panic
+	})
+
+	t.Run("button unwrapped, label kept", func(t *testing.T) {
+		t.Parallel()
+		doc, err := html.Parse(strings.NewReader(
+			`<html><body><nav><button class="menu-toggle">Open menu</button><a href="/x">x</a></nav></body></html>`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		SanitizeDOMReader(doc, NoOpAuditRecorder{})
+
+		out := GetTextContent(doc)
+		if !strings.Contains(out, "Open menu") {
+			t.Errorf("button label lost in reader mode: %q", out)
+		}
+		hasButton := false
+		var walk func(*html.Node)
+		walk = func(n *html.Node) {
+			if n != nil {
+				if n.Type == html.ElementNode && n.Data == "button" {
+					hasButton = true
+				}
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					walk(c)
+				}
+			}
+		}
+		walk(doc)
+		if hasButton {
+			t.Error("<button> element survived reader-mode sanitization")
+		}
+	})
+}
+
+// TestDataURLGatesDocumentedDivergence pins the documented, deliberate
+// difference between the two data: URL gates: isValidDataURLWithAudit
+// tolerates \r\n-folded base64 (the attribute may stay in the sanitized DOM —
+// browsers strip the fold while decoding), while IsValidURL — whose accepted
+// URLs enter output text as Markdown/HTML constructs, where a raw newline
+// breaks the link destination — rejects it. The both-accept and both-reject
+// cases frame the relationship; the policies and their rationale are
+// documented at both scan sites.
+func TestDataURLGatesDocumentedDivergence(t *testing.T) {
+	t.Parallel()
+
+	folded := "data:image/png;base64,AB\r\nCD"
+	plain := "data:image/png;base64,ABCD"
+	unsafe := "data:image/png;base64,A<B"
+
+	if !isValidDataURLWithAudit(folded, NoOpAuditRecorder{}) {
+		t.Error("sanitizer gate rejected folded base64 (it must tolerate the fold for DOM retention)")
+	}
+	if IsValidURL(folded) {
+		t.Error("IsValidURL accepted folded base64 (the output-facing gate must reject raw newlines)")
+	}
+	if !isValidDataURLWithAudit(plain, NoOpAuditRecorder{}) || !IsValidURL(plain) {
+		t.Error("both gates must accept a plain well-formed base64 data URL")
+	}
+	if isValidDataURLWithAudit(unsafe, NoOpAuditRecorder{}) || IsValidURL(unsafe) {
+		t.Error("both gates must reject a data part with markup bytes")
 	}
 }

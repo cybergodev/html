@@ -338,48 +338,10 @@ func TestCacheStartCleanup(t *testing.T) {
 	}
 }
 
-func TestCacheStopCleanup(t *testing.T) {
-	cache := NewCache[string](100, time.Hour)
-
-	// Start cleanup
-	cancel := cache.StartCleanup(time.Minute)
-	if cancel == nil {
-		t.Fatal("StartCleanup should return a cancel function")
-	}
-
-	// Stop cleanup
-	cache.StopCleanup()
-
-	// Should be safe to call multiple times
-	cache.StopCleanup()
-	cache.StopCleanup()
-}
-
-func TestCacheCleanupIdempotent(t *testing.T) {
-	cache := NewCache[string](100, time.Hour)
-
-	// Multiple calls to StartCleanup should only start one goroutine
-	cancel1 := cache.StartCleanup(time.Minute)
-	cancel2 := cache.StartCleanup(time.Minute)
-	cancel3 := cache.StartCleanup(time.Minute)
-
-	// Only the first call should return a valid cancel function
-	// Subsequent calls may return nil or the same cancel
-	if cancel1 == nil {
-		t.Error("First StartCleanup should return a cancel function")
-	}
-
-	// Clean up
-	if cancel1 != nil {
-		cancel1()
-	}
-	if cancel2 != nil {
-		cancel2()
-	}
-	if cancel3 != nil {
-		cancel3()
-	}
-}
+// Removed TestCacheStopCleanup and TestCacheCleanupIdempotent (no meaningful
+// assertions): repeated StopCleanup and repeated StartCleanup are pinned with
+// real oracles by TestCacheStartRestartConcurrent (no-panic + usable cancel)
+// and TestCacheMultipleStartCleanup (goroutine census) below.
 
 func TestCacheCleanupNoExpiredEntries(t *testing.T) {
 	if testing.Short() {
@@ -502,26 +464,6 @@ func TestCacheGoroutineCleanup(t *testing.T) {
 	}
 }
 
-// TestCacheExplicitStopCleanupClearsFinalizer verifies that calling StopCleanup
-// explicitly clears the finalizer to prevent double cleanup.
-func TestCacheExplicitStopCleanupClearsFinalizer(t *testing.T) {
-	cache := NewCache[string](100, time.Minute)
-	cache.StartCleanup(10 * time.Millisecond)
-
-	// Stop cleanup explicitly
-	cache.StopCleanup()
-
-	// This should be safe and not cause issues
-	runtime.GC()
-	time.Sleep(50 * time.Millisecond)
-
-	// Verify cache is still usable (though cleanup is stopped)
-	cache.Set("test", "value")
-	if cache.Get("test") != "value" {
-		t.Error("Cache should still be functional after StopCleanup")
-	}
-}
-
 // TestCacheMultipleStartCleanup verifies that StartCleanup is idempotent
 // and only starts one cleanup goroutine even when called multiple times.
 func TestCacheMultipleStartCleanup(t *testing.T) {
@@ -550,12 +492,12 @@ func TestCacheMultipleStartCleanup(t *testing.T) {
 	cache.StopCleanup()
 }
 
-// TestCacheRestartCleanup covers Cache.RestartCleanup (previously 0%). A pooled
-// processor is Close()d (which StopCleanup()s the cache) and then reused; the
-// cache must be able to restart its background sweeper so expired entries do not
-// accumulate. This test drives that lifecycle directly: after StopCleanup a fresh
-// expired entry lingers, and after RestartCleanup it is evicted again.
-func TestCacheRestartCleanup(t *testing.T) {
+// TestCacheStopCleanupStopsEviction covers the sweeper's stop semantics. While
+// running, expired entries are evicted in the background; after StopCleanup (as
+// the owning Processor's Close does), a newly expired entry lingers because
+// nobody is sweeping — and a later StartCleanup cannot bring the sweeper back
+// (the Once is spent; documented on StartCleanup).
+func TestCacheStopCleanupStopsEviction(t *testing.T) {
 	t.Parallel()
 
 	cache := NewCache[string](4, 25*time.Millisecond)
@@ -583,10 +525,17 @@ func TestCacheRestartCleanup(t *testing.T) {
 		t.Fatal("after StopCleanup the expired entry should linger (no sweeper running)")
 	}
 
-	// Phase 3: RestartCleanup brings the sweeper back and the lingering entry is evicted.
-	cache.RestartCleanup(10 * time.Millisecond)
-	if !waitCacheLen(cache, 0, time.Second) {
-		t.Fatal("RestartCleanup did not resume eviction of expired entries")
+	// Phase 3: StartCleanup must not restart a spent sweeper — it returns a
+	// no-op cancel and eviction stays off.
+	cancel := cache.StartCleanup(10 * time.Millisecond)
+	if cancel == nil {
+		t.Fatal("StartCleanup after StopCleanup returned nil cancel func")
+	}
+	cancel()
+	cache.Set("still-lingering", "v")
+	time.Sleep(80 * time.Millisecond)
+	if cache.Len() == 0 {
+		t.Fatal("StartCleanup must not restart the sweeper after StopCleanup (the Once is spent)")
 	}
 }
 
@@ -603,14 +552,13 @@ func waitCacheLen(c *Cache[string], want int, timeout time.Duration) bool {
 	return c.Len() == want
 }
 
-// TestCacheStartRestartConcurrent pins the internal serialization of the
-// cleanup lifecycle: RestartCleanup resets cleanupOnce under cleanupMu, and
-// StartCleanup's Once.Do runs under that same lock. A concurrent mix of
-// StartCleanup/StopCleanup/RestartCleanup on one Cache must not race on the
-// cleanupOnce field (run with -race; before Do() was moved inside the
-// critical section this test trips the race detector), must not panic, and
-// must leave a Cache whose StartCleanup still returns a usable CancelFunc.
-func TestCacheStartRestartConcurrent(t *testing.T) {
+// TestCacheStartStopConcurrent pins the internal serialization of the cleanup
+// lifecycle: StartCleanup's Once.Do runs under cleanupMu and StopCleanup takes
+// the same lock. A concurrent mix of StartCleanup/StopCleanup on one Cache must
+// not race on the cleanupOnce/cleanupCancel fields (run with -race), must not
+// panic, and must leave a Cache whose StartCleanup still returns a usable
+// CancelFunc.
+func TestCacheStartStopConcurrent(t *testing.T) {
 	t.Parallel()
 
 	cache := NewCache[string](16, time.Minute)
@@ -626,26 +574,24 @@ func TestCacheStartRestartConcurrent(t *testing.T) {
 			defer wg.Done()
 			for i := range iterations {
 				// Rotate operations within each goroutine so StartCleanup
-				// and RestartCleanup genuinely overlap across goroutines.
-				switch (mode + i) % 3 {
-				case 0:
+				// and StopCleanup genuinely overlap across goroutines.
+				if (mode+i)%2 == 0 {
 					cancel := cache.StartCleanup(time.Millisecond)
 					cancel() // returned CancelFunc must always be callable
-				case 1:
+				} else {
 					cache.StopCleanup()
-				default:
-					cache.RestartCleanup(time.Millisecond)
 				}
 			}
 		}(g)
 	}
 	wg.Wait()
 
-	// The lifecycle must remain usable after the hammering.
-	cache.RestartCleanup(time.Millisecond)
+	// The lifecycle must remain usable after the hammering. After any
+	// concurrent Stop the Once may be spent, in which case this returns the
+	// documented no-op cancel — either way non-nil and callable.
 	cancel := cache.StartCleanup(time.Millisecond)
 	if cancel == nil {
-		t.Fatal("StartCleanup returned a nil CancelFunc after concurrent Start/Stop/Restart")
+		t.Fatal("StartCleanup returned a nil CancelFunc after concurrent Start/Stop")
 	}
 	cancel()
 }
@@ -778,5 +724,119 @@ func TestCacheEvictOnePrefersExpired(t *testing.T) {
 	}
 	if got := c.Len(); got != 4 {
 		t.Errorf("Len() = %d, want 4 after evicting one expired entry", got)
+	}
+}
+
+// TestCacheStartCleanupAfterStopReturnsUsableCancel pins that StartCleanup
+// still returns a usable CancelFunc after an explicit StopCleanup (the
+// pooled-processor reuse path: Close() stops the sweeper, a later user
+// starts it again). From p2_regression_test.go.
+func TestCacheStartCleanupAfterStopReturnsUsableCancel(t *testing.T) {
+	t.Parallel()
+	c := NewCache[string](4, 0)
+	cancel := c.StartCleanup(0)
+	if cancel != nil {
+		cancel()
+	}
+	c.StopCleanup()
+	cancel2 := c.StartCleanup(0)
+	if cancel2 == nil {
+		t.Fatal("StartCleanup after StopCleanup returned nil cancel func")
+	}
+	cancel2() // must not panic
+}
+
+// TestConcurrentCacheCleanupLifecycle pins the serialization contract
+// documented on Cache: StartCleanup and StopCleanup are safe to call
+// concurrently with each other and with Get/Set/Clear. StartCleanup's Once.Do
+// runs under cleanupMu; a regression that moves it outside the lock trips the
+// race detector here. The final census additionally verifies that the last
+// StopCleanup leaves no cleanup goroutine behind. (Merged from
+// cache_lifecycle_race_test.go.)
+func TestConcurrentCacheCleanupLifecycle(t *testing.T) {
+	runtime.GC()
+	time.Sleep(5 * time.Millisecond)
+	initial := runtime.NumGoroutine()
+
+	cache := NewCache[string](64, 10*time.Millisecond)
+
+	var wg sync.WaitGroup
+
+	// Data traffic: hammers the entry mutex while the lifecycle goroutines
+	// below churn the cleanup goroutine.
+	for i := range 4 {
+		wg.Go(func() {
+			for j := range 400 {
+				key := fmt.Sprintf("k%d-%d", i, j%8)
+				cache.Set(key, j)
+				cache.Get(key)
+				if j%50 == 0 {
+					cache.Clear()
+				}
+			}
+		})
+	}
+
+	// Lifecycle churn: concurrent Start/Stop at staggered intervals so a
+	// stop frequently lands between another goroutine's Once.Do and its
+	// return.
+	for i := range 3 {
+		wg.Go(func() {
+			interval := time.Duration(i+1) * time.Millisecond
+			for j := range 60 {
+				if (i+j)%2 == 0 {
+					cache.StartCleanup(interval)
+				} else {
+					cache.StopCleanup()
+				}
+			}
+		})
+	}
+
+	wg.Wait()
+	cache.StopCleanup()
+
+	// Settle past the longest interval used (3ms), then require the goroutine
+	// census to return to its starting count: the final StopCleanup must have
+	// cancelled the last cleanup goroutine, and nothing starts a new one.
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	if final := runtime.NumGoroutine(); final > initial+1 {
+		t.Errorf("cleanup goroutine leak: initial=%d final=%d", initial, final)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LRU link guard branches ([FIX-001] boundary additions)
+// ---------------------------------------------------------------------------
+
+// TestCacheLRULinkGuards drives the doubly-linked-list helpers' degenerate
+// receiver branches directly (nil entry, head sentinel, tail sentinel): they
+// must be no-ops that leave the list and Len unchanged.
+func TestCacheLRULinkGuards(t *testing.T) {
+	t.Parallel()
+
+	c := NewCache[string](3, 0)
+	c.Set("a", 1)
+	c.Set("b", 2)
+
+	before := c.Len()
+
+	c.moveToFront(nil)    // nil entry
+	c.moveToFront(c.head) // head sentinel
+	c.moveToFront(c.tail) // tail sentinel
+	c.addToFront(nil)
+	c.removeNode(nil)
+	c.removeNode(c.head)
+	c.removeNode(c.tail)
+
+	if got := c.Len(); got != before {
+		t.Errorf("Len changed from %d to %d after no-op guard calls", before, got)
+	}
+	if got := c.Get("a"); got != 1 {
+		t.Errorf("Get(a) = %v after guard calls, want 1", got)
+	}
+	if got := c.Get("b"); got != 2 {
+		t.Errorf("Get(b) = %v after guard calls, want 2", got)
 	}
 }

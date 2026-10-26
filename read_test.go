@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -472,6 +473,67 @@ func TestReadPageAdjacentSectionMerge(t *testing.T) {
 	if len(nav.Links) != 2 {
 		t.Fatalf("merged nav links = %d, want 2", len(nav.Links))
 	}
+}
+
+// TestReadPageAdjacentSectionMergeImages pins C-1: merging adjacent same-kind
+// sections must concatenate Images alongside Links — the second nav's logo
+// used to be silently dropped while its links survived.
+func TestReadPageAdjacentSectionMergeImages(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<nav><a href="/a">MenuA</a><img src="/logo-a.png" alt="logo a"></nav>
+		<nav><a href="/b">MenuB</a><img src="/logo-b.png" alt="logo b"></nav>
+		<main><p>One main region with enough words to dominate and be selected without ambiguity whatsoever.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	want := []SectionKind{SectionNavigation, SectionMain}
+	if got := readerSectionKinds(t, page); !slices.Equal(got, want) {
+		t.Fatalf("kinds = %v, want %v (adjacent navs must merge)", got, want)
+	}
+	nav := page.Sections[0]
+	if len(nav.Links) != 2 {
+		t.Fatalf("merged nav links = %d, want 2", len(nav.Links))
+	}
+	if len(nav.Images) != 2 {
+		t.Fatalf("merged nav images = %d, want 2 (a merged section's images must concatenate like its links)", len(nav.Images))
+	}
+	if nav.Images[1].URL != "/logo-b.png" {
+		t.Fatalf("merged nav images = %v, want the second nav's logo kept", nav.Images)
+	}
+}
+
+// TestReadPageOrderedListMarkerContinuation pins M-1 end to end: an ordered
+// list item whose label is wrapped in <p> keeps the label on its "N." marker
+// line, exactly as the unordered form does.
+func TestReadPageOrderedListMarkerContinuation(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<nav>
+			<ol><li><p><a href="/o1">OL-Label</a></p></li></ol>
+		</nav>
+		<main><p>Main article body with a reasonable amount of text so the region is identified without ambiguity here.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	for _, s := range page.Sections {
+		if s.Kind != SectionNavigation {
+			continue
+		}
+		if !strings.Contains(s.Text, "1. [OL-Label](/o1)") {
+			t.Fatalf("nav text = %q, want the ordered marker and its label on one line", s.Text)
+		}
+		return
+	}
+	t.Fatal("no navigation section found")
 }
 
 func TestReadPageEmptyAndErrors(t *testing.T) {
@@ -1412,5 +1474,82 @@ func TestReadPageTableLinks(t *testing.T) {
 		if strings.Contains(sec.PlainText, "](/events/q3-call)") {
 			t.Errorf("plain text leaked a link construct:\n%s", sec.PlainText)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative-cancellation stage boundaries ([FIX-001] boundary additions)
+// ---------------------------------------------------------------------------
+
+// cancelAfterCtx cancels itself after its Done method has been probed n
+// times, letting a test stop a cooperative-cancellation pipeline at an exact
+// stage: each `select { case <-ctx.Done(); default: }` probe decrements the
+// countdown, and the probe that reaches zero sees the closed channel.
+type cancelAfterCtx struct {
+	mu        sync.Mutex
+	remaining int32
+	done      chan struct{}
+}
+
+func newCancelAfter(n int32) *cancelAfterCtx {
+	return &cancelAfterCtx{remaining: n, done: make(chan struct{})}
+}
+
+func (c *cancelAfterCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *cancelAfterCtx) Done() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.remaining--
+	if c.remaining <= 0 {
+		select {
+		case <-c.done:
+			// already closed
+		default:
+			close(c.done)
+		}
+	}
+	return c.done
+}
+
+func (c *cancelAfterCtx) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.remaining <= 0 {
+		return context.Canceled
+	}
+	return nil
+}
+
+func (c *cancelAfterCtx) Value(any) any { return nil }
+
+// TestReadContentCooperativeCancellationStages pins that every cancellation
+// checkpoint in readContentWithContext (entry, pre-parse, post-parse,
+// post-sanitize) returns the caller's context error. Each row cancels after
+// exactly that many Done() probes, so all four selects are reached
+// deterministically.
+func TestReadContentCooperativeCancellationStages(t *testing.T) {
+	t.Parallel()
+
+	p, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+
+	const doc = `<html><body><article><p>Body text.</p></article></body></html>`
+	stages := []string{"entry", "pre-parse", "post-parse", "post-sanitize"}
+
+	for i, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			t.Parallel()
+			rr, err := p.readContentWithContext(newCancelAfter(int32(i+1)), doc)
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("readContentWithContext(cancel at %s) error = %v, want context.Canceled", stage, err)
+			}
+			if rr != nil {
+				t.Errorf("readContentWithContext(cancel at %s) = %+v, want nil result", stage, rr)
+			}
+		})
 	}
 }

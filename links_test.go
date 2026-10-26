@@ -12,6 +12,7 @@ package html_test
 //     position so placeholders stay aligned with Result.Links.
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -253,4 +254,66 @@ func TestEmbedLinkTitleFallbacks(t *testing.T) {
 			t.Errorf("embed URL %s missing from links: %+v", tt.src, links)
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Package-level links wrappers with context (from the dissolved boundary_test.go)
+// ---------------------------------------------------------------------------
+
+// TestPackageLevelLinksWithContext covers the WithContext entry points of the
+// links family.
+func TestPackageLevelLinksWithContext(t *testing.T) {
+	t.Parallel()
+
+	linkHTML := `<html><body><a href="https://example.com">Link</a></body></html>`
+
+	t.Run("ExtractAllLinksWithContext", func(t *testing.T) {
+		links, err := html.ExtractAllLinksWithContext(context.Background(), []byte(linkHTML))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(links) == 0 {
+			t.Error("expected at least one link")
+		}
+	})
+
+	t.Run("ExtractAllLinksFromFileWithContext", func(t *testing.T) {
+		tmpFile := writeTempHTML(t, linkHTML)
+
+		links, err := html.ExtractAllLinksFromFileWithContext(context.Background(), tmpFile)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(links) == 0 {
+			t.Error("expected at least one link")
+		}
+	})
+}
+
+// TestPackageLevelLinksWithContext_ErrorPaths covers the error branches of the
+// package-level ExtractAllLinksWithContext family: file-not-found and
+// cancelled-context scenarios.
+func TestPackageLevelLinksWithContext_ErrorPaths(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ExtractAllLinksFromFileWithContext non-existent file", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := html.ExtractAllLinksFromFileWithContext(context.Background(), "nonexistent.html")
+		if err == nil {
+			t.Error("expected error for non-existent file")
+		}
+	})
+
+	t.Run("ExtractAllLinksWithContext cancelled context", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := html.ExtractAllLinksWithContext(ctx, []byte(`<html><body><a href="x">x</a></body></html>`))
+		if err == nil {
+			t.Error("expected error for cancelled context")
+		}
+	})
 }

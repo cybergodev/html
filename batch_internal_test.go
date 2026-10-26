@@ -133,3 +133,64 @@ func TestRecoverPanicWrapsAsErrInternalPanic(t *testing.T) {
 		t.Errorf("normal path = (%q, %v), want (%q, ErrProcessorClosed)", v, err, "ok")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Mid-batch cancellation accounting ([FIX-001] boundary additions)
+// ---------------------------------------------------------------------------
+
+// TestRunBatchWithContextCancelMidBatch cancels the context while the single
+// configured worker is blocked inside an extractor, so the queued item is
+// stopped by one of the dispatch-stage cancellation checks (before or while
+// acquiring the worker semaphore). Whichever branch takes it, the accounting
+// invariant must hold: Success+Failed+Cancelled equals the item count and no
+// result slot is both filled and errored.
+func TestRunBatchWithContextCancelMidBatch(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.WorkerPoolSize = 1
+	cfg.MaxCacheEntries = 0
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan *BatchResult, 1)
+
+	go func() {
+		done <- p.runBatchWithContext(ctx, []extractFunc{
+			func() (*Result, error) {
+				close(started)
+				<-release
+				return &Result{Title: "first"}, nil
+			},
+			func() (*Result, error) {
+				return &Result{Title: "second"}, nil
+			},
+		})
+	}()
+
+	<-started // worker 0 now holds the semaphore inside its extractor
+	cancel()  // queued item now hits a dispatch-stage cancellation check
+	close(release)
+
+	br := <-done
+
+	if got := br.Success + br.Failed + br.Cancelled; got != 2 {
+		t.Errorf("Success+Failed+Cancelled = %d, want 2 (accounting must cover every item)", got)
+	}
+	if br.Success == 0 || br.Results[0] == nil {
+		t.Errorf("blocked item's result lost: %+v", br)
+	}
+	for i, r := range br.Results {
+		if r != nil && br.Errors[i] != nil {
+			t.Errorf("item %d has both a result and an error", i)
+		}
+	}
+}

@@ -525,3 +525,59 @@ func TestScanMediaURLsCapAndEarlyStop(t *testing.T) {
 		t.Fatalf("early stop: first callback saw %q", first)
 	}
 }
+
+// TestScanMediaURLsMultibyteRunMatchesOracle pins that the URL run cap counts
+// runes, not bytes: 250 CJK characters = 750 bytes, and a byte-counted {1,500}
+// cap used to truncate the run before the ".mp4" while the oracle regex
+// (which counts runes) still matched.
+func TestScanMediaURLsMultibyteRunMatchesOracle(t *testing.T) {
+	t.Parallel()
+	content := "https://a.test/" + strings.Repeat("中", 250) + ".mp4"
+	var got []string
+	ScanMediaURLs(content, true, 10, func(u string) bool {
+		got = append(got, u)
+		return true
+	})
+	re := regexp.MustCompile(`(?i)https?://[^\s<>"',;)}\]]{1,500}\.(?:mp4|m4v|webm)`)
+	want := re.FindAllString(content, -1)
+	if len(want) == 0 {
+		t.Fatal("oracle regex found no match; test input is wrong")
+	}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("ScanMediaURLs = %v, oracle = %v", got, want)
+	}
+}
+
+// TestIsValidMediaType pins the data-URL media-type validator at its format
+// edges: empty, missing/misplaced slash, trailing slash, and disallowed
+// characters.
+func TestIsValidMediaType(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		mediaType string
+		want      bool
+	}{
+		{"image/png", true},
+		{"image/svg+xml", true},
+		{"text/plain", true},
+		{"application/x-custom.v2+json", true},
+		{"", false},            // empty
+		{"imagepng", false},    // no slash
+		{"/png", false},        // slash at index 0
+		{"image/", false},      // trailing slash
+		{"image/png ", false},  // whitespace
+		{"image/pn;g", false},  // semicolon
+		{"image/pn\"g", false}, // quote
+		{"image/pn(g)", false}, // parentheses
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.mediaType, func(t *testing.T) {
+			t.Parallel()
+			if got := isValidMediaType(tt.mediaType); got != tt.want {
+				t.Errorf("isValidMediaType(%q) = %v, want %v", tt.mediaType, got, tt.want)
+			}
+		})
+	}
+}

@@ -6,7 +6,7 @@
 [![Security](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
 [![Thread Safe](https://img.shields.io/badge/thread%20safe-yes-brightgreen.svg)](#-线程安全)
 
-**一个高性能的 Go 库，用于智能 HTML 内容提取**，基于 `golang.org/x/net/html` 构建。
+**一个从 HTML 页面提取纯净文本、结构化元数据、链接与媒体的 Go 库**，基于 `golang.org/x/net/html` 构建。
 
 **[English Documentation](README.md)** | **[www.cybergo.dev/html](https://www.cybergo.dev/html)**
 
@@ -17,7 +17,7 @@
 | 特性 | 描述 |
 |------|------|
 | 🚀 **一行代码提取** | 单个函数调用即可从 HTML 提取纯净文本 |
-| 🔍 **智能文章检测** | 使用评分算法识别主要内容 |
+| 🔍 **文章检测** | 通过评分算法识别主要内容区块 |
 | 📋 **元数据提取** | 作者、发布时间、描述、站点名、规范链接 |
 | 🎚️ **提取置信度** | 每次提取附带质量信号(文章 / 列表页 / 回退 / 付费墙检测) |
 | 📖 **阅读模式** | 整页结构化阅读视图 —— 导航 / 主体 / 页脚等分区保留并标注,内联超链接,用于向 LLM 喂入纯净页面 |
@@ -26,7 +26,7 @@
 | 📦 **多种输出格式** | 文本、Markdown、JSON |
 | 🛡️ **安全优先** | HTML 净化、XSS 防护、审计日志 |
 | 🧵 **线程安全** | 无需外部同步即可并发使用 |
-| 🔗 **基于 golang.org/x/net/html** | 内部使用标准 HTML 解析器 |
+| 🔗 **基于 x/net/html** | 无自研解析器，采用 HTML5 容错解析 |
 
 ---
 
@@ -49,7 +49,7 @@
 go get github.com/cybergodev/html
 ```
 
-**版本**：Go 1.26+
+**版本**：Go 1.26+ · 运行依赖：`golang.org/x/net`（HTML 解析）、`golang.org/x/text`（编码转换）
 
 ---
 
@@ -87,6 +87,7 @@ func main() {
 - ✅ 移除导航、页脚、广告、脚本
 - ✅ 使用评分算法检测主要内容
 - ✅ 处理字符编码（UTF-8、Windows-1252、GBK 等）
+- ✅ 标题以 Markdown 风格前缀输出（h1 → `#`，h2 → `##`）
 - ✅ 清理空白字符
 
 ---
@@ -132,7 +133,7 @@ func main() {
 
 ### 2️⃣ Processor 使用（推荐用于多次提取）
 
-对于多次提取，创建 Processor 以利用缓存：
+需要反复提取时请创建 Processor —— 调用之间的结果会被缓存（包级函数运行在禁用缓存的一次性 Processor 上）：
 
 ```go
 package main
@@ -198,6 +199,8 @@ func main() {
     fmt.Printf("找到 %d 张图片\n", len(result.Images))
 }
 ```
+
+> 上面的格式取值同时以常量形式导出：`html.FormatNone`、`html.FormatMarkdown`、`html.FormatHTML`、`html.FormatPlaceholder`（仅用于 `InlineImageFormat`）。
 
 ---
 
@@ -388,6 +391,10 @@ processor.ClearCache()
 // 重置统计（保留缓存条目）
 processor.ResetStatistics()
 ```
+
+> 缓存与统计仅存在于 `Processor` 上。包级便捷函数（`html.Extract`、
+> `html.ExtractToMarkdown` 等）运行在禁用缓存的一次性 Processor 上 ——
+> 需要缓存请通过 `New` 创建 `Processor`。
 
 ---
 
@@ -664,9 +671,9 @@ type Config struct {
     ExtractArticle  bool // 启用文章检测（默认：true）
     ExtractMetadata bool // 收集作者/发布时间/描述/站点名/规范链接元数据（默认：true）
     PreserveImages  bool // 提取图片（默认：true）
-    PreserveLinks  bool // 提取链接（默认：true）
-    PreserveVideos bool // 提取视频（默认：true）
-    PreserveAudios bool // 提取音频（默认：true）
+    PreserveLinks  bool  // 提取链接（默认：true）
+    PreserveVideos bool  // 提取视频（默认：true）
+    PreserveAudios bool  // 提取音频（默认：true）
 
     // === 输出格式 ===
     InlineImageFormat string // "none", "markdown", "html", "placeholder"
@@ -691,6 +698,21 @@ type Config struct {
 }
 ```
 
+### 校验限制
+
+`Config.Validate`（由 `New` 调用）会拒绝超出范围的取值：
+
+| 字段 | 有效范围 |
+|------|----------|
+| `MaxInputSize` | 1 – 50 MB |
+| `MaxCacheEntries` | 0 – 100,000（0 = 禁用） |
+| `CacheTTL`、`CacheCleanup` | ≥ 0 |
+| `WorkerPoolSize` | 1 – 256 |
+| `MaxDepth` | 1 – 500 |
+| `ProcessingTimeout` | ≥ 0（0 = 无超时） |
+| `Audit.MaxEntries` | 0 – 100,000（0 = 默认 10,000） |
+| `Audit.MaxRawValueLength` | ≥ 0（0 = 默认 200） |
+
 ### 默认配置值对比
 
 | 设置 | 默认值 | 高安全配置 |
@@ -703,6 +725,8 @@ type Config struct {
 | ProcessingTimeout | 30s | 10s |
 | MaxDepth | 500 | 100 |
 | Audit | 禁用 | 启用 |
+
+> **超大文档工作负载**:`ProcessingTimeout` 是墙钟截止时间,不是 CPU 时间。若你有意处理超大文档(数万节点以上)且处于 CPU 争抢环境——批量流水线、容器 CPU 限额、开启 race 插桩的测试构建——合法工作可能超出 30s 默认值,表现为 `ErrProcessingTimeout`。请按预期最大文档规模设定该值;若输入规模已由 `MaxInputSize` 约束,也可设为 `0` 关闭看门狗。
 
 ---
 
@@ -823,8 +847,6 @@ defer processor.Close()
 result, _ := processor.Extract(htmlBytes)
 fmt.Println(result.Text)
 ```
-
-详见 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) 获取完整的 API 参考和迁移指南。
 
 ---
 
@@ -972,6 +994,14 @@ if err != nil {
     }
 }
 ```
+
+如需更多上下文，可用 `errors.As()` 匹配结构化错误类型：
+
+- `*FileError` —— 文件访问失败；字段 `Op`、`Path`、`FileErr`，并提供返回脱敏路径的 `SafePath()`
+- `*InputError` —— 输入被拒绝；字段 `Op`、`Size`、`MaxSize`
+- `*ConfigError` —— 配置无效；字段 `Field`、`Value`、`Message`
+
+三者均解包到对应的哨兵错误，因此上面的 `errors.Is` 检查始终有效。
 
 ---
 

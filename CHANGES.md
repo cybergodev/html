@@ -4,6 +4,43 @@ All notable changes to the cybergodev/html library will be documented in this fi
 
 ---
 
+## v1.5.1 - Correctness Fixes, Reader-Mode Navigation & Performance (2026-10-27)
+
+### Fixed
+- Reader mode keeps desktop-visible chrome: Tailwind responsive/variant classes (`hidden md:block`, `xl:hidden`, `hover:hidden`, `print:hidden`) no longer count as hidden, and `<button>` menu labels unwrap to text instead of dropping
+- Reader mode: bare `hidden`/`hide` disclosure menus survive in chrome (collapsed token-classed main wrappers still drop), and `<li><p><a>` dropdown labels render on the list marker line
+- Merged adjacent reader sections concatenate `Images` — the merged-away section's images were silently dropped while its links survived
+- Inline `data:` URL images (safe media type, within `MaxDataURILength`) are no longer rejected by `IsValidURL`'s flat URL-length gate — they survive in `Result.Images`, `[IMAGE:n]` and `ExtractAllLinks`
+- `overflow-hidden` card wrappers and `xl:hidden` columns no longer match the trailing `hidden` token and drop whole visible subtrees on the Extract path and reader main sections
+- Ordered-list items continue their `N.` marker line across a wrapped `<li><p><a>` label instead of breaking it into a bare paragraph
+- `<template>`-nested table rows no longer render on the plain path — `TableFormat` no longer silently changes table content
+- Multi-line hiding styles (`color:red;\ndisplay:none`) and `behavior :` declaration spacing no longer evade hidden-element and dangerous-CSS checks
+- `text-align:center !important` (and the spaceless form) keeps its column alignment
+- `ToUTF8` strips the UTF-8 BOM on the unknown-encoding + valid-UTF-8 path, matching the utf-8 branch
+- Oversize `*InputError.Op` reports the true entry point (`ReadPageFromFile`, `ExtractAllLinksFromFile`, …) instead of a hardcoded `ExtractFromFile`
+- Custom-Scorer enumeration fallback picks its best candidate deterministically (first-wins in walk order) instead of randomized map-iteration ties
+
+### Added
+- Exported format-value constants `FormatNone`, `FormatMarkdown`, `FormatHTML`, `FormatPlaceholder` — byte-for-byte the existing values; presets and validation now reference them
+- `AuditConfig.Validate()`; `Config.Validate` delegates its audit-field checks with identical error fields and wrapping
+- CI: gosec security gate with triaged exclusions, and a `go test -race -count=2` stress job for order/timing-sensitive tests
+- Regression suites for concurrency race windows, panic surfaces, package-vs-Processor equivalence, and boundary coverage
+
+### Changed
+- `extract.go` split by pipeline stage (`extract_format/title/article/links/stats.go`) — pure code motion, no API or behavior change
+- `ProcessingTimeout` documented as wall-clock time, with guidance for batch pipelines and CPU-throttled containers
+- Godoc aligned with v1.5.0 behavior (metadata-first title ladder; `Close` has no package-level counterpart); examples switched to `Format*` constants with corrected flag semantics
+- Test suite consolidated 69 → 51 files with per-function coverage verified non-regressing
+- Internal-package surface trimmed (no public API change): exported-in-internal `IsHiddenElement`, `NodeSlicePool`, `RestartCleanup` and dead charset regex fallbacks removed
+
+### Performance
+- `[LINK:n]` position lookup is an allocation-free binary search over ascending positions — link-heavy formatting −16–20% sec/op, ~−10% B/op
+- `formatInlineImages` replaces the per-call replacer with a pooled scanner (−16% allocs/op); body text length is computed lazily; table cell text builds in pooled byte buffers
+- `ShouldRemove` folds class/id scanning into a single pass ordered removal-pattern-first — −5–6% on class-heavy documents; sanitize attribute policy maps became switches
+- `collapseInlineSpace` identity fast path cuts ~5% allocs/op on link-dense formatting
+
+---
+
 ## v1.5.0 - Reader Mode, Structured Metadata & Extraction Quality (2026-10-26)
 
 ### Added

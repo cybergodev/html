@@ -78,11 +78,12 @@ cfg := html.Config{
     Audit:              html.DefaultAuditConfig(), // Security audit logging (default: disabled; see Audit section in docs/SECURITY.md)
 
     // Content Extraction
-    ExtractArticle: true, // Enable article detection (default: true)
-    PreserveImages: true, // Extract image metadata (default: true)
-    PreserveLinks:  true, // Extract link metadata (default: true)
-    PreserveVideos: true, // Extract video metadata (default: true)
-    PreserveAudios: true, // Extract audio metadata (default: true)
+    ExtractArticle:  true, // Enable article detection (default: true)
+    ExtractMetadata: true, // Collect JSON-LD/OpenGraph metadata into Result fields and the title priority (default: true)
+    PreserveImages:  true, // Extract image metadata (default: true)
+    PreserveLinks:   true, // Extract link metadata (default: true)
+    PreserveVideos:  true, // Extract video metadata (default: true)
+    PreserveAudios:  true, // Extract audio metadata (default: true)
 
     // Output Formats
     InlineImageFormat: "none",      // "none", "markdown", "html", "placeholder" (default: "none")
@@ -283,7 +284,7 @@ defer processor.Close()
 
 ### Package-Level Convenience Functions
 
-All `Processor` methods have package-level convenience functions. Without a Config they reuse a pooled default-config processor (caching disabled — pooled processors are reset between uses); with a Config, a fresh one-shot processor is created and closed for that call. They accept an optional `cfg ...Config` parameter:
+Every method in the extraction families (content, text, formatted output, links, batch, reader mode) has a package-level convenience function; the lifecycle and statistics methods (`Close`, `GetStatistics`, `ClearCache`, `ResetStatistics`, `GetAuditLog`, `ClearAuditLog`) exist on `Processor` only. Without a Config the convenience functions reuse a pooled default-config processor (caching disabled — pooled processors are reset between uses); with a Config, a fresh one-shot processor is created and closed for that call. They accept an optional `cfg ...Config` parameter:
 
 ```go
 // Content extraction
@@ -352,7 +353,7 @@ for i, result := range br.Results {
 ```go
 type Result struct {
     Text             string        // Extracted clean text
-    Title            string        // Page/article title (JSON-LD headline > og:title > <title>)
+    Title            string        // Page/article title (JSON-LD headline > og:title > <title>, then h1/h2 fallbacks)
     Images           []ImageInfo   // Image metadata
     Links            []LinkInfo    // Link metadata
     Videos           []VideoInfo   // Video metadata
@@ -370,10 +371,12 @@ type Result struct {
 }
 ```
 
-The metadata fields (`Author` … `CanonicalURL`) and the metadata-based title priority are
-populated when `Config.ExtractMetadata` is true (the default); with it false the fields
-stay empty and `Title` falls back to the `<title>` tag. See
-`examples/12_metadata_quality/` for the priority ladders and quality signals.
+The metadata fields (`Author` … `CanonicalURL`) and the metadata-based title priority
+(JSON-LD article headline > og:title > WebPage/WebSite JSON-LD name) are populated when
+`Config.ExtractMetadata` is true (the default); with it false the fields stay empty and
+`Title` falls back to the DOM ladder: `<title>`, then the article's own h1, the first
+document h1, and the first h2. See `examples/12_metadata_quality/` for the priority
+ladders and quality signals.
 
 ### ReadResult
 

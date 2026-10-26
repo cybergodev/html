@@ -36,7 +36,7 @@ func TestReadBounded(t *testing.T) {
 	t.Run("empty input", func(t *testing.T) {
 		t.Parallel()
 
-		data, err := p.readBounded(strings.NewReader(""), "x.html")
+		data, err := p.readBounded(strings.NewReader(""), "x.html", "ExtractFromFile")
 		if err != nil {
 			t.Fatalf("readBounded(empty) error = %v", err)
 		}
@@ -48,7 +48,7 @@ func TestReadBounded(t *testing.T) {
 	t.Run("exactly at limit", func(t *testing.T) {
 		t.Parallel()
 
-		data, err := p.readBounded(strings.NewReader(strings.Repeat("a", 1024)), "x.html")
+		data, err := p.readBounded(strings.NewReader(strings.Repeat("a", 1024)), "x.html", "ExtractFromFile")
 		if err != nil {
 			t.Fatalf("readBounded(at limit) error = %v", err)
 		}
@@ -60,7 +60,7 @@ func TestReadBounded(t *testing.T) {
 	t.Run("one byte over limit", func(t *testing.T) {
 		t.Parallel()
 
-		_, err := p.readBounded(strings.NewReader(strings.Repeat("a", 1025)), "x.html")
+		_, err := p.readBounded(strings.NewReader(strings.Repeat("a", 1025)), "x.html", "ExtractFromFile")
 		if !errors.Is(err, ErrInputTooLarge) {
 			t.Errorf("readBounded(over limit) error = %v, want ErrInputTooLarge", err)
 		}
@@ -69,7 +69,7 @@ func TestReadBounded(t *testing.T) {
 	t.Run("far over limit reads at most limit+1", func(t *testing.T) {
 		t.Parallel()
 
-		_, err := p.readBounded(strings.NewReader(strings.Repeat("a", 1<<20)), "x.html")
+		_, err := p.readBounded(strings.NewReader(strings.Repeat("a", 1<<20)), "x.html", "ExtractFromFile")
 		if !errors.Is(err, ErrInputTooLarge) {
 			t.Errorf("readBounded(1MB over 1KB limit) error = %v, want ErrInputTooLarge", err)
 		}
@@ -185,5 +185,27 @@ func TestReadContainedDirectoryInsideBaseDir(t *testing.T) {
 	var fileErr *FileError
 	if !errors.As(err, &fileErr) {
 		t.Errorf("ExtractFromFile(subdirectory inside base) = %v, want a *FileError", err)
+	}
+}
+
+// TestReadContainedOpenErrors pins readContained's os.Open error branches:
+// a non-existent path maps to the ErrFileNotFound sentinel, and an invalid
+// path name (NUL byte) surfaces as a read error rather than panicking.
+func TestReadContainedOpenErrors(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.AllowedBaseDir = t.TempDir()
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+
+	if _, err := p.readContained("no-such-file.html", "ExtractFromFile"); !errors.Is(err, ErrFileNotFound) {
+		t.Errorf("readContained(non-existent) = %v, want ErrFileNotFound", err)
+	}
+	if _, err := p.readContained("bad\x00name.html", "ExtractFromFile"); err == nil {
+		t.Error("readContained(NUL in name) = nil error, want an open error")
 	}
 }

@@ -243,7 +243,7 @@ func (p *Processor) ReadPageFromFile(filePath string) (*ReadResult, error) {
 		if p == nil || p.closed.Load() {
 			return nil, ErrProcessorClosed
 		}
-		data, err := p.validateAndReadFile(filePath)
+		data, err := p.validateAndReadFile(filePath, "ReadPageFromFile")
 		if err != nil {
 			return nil, err
 		}
@@ -268,7 +268,7 @@ func (p *Processor) ReadPageFromFileWithContext(ctx context.Context, filePath st
 		if p == nil || p.closed.Load() {
 			return nil, ErrProcessorClosed
 		}
-		data, err := p.validateAndReadFile(filePath)
+		data, err := p.validateAndReadFile(filePath, "ReadPageFromFile")
 		if err != nil {
 			return nil, err
 		}
@@ -368,7 +368,7 @@ func (p *Processor) ReadPageFromFileToMarkdown(filePath string) (string, error) 
 		if p == nil || p.closed.Load() {
 			return "", ErrProcessorClosed
 		}
-		data, err := p.validateAndReadFile(filePath)
+		data, err := p.validateAndReadFile(filePath, "ReadPageFromFileToMarkdown")
 		if err != nil {
 			return "", err
 		}
@@ -396,7 +396,7 @@ func (p *Processor) ReadPageFromFileToMarkdownWithContext(ctx context.Context, f
 		if p == nil || p.closed.Load() {
 			return "", ErrProcessorClosed
 		}
-		data, err := p.validateAndReadFile(filePath)
+		data, err := p.validateAndReadFile(filePath, "ReadPageFromFileToMarkdown")
 		if err != nil {
 			return "", err
 		}
@@ -419,7 +419,7 @@ func (p *Processor) ReadPageFromFileToMarkdownText(filePath string) (string, err
 		if p == nil || p.closed.Load() {
 			return "", ErrProcessorClosed
 		}
-		data, err := p.validateAndReadFile(filePath)
+		data, err := p.validateAndReadFile(filePath, "ReadPageFromFileToMarkdownText")
 		if err != nil {
 			return "", err
 		}
@@ -445,7 +445,7 @@ func (p *Processor) ReadPageFromFileToMarkdownTextWithContext(ctx context.Contex
 		if p == nil || p.closed.Load() {
 			return "", ErrProcessorClosed
 		}
-		data, err := p.validateAndReadFile(filePath)
+		data, err := p.validateAndReadFile(filePath, "ReadPageFromFileToMarkdownText")
 		if err != nil {
 			return "", err
 		}
@@ -896,10 +896,10 @@ func (p *Processor) sectionText(spec *internal.PageSectionSpec, imageCounter, li
 }
 
 // mergeAdjacentSections merges consecutive sections of the same kind into one
-// (their text joined by a blank line, links concatenated, word counts
-// summed), keeping document order. Multiple header or navigation regions are
-// common (top bar + sidebar menu); one labeled block per kind run reads
-// cleaner for text-only consumers.
+// (their text joined by a blank line, links and images concatenated, word
+// counts summed), keeping document order. Multiple header or navigation
+// regions are common (top bar + sidebar menu); one labeled block per kind run
+// reads cleaner for text-only consumers.
 func mergeAdjacentSections(sections []PageSection) []PageSection {
 	if len(sections) == 0 {
 		return sections
@@ -918,6 +918,10 @@ func mergeAdjacentSections(sections []PageSection) []PageSection {
 			prev.PlainText += s.PlainText
 			prev.WordCount += s.WordCount
 			prev.Links = append(prev.Links, s.Links...)
+			// Images concatenate exactly like Links: a merged-away section's
+			// images used to be dropped here while its links survived — silent
+			// data loss for any adjacent same-kind regions carrying logos.
+			prev.Images = append(prev.Images, s.Images...)
 			continue
 		}
 		merged = append(merged, s)

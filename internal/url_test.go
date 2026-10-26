@@ -71,6 +71,16 @@ func TestExtractBaseFromURL(t *testing.T) {
 			url:  "https://example.com/path?query=value",
 			want: "https://example.com/",
 		},
+		{
+			name: "query only drops to root (from p2_regression_test.go)",
+			url:  "https://example.com?ref=x",
+			want: "https://example.com/",
+		},
+		{
+			name: "path then query drops to root (from p2_regression_test.go)",
+			url:  "https://example.com/p?ref=x",
+			want: "https://example.com/",
+		},
 	}
 
 	for _, tt := range tests {
@@ -324,32 +334,6 @@ func TestResolveURL(t *testing.T) {
 // TestIsExternalURL_CaseInsensitiveScheme verifies scheme matching is
 // case-insensitive per RFC 3986 §3.1, matching browser behavior. A
 // case-sensitive test misclassifies uppercase-scheme URLs as relative/internal.
-func TestIsExternalURL_CaseInsensitiveScheme(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name string
-		url  string
-		want bool
-	}{
-		{"lowercase http", "http://example.com", true},
-		{"uppercase http", "HTTP://example.com", true},
-		{"mixedcase http", "Http://example.com", true},
-		{"uppercase https", "HTTPS://example.com", true},
-		{"mixedcase https", "hTtPs://example.com", true},
-		{"protocol-relative", "//example.com", true},
-		{"relative path", "/path/page", false},
-		{"schemeless", "example.com", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := IsExternalURL(tt.url); got != tt.want {
-				t.Errorf("IsExternalURL(%q) = %v, want %v", tt.url, got, tt.want)
-			}
-		})
-	}
-}
-
 // TestNormalizeBaseURL_CaseInsensitiveScheme verifies an uppercase scheme is
 // still recognized as HTTP and normalized rather than dropped as a non-HTTP URL.
 func TestNormalizeBaseURL_CaseInsensitiveScheme(t *testing.T) {
@@ -487,5 +471,34 @@ func TestResolveURLQueryOnlyOverFragmentBase(t *testing.T) {
 		if got := ResolveURL(c.base, c.ref); got != c.want {
 			t.Errorf("ResolveURL(%q, %q) = %q, want %q", c.base, c.ref, got, c.want)
 		}
+	}
+}
+
+// TestAsDirectoryBase pins all three branches of asDirectoryBase: an
+// already-directory base is unchanged, a file-style base drops its last
+// segment, and an authority-only base gains a trailing slash.
+func TestAsDirectoryBase(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		base string
+		want string
+	}{
+		{"already a directory base", "https://example.com/path/", "https://example.com/path/"},
+		{"file-style base drops last segment", "https://example.com/path/page.html", "https://example.com/path/"},
+		{"root file drops to root", "https://example.com/page.html", "https://example.com/"},
+		{"authority without path gains slash", "http://example.com", "http://example.com/"},
+		{"relative directory base unchanged", "dir/sub/", "dir/sub/"},
+		{"relative file base drops to its directory", "dir/sub/page.html", "dir/sub/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := asDirectoryBase(tt.base); got != tt.want {
+				t.Errorf("asDirectoryBase(%q) = %q, want %q", tt.base, got, tt.want)
+			}
+		})
 	}
 }

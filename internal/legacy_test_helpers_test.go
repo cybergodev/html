@@ -86,6 +86,14 @@ func SanitizeHTML(htmlContent string) string {
 	return SanitizeHTMLWithAudit(htmlContent, NoOpAuditRecorder{})
 }
 
+// sanitizeNodeWithAudit sanitizes n and its entire subtree in place, with the
+// Extract-path semantics (no button unwrap). SanitizeHTMLWithAudit's string
+// round-trip goes through it; production goes through SanitizeDOM /
+// SanitizeDOMReader, so the wrapper lives here with its only caller.
+func sanitizeNodeWithAudit(n *html.Node, audit AuditRecorder) {
+	sanitizeNodeWithAuditMode(n, audit, false)
+}
+
 // SanitizeHTMLWithAudit sanitizes an HTML string and records security events.
 //
 // Production sanitizes the already-parsed tree in place (SanitizeDOM), so the

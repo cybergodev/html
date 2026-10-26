@@ -42,7 +42,7 @@ func (p *Processor) ExtractAllLinksFromFile(filePath string) ([]LinkResource, er
 			return nil, ErrProcessorClosed
 		}
 
-		data, err := p.validateAndReadFile(filePath)
+		data, err := p.validateAndReadFile(filePath, "ExtractAllLinksFromFile")
 		if err != nil {
 			return nil, err
 		}
@@ -78,7 +78,7 @@ func (p *Processor) ExtractAllLinksFromFileWithContext(ctx context.Context, file
 			return nil, ErrProcessorClosed
 		}
 
-		data, err := p.validateAndReadFile(filePath)
+		data, err := p.validateAndReadFile(filePath, "ExtractAllLinksFromFile")
 		if err != nil {
 			return nil, err
 		}

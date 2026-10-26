@@ -134,6 +134,19 @@ func TestGetCellAlign(t *testing.T) {
 			wantAlign: table.AlignCenter,
 		},
 		{
+			// "!important" is a priority marker, not part of the value; both
+			// spellings must keep the alignment (the spaceless form used to
+			// miss because '!' is not a CSS boundary character).
+			name:      "style with !important",
+			html:      `<table><tr><td style="text-align:center !important">Text</td></tr></table>`,
+			wantAlign: table.AlignCenter,
+		},
+		{
+			name:      "style with spaceless !important",
+			html:      `<table><tr><td style="text-align:center!important">Text</td></tr></table>`,
+			wantAlign: table.AlignCenter,
+		},
+		{
 			name:      "align takes precedence over style",
 			html:      `<table><tr><td align="left" style="text-align:center">Text</td></tr></table>`,
 			wantAlign: table.AlignLeft,
@@ -748,5 +761,28 @@ func TestTableColspanExpansion(t *testing.T) {
 				t.Errorf("%s: expected content %q not found in output %q", tc.description, tc.expectedContent, result)
 			}
 		})
+	}
+}
+
+// TestHTMLCellAccessorNilGuards pins the nil-node branches of every
+// htmlCellAccessor method (internal/table.go).
+func TestHTMLCellAccessorNilGuards(t *testing.T) {
+	t.Parallel()
+
+	a := &htmlCellAccessor{}
+	if got := a.GetAlignment(nil); got != table.AlignDefault {
+		t.Errorf("GetAlignment(nil) = %v, want AlignDefault", got)
+	}
+	if got := a.GetColSpan(nil); got != 1 {
+		t.Errorf("GetColSpan(nil) = %d, want 1", got)
+	}
+	if got := a.GetRowSpan(nil); got != 1 {
+		t.Errorf("GetRowSpan(nil) = %d, want 1", got)
+	}
+	if got := a.GetWidth(nil); got != "" {
+		t.Errorf("GetWidth(nil) = %q, want empty", got)
+	}
+	if got := a.GetTextContent(nil); got != "" {
+		t.Errorf("GetTextContent(nil) = %q, want empty", got)
 	}
 }

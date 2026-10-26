@@ -268,6 +268,69 @@ func TestGetRendererDispatch(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Unexported render helpers (from render_internal_test.go)
+// ---------------------------------------------------------------------------
+
+// TestSpannedFill pins spannedFill's empty-text substitution: an empty cell
+// body becomes a single space so the rendered cell keeps its column, while
+// non-empty text passes through unchanged.
+func TestSpannedFill(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty text becomes single space", "", " "},
+		{"non-empty text unchanged", "value", "value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := spannedFill(tt.in)
+			if got.Text != tt.want {
+				t.Errorf("spannedFill(%q).Text = %q, want %q", tt.in, got.Text, tt.want)
+			}
+			if got.Align != AlignDefault || got.Colspan != 1 || got.Rowspan != 1 {
+				t.Errorf("spannedFill(%q) = %+v, want default alignment and 1x1 span", tt.in, got)
+			}
+		})
+	}
+}
+
+// TestSanitizeCellTextEmptyString pins sanitizeCellText's empty-string
+// substitution: a blank cell body becomes a single space so the rendered cell
+// keeps its column, while non-empty text passes through trimmed. The
+// external table_test package used to pin this through a mirrored helper
+// (sanitizeTestCellText); that mirror and its test were removed and the
+// rows live here against the production function.
+func TestSanitizeCellTextEmptyString(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty becomes single space", "", " "},
+		{"whitespace becomes single space", "   \t\n", " "},
+		{"non-empty trimmed", "  hello  ", "hello"},
+		{"newlines folded and trimmed", "\n\nText\n\n", "Text"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := sanitizeCellText(tt.in); got != tt.want {
+				t.Errorf("sanitizeCellText(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestExtractWithCellTextOverride pins the cell-text override at the table
 // layer (the root package exercises it end-to-end through ReadPage's section
 // rendering; ExtractWithCellText and its appendRowCells callback branches had
@@ -318,5 +381,111 @@ func TestExtractWithCellTextOverride(t *testing.T) {
 	p.Extract(tbl, tbPlain, "markdown")
 	if tbNil.String() != tbPlain.String() {
 		t.Errorf("nil cellText diverged from Extract:\n%q\n%q", tbNil.String(), tbPlain.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rowspan grid, alignment voting, and cell escaping boundaries
+// ([FIX-001] boundary additions)
+// ---------------------------------------------------------------------------
+
+// TestApplyRowspanGridBoundaries drives the grid rebuild's guard and fill
+// branches directly: degenerate inputs return the input unchanged, cells past
+// maxCols are dropped like the renderer drops them, and trailing columns
+// reserved by a rowspan from above are filled with spanned repeats.
+func TestApplyRowspanGridBoundaries(t *testing.T) {
+	t.Parallel()
+
+	// Degenerate shapes: identity, no allocation.
+	if got := applyRowspanGrid(nil, 3); got != nil {
+		t.Errorf("applyRowspanGrid(nil, 3) = %v, want nil", got)
+	}
+	src := [][]CellData{{{Text: "a", Rowspan: 2}}}
+	if got := applyRowspanGrid(src, 0); !sameGrid(got, src) {
+		t.Errorf("applyRowspanGrid(data, 0) rebuilt the grid, want identity: %v", got)
+	}
+
+	// A rowspan origin in the last column with a short following row: the
+	// spanned column is filled at the trailing-fill stage (nothing follows it).
+	grid := applyRowspanGrid([][]CellData{
+		{{Text: "l"}, {Text: "span", Rowspan: 2}},
+		{{Text: "r"}},
+	}, 2)
+	if len(grid) != 2 || len(grid[1]) != 2 {
+		t.Fatalf("grid shape = %dx?, want 2x2", len(grid))
+	}
+	if grid[0][1].Text != "span" || grid[1][0].Text != "r" {
+		t.Errorf("rowspan placement wrong: %+v / %+v", grid[0], grid[1])
+	}
+	if grid[1][1].Text != "span" || grid[1][1].Align != AlignDefault {
+		t.Errorf("trailing spanned fill = %+v, want the origin text %q with default alignment", grid[1][1], "span")
+	}
+
+	// More cells than maxCols: the surplus is dropped, matching the renderer.
+	wide := [][]CellData{{{Text: "1", Rowspan: 2}, {Text: "2", Rowspan: 2}, {Text: "3", Rowspan: 2}}}
+	grid = applyRowspanGrid(wide, 2)
+	for _, cell := range grid[0] {
+		if cell.Text == "3" {
+			t.Errorf("cell past maxCols survived: %+v", grid[0])
+		}
+	}
+}
+
+// sameGrid compares two grids by cell text and span, for the identity check.
+func sameGrid(a, b [][]CellData) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for r := range a {
+		if len(a[r]) != len(b[r]) {
+			return false
+		}
+		for c := range a[r] {
+			if a[r][c].Text != b[r][c].Text || a[r][c].Rowspan != b[r][c].Rowspan {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// TestDetermineColumnAlignmentVotes pins the vote branches not reached by the
+// fixture tables: a justify majority, a left+right tie refusing to pick a
+// side (plain "---"), and the zero-vote fallback to the first row's cell.
+func TestDetermineColumnAlignmentVotes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		counts   AlignCount
+		firstRow []CellData
+		want     string
+	}{
+		{"justify majority", AlignCount{Justify: 2}, nil, "---"},
+		{"mixed left and right defuses to default", AlignCount{Left: 1, Right: 1}, nil, "---"},
+		{"zero votes fall back to first row", AlignCount{}, []CellData{{Align: AlignRight}}, "---:"},
+		{"center majority", AlignCount{Center: 3}, nil, ":--:"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := determineColumnAlignment(tt.counts, tt.firstRow, 0); got != tt.want {
+				t.Errorf("determineColumnAlignment(%+v) = %q, want %q", tt.counts, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWriteMarkdownCellTextControlChars pins the escaping of every control
+// character the cell writer handles, including the carriage return the
+// fixture-based tests never contained.
+func TestWriteMarkdownCellTextControlChars(t *testing.T) {
+	t.Parallel()
+
+	tb := NewTrackedBuilder()
+	writeMarkdownCellText(tb, "a|b\\c\nd\re")
+	if got, want := tb.String(), `a\|b\\c d e`; got != want {
+		t.Errorf("writeMarkdownCellText = %q, want %q", got, want)
 	}
 }

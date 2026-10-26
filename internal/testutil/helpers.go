@@ -27,7 +27,7 @@ func CreateTempHTML(t *testing.T, content string) string {
 		tmpFile = base + ext
 	}
 
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o600); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 

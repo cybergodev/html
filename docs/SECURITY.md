@@ -52,6 +52,7 @@ cfg.MaxDepth = 50 // Limit nesting to 50 levels
 - **Validation**: Operations respect context deadlines
 - **Error**: Returns `ErrProcessingTimeout` when exceeded
 - **Goroutine Safety**: Maximum 1000 concurrent timeout goroutines to prevent resource exhaustion
+- **Tuning**: the deadline is wall-clock, not CPU time. Workloads that intentionally process very large documents under CPU pressure (batch pipelines, container CPU limits) should raise the value or set `0` (input size remains bounded by `MaxInputSize`) — a 30s budget can kill legitimate work, not only hostile input.
 
 **Cache Exhaustion**
 - **Threat**: Unique inputs fill cache memory
@@ -100,7 +101,7 @@ cfg.EnableSanitization = true // Default: true
 - **Mitigation**: All event handler attributes removed during sanitization
 
 **Removed Event Handler Attributes** (prefix-based catch-all):
-- All attributes starting with `on` are removed via a prefix check (`strings.HasPrefix("on")`)
+- All attributes whose lowercased key starts with `on` are removed via a length-guarded two-byte prefix check (`key[0] == 'o' && key[1] == 'n'`)
 - This covers every current and future event handler, including (non-exhaustive):
   `onclick`, `onerror`, `onload`, `onmouseover`, `onsubmit`, `onchange`, `oninput`,
   `onkeydown`, `onkeyup`, `onfocus`, `onblur`, `ondrag`, `ondrop`, `oncopy`, `onpaste`,
@@ -508,7 +509,7 @@ Security fixes are released as:
 
 ### Automated Testing
 
-The library includes comprehensive security-focused tests with **~95% code coverage** (main package 95.0%; `internal` 94.7%, `internal/table` 93.6%):
+The library includes comprehensive security-focused tests with **~95% code coverage** (main package 95.1%; `internal` 94.0%, `internal/table` 93.4%):
 
 ```bash
 # Run all tests including security tests
@@ -632,11 +633,34 @@ func FuzzExtract(f *testing.F) {
 > This section highlights security-relevant changes per release. For the complete
 > change history (features, performance, bug fixes), see [CHANGES.md](../CHANGES.md).
 
-### Unreleased
+### v1.5.0 (2026-10-26)
 
-- **Concurrency (P-002)**: media URLs extracted from raw pre-parse markup (`<iframe>`/`<embed>`/`<object>` attributes, and URL-shaped strings found by the media scan) were retained as substrings of the decoded document. On the zero-copy decode path that document is a view of the caller's input `[]byte`, so a returned — and cached — `Result` mutated when the caller recycled its buffer, and a cache-hit reader raced that write. `addVideo`/`addAudio` and `appendUniqueVideoURLs` now clone the URL before retaining it.
+- Audit hardening: `MultiSink` isolates a panicking child sink (sinks listed after it still receive every entry), capped in-memory retention releases evicted entries instead of pinning them in the backing array, and `WriterAuditSink` emits each JSON line plus its newline as one write
+- Path-traversal `FileError` now wraps `ErrInvalidFilePath`, so `errors.Is` matches the documented sentinel on traversal rejections
+
+### v1.4.9 (2026-10-22)
+
+- **Concurrency (P-002)**: media URLs extracted from raw pre-parse markup (`<iframe>`/`<embed>`/`<object>` attributes, and URL-shaped strings found by the media scan) were retained as substrings of the decoded document. On the zero-copy decode path that document is a view of the caller's input `[]byte`, so a returned — and cached — `Result` mutated when the caller recycled its buffer, and a cache-hit reader raced that write. The raw-HTML funnels (`appendUniqueVideoURLs` and the `ScanMediaURLs` callbacks) now clone the URL before retaining it; `addVideo`/`addAudio` need no clone of their own — DOM-sourced values are owned by the parser's tokenizer copies.
 - **Concurrency (P-002)**: with `ProcessingTimeout > 0` the parser can outlive `Extract` by one cooperative-cancellation window after a deadline fires. The decoded document is now a private copy in that mode instead of a zero-copy view of the caller's input, so a straggling parser can no longer read a buffer the caller has started reusing. With `ProcessingTimeout == 0` the work runs inline and the zero-copy path is unchanged.
 - Both fixes are covered by `regressions_media_test.go` (`TestMediaURLsNotAliasedWithInputBuffer`, `TestCachedMediaURLsNotAliasedWithInputBuffer`) and `regressions_timeout_test.go` (`TestDetectEncodingCopiesWhenTimeoutConfigured`, `TestDetectEncodingKeepsZeroCopyWhenSynchronous`), which fail if the copy is removed.
+- Cache keys hash the whole input: same-length documents differing only mid-document no longer collide and serve the wrong cached `Result` (the v1.3.2 5-point sampling was blind to the unsampled middle)
+- Leading control bytes can no longer bypass the protocol-relative scheme policy (`//javascript:` / `//data:` / `//file:` blocked again)
+- Table colspan expansion is bounded table-wide, closing a ~780 MB hostile-table allocation
+- Extraction no longer silently truncates past 50,000 nodes — media, links, `<base>`, title, tables, and text content are now complete
+
+### v1.4.8 (2026-10-10)
+
+- `IsValidURL` now enforces the sanitizer's data-URL media-type whitelist — percent-encoded script-executing URLs (`data:image/svg+xml,…onload…`, `data:text/html,…`) no longer reach `ExtractAllLinks` results or the raw-HTML media scan (intentional tightening: non-whitelisted types such as `text/plain` and `text/css` are rejected as well)
+- In-memory audit retention is capped (`AuditConfig.MaxEntries`, default 10,000, hard max 100,000) — entries previously grew without bound on a long-lived processor
+- Audit entries are centrally truncated (`AuditEntry.URL` plus boundary-aware `RawValue` capping) — one oversized attribute can no longer flood the audit log, and a truncated value never ends mid-rune or mid-entity
+- File reads are hard-capped at `MaxInputSize+1` bytes — FIFOs, character devices (`/dev/zero`), or files growing between `Stat` and read can no longer stream unbounded bytes into memory
+- The string-based sanitize walk (since removed together with its test-only callers) became iterative with an explicit stack, eliminating the unbounded-recursion / stack-overflow hazard on pathologically deep input
+- `normalizeCharset` no longer caches names longer than 40 bytes from untrusted `<meta charset>` input — closes a slow unbounded-memory-growth vector under hostile traffic
+- Windows: `AllowedBaseDir` containment compares paths ASCII case-insensitively, matching case-insensitive filesystems (NTFS/FAT/ReFS)
+- `golang.org/x/text` upgraded v0.40.0 → v0.41.0, clearing GO-2026-6629/CVE-2026-56851
+- govulncheck reports zero findings and is now a blocking CI job; this document gained a real vulnerability-reporting channel (GitHub Private Vulnerability Reporting)
+- Fixed a quadratic inline-link-formatting CPU sink: a crafted 1MB document dense with unmatched `[LINK:n]` placeholders dropped from ~31s CPU to milliseconds, with byte-identical output
+- `InputError.Unwrap` returns both the wrapped cause and `ErrInputTooLarge`, so `errors.Is(err, ErrInputTooLarge)` holds for every `*InputError`
 
 ### v1.4.7 (2026-08-11)
 
@@ -649,7 +673,7 @@ func FuzzExtract(f *testing.F) {
 - `ExtractFromFile` pre-reads `Stat` and rejects oversized files, preventing memory exhaustion from untrusted paths
 - `isSafeURIWithAudit` strips leading/trailing C0 controls and internal tab/LF/CR before scheme detection, closing an XSS-class bypass (`\x01javascript:`, `java&#9;script:`)
 - `AuditSink.Close` panics are now recovered, matching the `Record`/`Write` protection
-- ~~HTML entity decoding is bounded to `maxEntityScanLen`, closing an O(N²) CPU-exhaustion DoS reachable from any text node via runs of bare `&`~~ — the separate entity-decoding pass had no production caller and was removed; the HTML tokenizer in `golang.org/x/net/html` performs the only entity decoding, and raw text is never re-scanned for `&` sequences
+- ~~HTML entity decoding is bounded to `maxEntityScanLen`, closing an O(N²) CPU-exhaustion DoS reachable from any text node via runs of bare `&`~~ — the separate entity-decoding pass had no production caller and was removed (v1.4.9); the HTML tokenizer in `golang.org/x/net/html` performs the only entity decoding, and raw text is never re-scanned for `&` sequences
 - `DetectCharsetSmart` now honors `ForcedEncoding`/`Config.Encoding` even with smart detection enabled
 
 ### v1.4.5 (2026-07-08)
@@ -658,7 +682,7 @@ func FuzzExtract(f *testing.F) {
 - Package-level entry points (`Extract*`, `ExtractAllLinks`, `ExtractBatch*`) now recover a pool-`New` panic and return `ErrInternalPanic` instead of letting it escape to callers
 - Data URLs with an empty media type (`data:;base64,...`) are now rejected — previously arbitrary base64 payload bypassed the safe-MIME whitelist
 - Table `colspan`/`rowspan` clamped to 1000 (HTML spec ceiling) to close a memory-exhaustion vector; oversized non-data URIs are now sanitized/rejected before emission
-- Table colspan expansion additionally bounded in aggregate: at most 10,000 placeholder cells per table (`maxExpandedCells`) and a rendering grid of at most 2^20 cells (`maxGridCells`), closing the amplification where a ~1.5MB document of `<td colspan="1000">` cells expanded into tens of millions of `CellData` (per-cell clamping and any node-count bound cannot see synthetic cells). Fixed in a later audit: the budget was per row rather than per table, so a 2,000-row hostile table still expanded to two million cells.
+- Table colspan expansion additionally bounded in aggregate: at most 10,000 placeholder cells per table (`maxExpandedCells`) and a rendering grid of at most 2^20 cells (`maxGridCells`), closing the amplification where a ~1.5MB document of `<td colspan="1000">` cells expanded into tens of millions of `CellData` (per-cell clamping and any node-count bound cannot see synthetic cells). Fixed in v1.4.9: the budget was per row rather than per table, so a 2,000-row hostile table still expanded to two million cells.
 - Pooled `[]byte`/node-slice buffers above 64 KiB / 8192 entries are no longer retained in `sync.Pool`, eliminating the retention footgun where one multi-MB buffer was reused for every later small request
 
 ### v1.4.4 (2026-06-26)
@@ -692,8 +716,8 @@ func FuzzExtract(f *testing.F) {
 ### v1.3.2 (2026-03-23)
 - Defense-in-depth for fast-path vulnerabilities (S-06 to S-16)
 - Enhanced numeric entity validation prevents DoS via long strings
-- Cache key sampling for large documents (5-point sampling) — later replaced: sampling made the key blind to unsampled bytes, so the whole input is hashed now
-- ~~`maxWalkDepth` (50,000 nodes) prevents memory exhaustion attacks~~ — removed in a later audit: the cap truncated legal input silently and desynchronized passes over the same tree. Traversal is now bounded by `MaxInputSize` (node count) and `MaxDepth` (nesting).
+- Cache key sampling for large documents (5-point sampling) — replaced in v1.4.9: sampling made the key blind to unsampled bytes, so the whole input is hashed now
+- ~~`maxWalkDepth` (50,000 nodes) prevents memory exhaustion attacks~~ — removed in v1.4.9: the cap truncated legal input silently and desynchronized passes over the same tree. Traversal is now bounded by `MaxInputSize` (node count) and `MaxDepth` (nesting).
 
 ### v1.3.0 (2026-03-03)
 - Library confirmed fully thread-safe (100+ race detection iterations)

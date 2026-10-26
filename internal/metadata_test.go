@@ -9,7 +9,10 @@ package internal
 // non-ld+json scripts leaving fields empty.
 
 import (
+	"strings"
 	"testing"
+
+	"golang.org/x/net/html"
 )
 
 func TestCollectMetadata(t *testing.T) {
@@ -113,5 +116,38 @@ func TestCollectMetadata(t *testing.T) {
 
 	if got := CollectMetadata(nil); got != (Metadata{}) {
 		t.Errorf("CollectMetadata(nil) = %+v, want zero Metadata", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// scriptText boundaries ([FIX-001] boundary additions)
+// ---------------------------------------------------------------------------
+
+// TestScriptTextLimits pins scriptText's byte-cap and multi-node behavior:
+// text past the limit is truncated (mid-rune bytes included, byte-counted like
+// production), non-text children are skipped, and a single long text node
+// stops exactly at the limit.
+func TestScriptTextLimits(t *testing.T) {
+	t.Parallel()
+
+	script := &html.Node{Type: html.ElementNode, Data: "script"}
+	script.AppendChild(&html.Node{Type: html.CommentNode, Data: "not text"})
+	script.AppendChild(&html.Node{Type: html.TextNode, Data: "abcdefghij"})
+	script.AppendChild(&html.Node{Type: html.TextNode, Data: "KLMNOP"})
+
+	if got, want := scriptText(script, 5), "abcde"; got != want {
+		t.Errorf("scriptText(limit=5) = %q, want %q (truncated at the cap)", got, want)
+	}
+	if got, want := scriptText(script, 15), "abcdefghijKLMNO"; got != want {
+		t.Errorf("scriptText(limit=15) = %q, want %q (cap lands in the second node)", got, want)
+	}
+	if got, want := scriptText(script, 100), "abcdefghijKLMNOP"; got != want {
+		t.Errorf("scriptText(limit=100) = %q, want %q (no truncation)", got, want)
+	}
+	if got := scriptText(&html.Node{Type: html.ElementNode, Data: "script"}, 10); got != "" {
+		t.Errorf("scriptText(empty script) = %q, want empty", got)
+	}
+	if !strings.Contains(scriptText(script, 100), "abcdefghij") {
+		t.Error("comment child was not skipped")
 	}
 }

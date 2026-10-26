@@ -120,6 +120,11 @@ func getCellAlign(n *html.Node) table.CellAlignment {
 		// colon-space-free forms below can ever match.
 		normalizedStyle := strings.ReplaceAll(style, " :", ":")
 		normalizedStyle = strings.ReplaceAll(normalizedStyle, ": ", ":")
+		// "!important" (already lowercased together with style above) is a
+		// priority marker, not part of the value — strip it so both
+		// "text-align:center !important" and the spaceless "center!important"
+		// spelling match.
+		normalizedStyle = strings.ReplaceAll(normalizedStyle, "!important", "")
 		// Check for text-align patterns with better boundary detection.
 		if containsWord(normalizedStyle, "text-align:justify") {
 			return table.AlignJustify

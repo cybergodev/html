@@ -48,6 +48,8 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Printf("  GBK          → title=%q, text=%q\n", r.Title, compact(r.Text))
+	fmt.Printf("                %d words, %v reading time — CJK text counts each\n", r.WordCount, r.ReadingTime)
+	fmt.Println("                character as one word and reads at 350 chars/min (Latin: 200 wpm)")
 
 	r, err = html.Extract(winBytes)
 	if err != nil {

@@ -405,12 +405,13 @@ func (p *Processor) inputTooLargeError(op string, size int) error {
 // memory. Non-regular files (pipes, devices, sockets) report an implausible
 // Stat size (often 0), so they are never rejected here — they are bounded
 // instead by the MaxInputSize+1 read cap in readBounded at read time.
-// Returns nil when the file is within the limit.
-func (p *Processor) errFileTooLarge(regular bool, size int64) error {
+// op names the public file API the caller serves, so the error identifies
+// its true source. Returns nil when the file is within the limit.
+func (p *Processor) errFileTooLarge(regular bool, size int64, op string) error {
 	if !regular || size <= int64(p.config.MaxInputSize) {
 		return nil
 	}
-	return p.inputTooLargeError("ExtractFromFile", int(size))
+	return p.inputTooLargeError(op, int(size))
 }
 
 // detectEncoding detects the character encoding and converts HTML bytes to UTF-8.
@@ -448,8 +449,10 @@ func (p *Processor) detectEncoding(htmlBytes []byte) (string, error) {
 
 // validateAndReadFile validates the file path and reads the file contents.
 // It performs security checks including path traversal detection and optional directory restriction.
+// op names the public file API the caller serves; it flows into oversize
+// *InputError.Op values so they identify their true source.
 // Returns the file contents or an appropriate error.
-func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
+func (p *Processor) validateAndReadFile(filePath, op string) ([]byte, error) {
 	// Validate file path
 	if filePath == "" {
 		return nil, newFileError("ReadFile", filePath, ErrInvalidFilePath)
@@ -484,7 +487,7 @@ func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
 	// (which need no privilege and are NOT resolved by filepath.EvalSymlinks).
 	// See readContained for details.
 	if p.config.AllowedBaseDir != "" {
-		return p.readContained(cleanPath)
+		return p.readContained(cleanPath, op)
 	}
 
 	// Pre-check the file size against MaxInputSize so an oversized file is
@@ -499,7 +502,7 @@ func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
 		}
 		return nil, newFileError("ReadFile", cleanPath, err)
 	}
-	if err := p.errFileTooLarge(info.Mode().IsRegular(), info.Size()); err != nil {
+	if err := p.errFileTooLarge(info.Mode().IsRegular(), info.Size(), op); err != nil {
 		return nil, err
 	}
 
@@ -515,7 +518,7 @@ func (p *Processor) validateAndReadFile(filePath string) ([]byte, error) {
 	}
 	defer func() { _ = f.Close() }() // best-effort close of a read-only handle
 
-	return p.readBounded(f, cleanPath)
+	return p.readBounded(f, cleanPath, op)
 }
 
 // hasParentComponent reports whether a filepath.Clean'ed path contains ".."
@@ -536,14 +539,15 @@ func hasParentComponent(cleanPath string) bool {
 // streamed unbounded bytes into memory before validateInput ever saw the
 // length. Reading one byte past the limit distinguishes "exactly at the limit"
 // from "over the limit" so the standard ErrInputTooLarge error is produced
-// here, identical to the byte-input path.
-func (p *Processor) readBounded(r io.Reader, path string) ([]byte, error) {
+// here, identical to the byte-input path. op names the public file API the
+// caller serves (see validateAndReadFile).
+func (p *Processor) readBounded(r io.Reader, path, op string) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(r, int64(p.config.MaxInputSize)+1))
 	if err != nil {
 		return nil, newFileError("ReadFile", path, err)
 	}
 	if len(data) > p.config.MaxInputSize {
-		return nil, p.inputTooLargeError("ExtractFromFile", len(data))
+		return nil, p.inputTooLargeError(op, len(data))
 	}
 	return data, nil
 }
@@ -565,7 +569,7 @@ func (p *Processor) readBounded(r io.Reader, path string) ([]byte, error) {
 // containment decision and never reaches the returned error (which carries the
 // caller-supplied path, sanitized by FileError), so no filesystem layout is
 // disclosed on rejection.
-func (p *Processor) readContained(cleanPath string) ([]byte, error) {
+func (p *Processor) readContained(cleanPath, op string) ([]byte, error) {
 	absBase, err := filepath.Abs(p.config.AllowedBaseDir)
 	if err != nil {
 		return nil, newFileError("ReadFile", cleanPath, fmt.Errorf("invalid AllowedBaseDir: %w", err))
@@ -601,7 +605,7 @@ func (p *Processor) readContained(cleanPath string) ([]byte, error) {
 	// second path resolution, no TOCTOU window) so an oversized file inside
 	// the allowed tree is rejected before its contents are loaded into memory.
 	if info, err := f.Stat(); err == nil {
-		if err := p.errFileTooLarge(info.Mode().IsRegular(), info.Size()); err != nil {
+		if err := p.errFileTooLarge(info.Mode().IsRegular(), info.Size(), op); err != nil {
 			return nil, err
 		}
 	}
@@ -609,7 +613,7 @@ func (p *Processor) readContained(cleanPath string) ([]byte, error) {
 	// The Stat pre-check cannot see non-regular files (pipes under the allowed
 	// tree, devices) or growth since the Stat; readBounded enforces the byte
 	// ceiling on the actual read.
-	return p.readBounded(f, cleanPath)
+	return p.readBounded(f, cleanPath, op)
 }
 
 // resolveRealPath opens path, resolves its true on-disk location, and closes it.

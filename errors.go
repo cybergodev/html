@@ -223,11 +223,9 @@ func (e *FileError) sanitizeErrorMessage() error {
 		return fmt.Errorf("file not found")
 	}
 	if strings.Contains(lowerErr, "permission denied") ||
-		strings.Contains(lowerErr, "access is denied") {
+		strings.Contains(lowerErr, "access is denied") ||
+		strings.Contains(lowerErr, "access denied") {
 		return fmt.Errorf("permission denied")
-	}
-	if strings.Contains(lowerErr, "access denied") {
-		return fmt.Errorf("access denied")
 	}
 	if strings.Contains(lowerErr, "is a directory") {
 		return fmt.Errorf("is a directory")

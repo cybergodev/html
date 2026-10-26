@@ -6,7 +6,9 @@ package html_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -300,29 +302,10 @@ func TestExtractBatchFilesWithContext(t *testing.T) {
 }
 
 // TestBatchResultStructure tests the BatchResult structure fields.
-func TestBatchResultStructure(t *testing.T) {
-	t.Parallel()
-
-	p := testutil.NewTestProcessor(t)
-	docs := [][]byte{
-		[]byte(`<html><body><p>Doc 1</p></body></html>`),
-		[]byte(`<html><body><p>Doc 2</p></body></html>`),
-	}
-
-	result := p.ExtractBatchWithContext(context.Background(), docs)
-
-	if result.Results == nil {
-		t.Error("Results slice should not be nil")
-	}
-	if result.Errors == nil {
-		t.Error("Errors slice should not be nil")
-	}
-
-	total := result.Success + result.Failed + result.Cancelled
-	if total != len(docs) {
-		t.Errorf("Success + Failed + Cancelled = %d, expected %d", total, len(docs))
-	}
-}
+// Removed TestBatchResultStructure: never-nil assertions on slices that
+// ExtractBatchWithContext always allocates, plus the accounting invariant
+// (Success+Failed+Cancelled == len(docs)) already asserted identically in
+// TestExtractBatchWithContextTimeout and TestExtractBatchWithContext.
 
 // Helper functions
 
@@ -346,4 +329,174 @@ func createTempHTMLFiles(t *testing.T, tmpDir string, count int) []string {
 		}
 	}
 	return files
+}
+
+// ---------------------------------------------------------------------------
+// Package-level batch wrapper boundaries (from the dissolved boundary_test.go)
+// ---------------------------------------------------------------------------
+
+// boundaryTestHTML and writeTempHTML are shared fixtures for the moved
+// package-level wrapper tests across this package (links_test.go,
+// output_test.go, layer_equivalence_test.go). writeTempHTML mirrors
+// testutil.CreateTempHTML.
+const boundaryTestHTML = `<html><head><title>Boundary Test</title></head><body><article><p>Content</p></article></body></html>`
+
+// writeTempHTML writes content to a fresh temp .html file and returns its path.
+func writeTempHTML(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "test.html")
+	if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp html: %v", err)
+	}
+	return p
+}
+
+// TestPackageLevelBatchWithContext covers the package-level batch WithContext
+// entry points (from boundary_test.go).
+func TestPackageLevelBatchWithContext(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ExtractBatchWithContext", func(t *testing.T) {
+		inputs := [][]byte{[]byte(boundaryTestHTML), []byte(boundaryTestHTML)}
+		br := html.ExtractBatchWithContext(context.Background(), inputs)
+		if br.Failed > 0 {
+			t.Fatalf("unexpected failures: %v", br.Errors)
+		}
+		if len(br.Results) != 2 {
+			t.Errorf("got %d results, want 2", len(br.Results))
+		}
+	})
+
+	t.Run("ExtractBatchFilesWithContext", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		paths := make([]string, 2)
+		for i := range paths {
+			paths[i] = filepath.Join(tmpDir, filepath.Join("file"+string(rune('A'+i))+".html"))
+			_ = os.WriteFile(paths[i], []byte(boundaryTestHTML), 0644)
+		}
+
+		br := html.ExtractBatchFilesWithContext(context.Background(), paths)
+		if br.Failed > 0 {
+			t.Fatalf("unexpected failures: %v", br.Errors)
+		}
+		if len(br.Results) != 2 {
+			t.Errorf("got %d results, want 2", len(br.Results))
+		}
+	})
+
+	t.Run("cancelled context in batch", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		inputs := [][]byte{[]byte(boundaryTestHTML)}
+		br := html.ExtractBatchWithContext(ctx, inputs)
+		if br.Cancelled == 0 && br.Failed == 0 {
+			t.Error("expected cancelled or failed items")
+		}
+	})
+}
+
+// TestBatchInvalidConfig tests that batch functions handle invalid config
+// via withProcessorBatch's error path (which calls uniformErrorBatch).
+func TestBatchInvalidConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ExtractBatch with invalid config", func(t *testing.T) {
+		cfg := html.Config{MaxInputSize: -1} // invalid
+		br := html.ExtractBatch([][]byte{[]byte(boundaryTestHTML)}, cfg)
+		if br.Failed != 1 {
+			t.Fatalf("expected 1 failure, got %d", br.Failed)
+		}
+		if br.Errors[0] == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("ExtractBatchWithContext with invalid config", func(t *testing.T) {
+		cfg := html.Config{MaxInputSize: -1}
+		br := html.ExtractBatchWithContext(context.Background(), [][]byte{[]byte(boundaryTestHTML)}, cfg)
+		if br.Failed != 1 {
+			t.Fatalf("expected 1 failure, got %d", br.Failed)
+		}
+	})
+
+	t.Run("ExtractBatchFiles with invalid config", func(t *testing.T) {
+		cfg := html.Config{MaxInputSize: -1}
+		br := html.ExtractBatchFiles([]string{"test.html"}, cfg)
+		if br.Failed != 1 {
+			t.Fatalf("expected 1 failure, got %d", br.Failed)
+		}
+	})
+
+	t.Run("ExtractBatchFilesWithContext with invalid config", func(t *testing.T) {
+		cfg := html.Config{MaxInputSize: -1}
+		br := html.ExtractBatchFilesWithContext(context.Background(), []string{"test.html"}, cfg)
+		if br.Failed != 1 {
+			t.Fatalf("expected 1 failure, got %d", br.Failed)
+		}
+	})
+}
+
+// TestPackageLevelBatchFiles_HappyPath covers the package-level
+// ExtractBatchFiles happy path. The processor-method variant is tested above
+// but the convenience wrapper was only tested on its error branch.
+func TestPackageLevelBatchFiles_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	paths := make([]string, 3)
+	for i := range paths {
+		paths[i] = filepath.Join(tmpDir, fmt.Sprintf("file%d.html", i))
+		content := fmt.Sprintf(`<html><body><h1>File %d</h1></body></html>`, i)
+		_ = os.WriteFile(paths[i], []byte(content), 0644)
+	}
+
+	br := html.ExtractBatchFiles(paths)
+	if br.Failed > 0 {
+		t.Fatalf("unexpected failures: %v", br.Errors)
+	}
+	if len(br.Results) != 3 {
+		t.Errorf("got %d results, want 3", len(br.Results))
+	}
+}
+
+// TestBatchMultipleConfigsRejected covers the resolveConfig error branch of
+// withConfigBatch (processor_pool.go): two variadic configs must fail every
+// batch wrapper uniformly, marking all items failed with ErrMultipleConfigs.
+func TestBatchMultipleConfigsRejected(t *testing.T) {
+	t.Parallel()
+
+	cfg1 := html.DefaultConfig()
+	cfg2 := html.DefaultConfig()
+
+	tests := []struct {
+		name string
+		run  func() *html.BatchResult
+	}{
+		{"ExtractBatch", func() *html.BatchResult {
+			return html.ExtractBatch([][]byte{[]byte(`<p>x</p>`)}, cfg1, cfg2)
+		}},
+		{"ExtractBatchWithContext", func() *html.BatchResult {
+			return html.ExtractBatchWithContext(context.Background(), [][]byte{[]byte(`<p>x</p>`)}, cfg1, cfg2)
+		}},
+		{"ExtractBatchFiles", func() *html.BatchResult {
+			return html.ExtractBatchFiles([]string{"a.html"}, cfg1, cfg2)
+		}},
+		{"ExtractBatchFilesWithContext", func() *html.BatchResult {
+			return html.ExtractBatchFilesWithContext(context.Background(), []string{"a.html"}, cfg1, cfg2)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			br := tt.run()
+			if br.Failed != 1 {
+				t.Fatalf("Failed = %d, want 1", br.Failed)
+			}
+			if !errors.Is(br.Errors[0], html.ErrMultipleConfigs) {
+				t.Errorf("error = %v, want ErrMultipleConfigs", br.Errors[0])
+			}
+		})
+	}
 }

@@ -136,6 +136,62 @@ func TestExtractToJSON(t *testing.T) {
 			}
 		})
 	}
+
+	// End-to-end media arrays (absorbed from html_test.go's former
+	// TestJSONOutput, whose per-type field structure is pinned by
+	// TestMediaInfoJSONSerialization above; this keeps the markup→extract→JSON
+	// integration oracle in one compact place).
+	t.Run("media arrays carry extracted values", func(t *testing.T) {
+		htmlContent := `<html><head><title>Media Page</title></head><body>
+			<img src="image.jpg" alt="Test Image" width="100" height="50">
+			<a href="http://example.com">Link</a>
+			<video src="video.mp4" poster="poster.jpg"></video>
+			<audio src="audio.mp3"></audio>
+		</body></html>`
+
+		jsonData, err := html.ExtractToJSON([]byte(htmlContent))
+		if err != nil {
+			t.Fatalf("ExtractToJSON() failed: %v", err)
+		}
+
+		var result map[string]interface{}
+		if err := json.Unmarshal(jsonData, &result); err != nil {
+			t.Fatalf("Invalid JSON: %v", err)
+		}
+
+		images, ok := result["images"].([]interface{})
+		if !ok || len(images) != 1 {
+			t.Fatalf("images = %v, want one entry", result["images"])
+		}
+		img := images[0].(map[string]interface{})
+		if img["url"] != "image.jpg" || img["alt"] != "Test Image" || img["width"] != "100" || img["height"] != "50" {
+			t.Errorf("image entry = %v, want url/alt/width/height preserved", img)
+		}
+
+		links, ok := result["links"].([]interface{})
+		if !ok || len(links) != 1 {
+			t.Fatalf("links = %v, want one entry", result["links"])
+		}
+		if links[0].(map[string]interface{})["url"] != "http://example.com" {
+			t.Errorf("link url = %v, want http://example.com", links[0])
+		}
+
+		videos, ok := result["videos"].([]interface{})
+		if !ok || len(videos) != 1 {
+			t.Fatalf("videos = %v, want one entry", result["videos"])
+		}
+		if videos[0].(map[string]interface{})["poster"] != "poster.jpg" {
+			t.Errorf("video poster = %v, want poster.jpg", videos[0])
+		}
+
+		audios, ok := result["audios"].([]interface{})
+		if !ok || len(audios) != 1 {
+			t.Fatalf("audios = %v, want one entry", result["audios"])
+		}
+		if audios[0].(map[string]interface{})["url"] != "audio.mp3" {
+			t.Errorf("audio url = %v, want audio.mp3", audios[0])
+		}
+	})
 }
 
 // TestResultSerialization tests Result JSON marshaling/unmarshaling.
@@ -549,4 +605,58 @@ func TestProcessorOutputMethodsAfterClose(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Package-level output wrappers with context (from the dissolved boundary_test.go)
+// ---------------------------------------------------------------------------
+
+// TestPackageLevelOutputWithContext covers the WithContext entry points of the
+// output-format family.
+func TestPackageLevelOutputWithContext(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ExtractToMarkdownWithContext", func(t *testing.T) {
+		md, err := html.ExtractToMarkdownWithContext(context.Background(), []byte(boundaryTestHTML))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if md == "" {
+			t.Error("expected non-empty markdown")
+		}
+	})
+
+	t.Run("ExtractToMarkdownFromFileWithContext", func(t *testing.T) {
+		tmpFile := writeTempHTML(t, boundaryTestHTML)
+
+		md, err := html.ExtractToMarkdownFromFileWithContext(context.Background(), tmpFile)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if md == "" {
+			t.Error("expected non-empty markdown")
+		}
+	})
+
+	t.Run("ExtractToJSONWithContext", func(t *testing.T) {
+		jsonData, err := html.ExtractToJSONWithContext(context.Background(), []byte(boundaryTestHTML))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(jsonData) == 0 {
+			t.Error("expected non-empty JSON")
+		}
+	})
+
+	t.Run("ExtractToJSONFromFileWithContext", func(t *testing.T) {
+		tmpFile := writeTempHTML(t, boundaryTestHTML)
+
+		jsonData, err := html.ExtractToJSONFromFileWithContext(context.Background(), tmpFile)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(jsonData) == 0 {
+			t.Error("expected non-empty JSON")
+		}
+	})
 }

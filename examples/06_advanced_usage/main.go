@@ -176,12 +176,32 @@ drain:
 	_ = channelSink.Close()
 	fmt.Printf("ChannelAuditSink drained: %d critical, %d warning, %d info\n", critical, warning, info)
 
-	fmt.Println("\nOther built-in sinks (set via AuditConfig.Sink):")
-	fmt.Println("  - LoggerAuditSink   - Writes to standard logger")
-	fmt.Println("  - ChannelAuditSink  - Sends to Go channel (for async processing)")
-	fmt.Println("  - MultiSink         - Combines multiple sinks")
-	fmt.Println("  - FilteredSink      - Filters by custom criteria")
-	fmt.Println("  - LevelFilteredSink - Filters by severity level")
+	// MultiSink fans each entry out to several sinks, and LevelFilteredSink
+	// forwards only entries at or above a severity level. Combined here: one
+	// sink receives the full stream, the other only criticals — the "verbose
+	// audit file + quiet alert channel" production pattern.
+	var allBuf, criticalBuf bytes.Buffer
+	multiSink := html.NewMultiSink(
+		html.NewWriterAuditSink(&allBuf),
+		html.NewLevelFilteredSink(html.NewWriterAuditSink(&criticalBuf), html.AuditLevelCritical),
+	)
+	multiCfg := html.DefaultConfig()
+	multiCfg.Audit = html.HighSecurityAuditConfig() // enabled + every Log* category
+	multiCfg.Audit.Sink = multiSink
+	multiCfg.MaxInputSize = 1024 // so an oversize input yields a critical entry below
+	multiProcessor, err := html.New(multiCfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	_, _ = multiProcessor.Extract([]byte(dangerousHTML))                // warnings (blocked tag/attr/URL)
+	_, _ = multiProcessor.Extract([]byte(strings.Repeat("<div>", 500))) // critical (input violation)
+	_ = multiProcessor.Close()                                          // closes the MultiSink (and its children)
+	fmt.Printf("MultiSink: %d bytes to the full sink, %d bytes critical-only to the filtered one\n",
+		allBuf.Len(), criticalBuf.Len())
+
+	fmt.Println("\nAlso available (set via AuditConfig.Sink):")
+	fmt.Println("  - LoggerAuditSink - the default sink; writes to the standard logger")
+	fmt.Println("  - FilteredSink    - filters entries with a custom predicate")
 	fmt.Println()
 	fmt.Println("Or use GetAuditLog()/ClearAuditLog() to read and reset the internal storage.")
 
