@@ -810,14 +810,44 @@ func isAlphaNumericByte(c byte) bool {
 // IsHiddenElement reports whether node is hidden via the hidden attribute,
 // aria-hidden="true", a display:none/visibility:hidden inline style, or a
 // hidden class token (hidden, sr-only, d-none, ...). It is the hidden-detection
-// subset of DefaultScorer.ShouldRemove, factored out so page-chrome cleaning
-// (RemoveHiddenElements) and reader-mode section filtering can strip invisible
-// nodes without applying content-oriented class removal — a nav region's own
+// subset of DefaultScorer.ShouldRemove, factored out so reader-mode chrome
+// cleaning (RemoveHiddenElementsReader, via the narrower reader predicates)
+// and ShouldRemove itself can strip invisible nodes without applying
+// content-oriented class removal — a nav region's own
 // "nav-menu" class must survive chrome cleaning. Primary-content containers
 // (<article>/<main>, role=main/article) keep their exemption from the
 // class-token test, matching ShouldRemove; an explicit hidden attribute or
 // style still hides them.
 func IsHiddenElement(node *html.Node) bool {
+	return isHiddenElement(node, matchesHiddenClassToken)
+}
+
+// IsHiddenElementReader is the reader-mode (ReadPage family) hidden test. It
+// shares everything with IsHiddenElement — the hidden attribute, aria-hidden,
+// inline display:none/visibility:hidden, and the primary-content-container
+// class exemption — except the class-token predicate for non-primary elements,
+// where it uses classHidesInReaderMode instead of matchesHiddenClassToken. The
+// reader view has no viewport and no pointer, so class-based visibility hints
+// that mean "revealed on some breakpoint or on interaction" (Tailwind's
+// "hidden md:block", a bare-"hidden" dropdown or drawer panel) keep their
+// element: those menus and footer link columns are precisely the content
+// ReadPage exists to preserve. Only the always-hidden utility classes hide
+// (see classHidesInReaderMode). The Extract path is unaffected — it keeps
+// calling IsHiddenElement.
+func IsHiddenElementReader(node *html.Node) bool {
+	return isHiddenElement(node, classHidesInReaderMode)
+}
+
+// isHiddenElement is the shared implementation behind IsHiddenElement and
+// IsHiddenElementReader. classHidden selects the class/id predicate: the
+// Extract path passes matchesHiddenClassToken (the full hidden-token set), the
+// reader path passes classHidesInReaderMode (the always-hidden utility tokens
+// only — there the bare "hidden"/"hide" token marks an interaction-revealed
+// panel and does not hide). Primary-content containers are exempt from the class-token
+// test in both modes, matching ShouldRemove, so a classed <main>/<article> is
+// never dropped for a class token; an explicit hidden attribute or inline style
+// still hides it.
+func isHiddenElement(node *html.Node, classHidden func(string) bool) bool {
 	if node == nil || node.Type != html.ElementNode {
 		return false
 	}
@@ -828,7 +858,7 @@ func IsHiddenElement(node *html.Node) bool {
 			if primary {
 				continue
 			}
-			if matchesHiddenClassToken(strings.ToLower(attr.Val)) {
+			if classHidden(strings.ToLower(attr.Val)) {
 				return true
 			}
 		case "style":
@@ -840,6 +870,145 @@ func IsHiddenElement(node *html.Node) bool {
 		case "aria-hidden":
 			if strings.EqualFold(strings.TrimSpace(attr.Val), "true") {
 				return true
+			}
+		}
+	}
+	return false
+}
+
+// alwaysHiddenClassTokens are the only class tokens that hide an element in
+// reader mode: visibility utilities with no responsive or interactive reading,
+// meaning "visually absent" at every breakpoint (screen-reader-only filler,
+// Bootstrap's d-none, invisible, ...). The bare "hidden"/"hide" token is
+// deliberately absent — on Tailwind-era component sites it is the standard
+// hover/click disclosure idiom (dropdown menus, drawers, tab panels), so in
+// reader mode it is an interaction hook, not a hiding signal.
+var alwaysHiddenClassTokens = [...]string{
+	"is-hidden", "sr-only", "visually-hidden", "d-none", "invisible",
+}
+
+// classHidesInReaderMode reports whether lowerVal (a lowercased class or id
+// attribute value) hides its element under reader-mode semantics. It is the
+// reader-only counterpart of matchesHiddenClassToken, and strictly narrower:
+// only the always-hidden utility tokens hide. The bare "hidden"/"hide" token
+// never does — the reader view has no pointer, so a class-revealed disclosure
+// panel (Tailwind's "hidden" until hover/click, with or without a breakpoint
+// display override like "md:block", plus the legacy "hidden-sm" family) is
+// kept exactly like <details> content; pruning it would discard the nav link
+// data ReadPage exists to preserve. The hidden attribute, aria-hidden="true",
+// and inline display:none/visibility:hidden styles still hide — see
+// isHiddenElement, which applies them before this predicate.
+func classHidesInReaderMode(lowerVal string) bool {
+	for _, token := range alwaysHiddenClassTokens {
+		if containsClassToken(lowerVal, token) {
+			return true
+		}
+	}
+	return false
+}
+
+// classHidesInReaderMainRoot is the main-region-root variant of
+// classHidesInReaderMode: identical to it (always-hidden utilities hide) except
+// the bare "hidden"/"hide" token hides too, unless a Tailwind breakpoint
+// display class ("md:flex", "lg:block", ...) overrides it. It governs the main
+// section roots that are not semantic containers — token-classed wrappers
+// (<div class="article hidden">, an SPA shell or inactive view) and promoted
+// residuals — where reader mode keeps article-grade hidden semantics; a
+// responsively hidden wrapper ("hidden lg:block", "xl:hidden": the
+// mobile/desktop main swap) survives exactly as it does for chrome roots.
+// Semantic <main>/<article> roots never reach the class test at all (the
+// primary-container exemption in isHiddenElement), so for them this predicate
+// and classHidesInReaderMode are equivalent.
+func classHidesInReaderMainRoot(lowerVal string) bool {
+	if classHidesInReaderMode(lowerVal) {
+		return true
+	}
+	if containsClassToken(lowerVal, "hidden") || containsClassToken(lowerVal, "hide") {
+		return !hasBreakpointDisplayClass(lowerVal)
+	}
+	return false
+}
+
+// IsHiddenElementReaderStrict is the strict variant of IsHiddenElementReader
+// for main-region section roots: like IsHiddenElementReader (hidden attribute,
+// aria-hidden, inline display:none/visibility:hidden, the primary-content
+// exemption, and the always-hidden utility classes) except that the bare
+// "hidden"/"hide" class token additionally hides, unless a breakpoint display
+// class overrides it ("hidden md:block"). It applies to main roots that are
+// not semantic containers — token-classed wrappers (<div class="article
+// hidden">, an SPA shell) and promoted residuals — where reader mode keeps
+// article-grade hidden semantics. Semantic <main>/<article> roots are
+// class-exempt in every variant (the primary-container rule), so only the
+// unambiguous signals — the hidden attribute, aria-hidden, an inline hiding
+// style — ever hide them. The Extract path keeps IsHiddenElement.
+func IsHiddenElementReaderStrict(node *html.Node) bool {
+	return isHiddenElement(node, classHidesInReaderMainRoot)
+}
+
+// containsClassToken reports whether lowerVal contains token as a complete
+// class token: preceded by whitespace (or start of string) and followed by
+// whitespace (or end of string). The reader path scans tokens linearly because
+// it runs once per chrome node, not on the scoring hot path that
+// matchesHiddenClassToken's byte-bucketed index serves.
+func containsClassToken(lowerVal, token string) bool {
+	for i := 0; i+len(token) <= len(lowerVal); i++ {
+		if lowerVal[i] != token[0] || !strings.HasPrefix(lowerVal[i:], token) {
+			continue
+		}
+		if i > 0 && !isClassBoundaryByte(lowerVal[i-1]) {
+			continue
+		}
+		end := i + len(token)
+		if end < len(lowerVal) && !isClassBoundaryByte(lowerVal[end]) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// isClassBoundaryByte reports whether c separates CSS class tokens (whitespace).
+func isClassBoundaryByte(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// responsiveBreakpoints are the Tailwind responsive breakpoint prefixes, matched
+// as bounded tokens by hasBreakpointDisplayClass.
+var responsiveBreakpoints = [...]string{"sm", "md", "lg", "xl", "2xl"}
+
+// responsiveDisplayTokens are the Tailwind display-utility class stems, matched
+// with a bounded right edge (the stem must not continue into a longer word).
+// They identify a breakpoint display override ("md:flex", "lg:block", ...) that
+// turns a "hidden md:block" pair from "always hidden" into "visible from md up".
+var responsiveDisplayTokens = [...]string{
+	"flex", "block", "grid", "inline-block", "inline-flex", "inline", "table",
+}
+
+// hasBreakpointDisplayClass reports whether lowerVal contains a
+// "{breakpoint}:{display}" class token (e.g. "md:flex"), where the breakpoint
+// is bounded on the left by whitespace or start-of-string and the display stem
+// is bounded on the right by whitespace or end-of-string. It backs the
+// responsive exemptions in classHidesInReaderMainRoot: without the override a
+// bare "hidden" token means display:none at every breakpoint.
+func hasBreakpointDisplayClass(lowerVal string) bool {
+	for _, brk := range responsiveBreakpoints {
+		prefix := brk + ":"
+		for i := 0; i+len(prefix) <= len(lowerVal); i++ {
+			if !strings.HasPrefix(lowerVal[i:], prefix) {
+				continue
+			}
+			if i > 0 && !isClassBoundaryByte(lowerVal[i-1]) {
+				continue
+			}
+			after := i + len(prefix)
+			for _, disp := range responsiveDisplayTokens {
+				if !strings.HasPrefix(lowerVal[after:], disp) {
+					continue
+				}
+				end := after + len(disp)
+				if end == len(lowerVal) || isClassBoundaryByte(lowerVal[end]) {
+					return true
+				}
 			}
 		}
 	}

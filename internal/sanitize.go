@@ -128,10 +128,34 @@ func SanitizeDOM(doc *html.Node, audit AuditRecorder) {
 	if doc == nil {
 		return
 	}
-	sanitizeNodeWithAudit(doc, audit)
+	sanitizeNodeWithAuditMode(doc, audit, false)
 }
 
-// sanitizeNodeWithAudit sanitizes n and its entire subtree in place.
+// SanitizeDOMReader sanitizes an already-parsed HTML DOM tree in place with
+// reader-mode (ReadPage family) semantics. It differs from SanitizeDOM in one
+// way: a <button> element is unwrapped — the element is removed but its child
+// text (and safe inline markup) is spliced into the parent — instead of being
+// dropped whole with its subtree. ReadPage keeps page-chrome navigation, where
+// a menu's top-level labels are routinely <button> dropdown triggers; dropping
+// the button also dropped the label. The <button> element itself is still gone
+// in both modes (no interactive form control survives), so the unwrap preserves
+// no control surface — only the visible label. The Extract path keeps
+// SanitizeDOM, whose whole-subtree removal of <button> is unchanged.
+func SanitizeDOMReader(doc *html.Node, audit AuditRecorder) {
+	if doc == nil {
+		return
+	}
+	sanitizeNodeWithAuditMode(doc, audit, true)
+}
+
+// sanitizeNodeWithAudit sanitizes n and its entire subtree in place, with the
+// Extract-path semantics (no button unwrap). Test helpers use it for the string
+// round-trip; production goes through SanitizeDOM / SanitizeDOMReader.
+func sanitizeNodeWithAudit(n *html.Node, audit AuditRecorder) {
+	sanitizeNodeWithAuditMode(n, audit, false)
+}
+
+// sanitizeNodeWithAuditMode sanitizes n and its entire subtree in place.
 //
 // The traversal is iterative with an explicit stack rather than recursive:
 // SanitizeDOM's callers pre-validate nesting depth, but the traversal must not
@@ -142,7 +166,11 @@ func SanitizeDOM(doc *html.Node, audit AuditRecorder) {
 // unaffected by removals performed deeper in the walk. The stack is pooled,
 // but — unlike WalkNodes — deliberately has no node-count cap: sanitization
 // must never be silently truncated.
-func sanitizeNodeWithAudit(n *html.Node, audit AuditRecorder) {
+//
+// When unwrapButtons is true (reader mode), a <button> is intercepted before
+// the generic removed-tag path: its children are queued for sanitization and
+// the button is unwrapped, keeping the label text without keeping the control.
+func sanitizeNodeWithAuditMode(n *html.Node, audit AuditRecorder, unwrapButtons bool) {
 	if n == nil {
 		return
 	}
@@ -156,6 +184,22 @@ func sanitizeNodeWithAudit(n *html.Node, audit AuditRecorder) {
 	for len(stack) > 0 {
 		node := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+
+		if unwrapButtons && node.Type == html.ElementNode && strings.EqualFold(node.Data, "button") {
+			audit.RecordBlockedTag(node.Data)
+			// Queue the button's children for sanitization before unwrapping:
+			// after the unwrap they are ordinary siblings at the button's former
+			// position and would otherwise never be reached by the stack walk.
+			segStart := len(stack)
+			for child := node.FirstChild; child != nil; child = child.NextSibling {
+				stack = append(stack, child)
+			}
+			for i, j := segStart, len(stack)-1; i < j; i, j = i+1, j-1 {
+				stack[i], stack[j] = stack[j], stack[i]
+			}
+			unwrapNode(node)
+			continue
+		}
 
 		if !sanitizeNodeInPlace(node, audit) {
 			continue
@@ -249,6 +293,26 @@ func removeNode(n *html.Node) {
 	if n.Parent != nil {
 		n.Parent.RemoveChild(n)
 	}
+}
+
+// unwrapNode replaces n with its children in place: each child is inserted
+// before n in the parent's child list (preserving order), then n is detached.
+// It is the reader-mode alternative to removeNode for <button>: the interactive
+// control disappears but the label text survives. The re-parented children keep
+// their original subtree untouched, so any descendant sanitization still owed to
+// them must be done separately (sanitizeNodeWithAuditMode queues them before the
+// unwrap). Like removeNode, it is a no-op for a detached node.
+func unwrapNode(n *html.Node) {
+	if n.Parent == nil {
+		return
+	}
+	for child := n.FirstChild; child != nil; {
+		next := child.NextSibling
+		n.RemoveChild(child) // detach (clears child.Parent) before re-parenting
+		n.Parent.InsertBefore(child, n)
+		child = next
+	}
+	n.Parent.RemoveChild(n)
 }
 
 // dangerousSchemePrefixes lists the scheme prefixes blocked everywhere a URI

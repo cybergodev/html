@@ -269,8 +269,16 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 		}
 
 		startLen := tb.Len()
+		// continuesListItem records whether this block skipped the leading
+		// newline to continue its parent list item's marker line (see
+		// continuesListItem); its exit then also skips the extra blank line so
+		// the item stays a tight "- [label](URL)" line.
+		continuedMarker := false
 		if isBlockElement && startLen > 0 {
-			table.EnsureNewline(tb)
+			continuedMarker = continuesListItem(node, parentBlock, tb, chromeMode)
+			if !continuedMarker {
+				table.EnsureNewline(tb)
+			}
 			// Add Markdown list/indentation prefix (list markers for <li>,
 			// padding-left based indentation for other indented blocks).
 			if listPrefix := blockListPrefix(node); listPrefix != "" {
@@ -297,7 +305,7 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 		if isBlockElement && hasContent {
 			table.EnsureNewline(tb)
 			// Add an extra newline for paragraph-level blocks to create paragraph spacing in Markdown
-			if isParagraphBlock && tb.LastChar == '\n' {
+			if isParagraphBlock && tb.LastChar == '\n' && !continuedMarker {
 				_ = tb.WriteByte('\n')
 			}
 		}
@@ -311,6 +319,58 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 			extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, parentBlock, depth+1, inPre, chromeMode)
 		}
 	}
+}
+
+// continuesListItem reports whether node is about to become the first content
+// of its list item: a p/div child of an li/dd whose Markdown marker was just
+// written and is still the only thing on the current line. Such a child
+// continues the marker line instead of breaking after it, so the dropdown-menu
+// idiom <li><p><a>label</a></p></li> renders as "- [label](URL)" rather than a
+// lone bullet followed by the label on a paragraph of its own. Chrome mode
+// only — the Extract path's text formatting is unchanged.
+func continuesListItem(node, parentBlock *html.Node, tb *table.TrackedBuilder, chromeMode bool) bool {
+	if !chromeMode || node == nil || parentBlock == nil {
+		return false
+	}
+	if node.Data != "p" && node.Data != "div" {
+		return false
+	}
+	if parentBlock.Data != "li" && parentBlock.Data != "dd" {
+		return false
+	}
+	return pendingListMarkerLine(tb)
+}
+
+// pendingListMarkerLine reports whether the builder's current line holds only
+// a list marker in progress — indentation, one marker character ("-", "*",
+// "+", ":" for <dd>, or ordered "N."), trailing spaces — with none of the
+// item's content written yet.
+func pendingListMarkerLine(tb *table.TrackedBuilder) bool {
+	b := tb.Bytes()
+	i := len(b)
+	for i > 0 && (b[i-1] == ' ' || b[i-1] == '\t') {
+		i--
+	}
+	if i == 0 {
+		return false
+	}
+	switch b[i-1] {
+	case '-', '*', '+', ':':
+		i--
+	default:
+		j := i
+		for j > 0 && b[j-1] >= '0' && b[j-1] <= '9' {
+			j--
+		}
+		if j == i || j == 0 || b[j-1] != '.' {
+			return false
+		}
+		i = j - 1
+	}
+	for i > 0 && (b[i-1] == ' ' || b[i-1] == '\t') {
+		i--
+	}
+	return i == 0 || b[i-1] == '\n'
 }
 
 // tableTokenText returns node's flattened visible text with [LINK:n]…[/LINK]
@@ -494,21 +554,28 @@ func CleanContentNode(node *html.Node) *html.Node {
 	return pruneDescendants(node, ShouldRemoveElement)
 }
 
-// RemoveHiddenElements removes hidden elements from node's subtree in place:
-// the hidden attribute, aria-hidden="true", a display:none/visibility:hidden
-// style, or a hidden class token (hidden, sr-only, d-none, ...). It is the
-// light-weight cleaner for page-chrome sections in reader mode: CleanContentNode
-// applies the content scorer's class removal, which would strip a nav region's
-// own "nav-menu" children along with the ads, so chrome regions clear only
-// what is invisible. The root node itself is never removed (callers decide its
-// fate; see IsHiddenElement).
-func RemoveHiddenElements(node *html.Node) *html.Node {
-	return pruneDescendants(node, IsHiddenElement)
+// RemoveHiddenElementsReader removes hidden elements from node's subtree in
+// place, testing hidden-ness with IsHiddenElementReader: the hidden attribute,
+// aria-hidden="true", a display:none/visibility:hidden style, or an
+// always-hidden class token (d-none, sr-only, ...). It is the light-weight
+// cleaner for page-chrome sections in reader mode: CleanContentNode applies
+// the content scorer's class removal, which would strip a nav region's own
+// "nav-menu" children along with the ads, so chrome regions clear only what is
+// invisible — and a viewport-less, pointer-less reader cannot resolve
+// responsive visibility (Tailwind's "hidden md:block", "xl:hidden") or
+// bare-"hidden" hover/click disclosure panels (dropdown menus, drawers) to
+// invisible, so those are kept: they are precisely the nav link data ReadPage
+// exists to preserve. The root node itself is never removed (callers decide
+// its fate; read.go tests section roots with IsHiddenElementReader /
+// IsHiddenElementReaderStrict). The Extract path keeps applying its hidden
+// semantics through ShouldRemove's IsHiddenElement, unchanged.
+func RemoveHiddenElementsReader(node *html.Node) *html.Node {
+	return pruneDescendants(node, IsHiddenElementReader)
 }
 
 // pruneDescendants detaches every element child for which remove returns
 // true, in place, and returns node. It is the single implementation of the
-// detach-while-iterating walk CleanContentNode and RemoveHiddenElements
+// detach-while-iterating walk CleanContentNode and RemoveHiddenElementsReader
 // share. Marked children are detached immediately — saving next BEFORE
 // RemoveChild, which clears the child's sibling links — instead of being
 // collected into a toRemove slice for a second pass; detached subtrees are

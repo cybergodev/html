@@ -194,9 +194,16 @@ func (r *ReadResult) render(pick func(*PageSection) string, withLinks bool) stri
 // Section cleaning is kind-aware: main regions get the article-grade cleaning
 // (ads, hidden nodes, and nested navigation removed); chrome regions
 // (header/navigation/aside/footer) keep their menus — a header's <nav> is its
-// substance — and are stripped of hidden nodes only. Residual blocks the
-// article scorer would remove outright (ads, social, related, comments,
-// cookie bars) are dropped entirely. A later chrome section whose
+// substance — and are stripped of hidden nodes only. "Hidden" there means the
+// unambiguous signals: the hidden attribute, aria-hidden="true", an inline
+// display:none/visibility:hidden style, and always-hidden utility classes
+// (d-none, sr-only, invisible, ...). The bare "hidden"/"hide" class token and
+// responsive-visibility classes ("hidden md:block", "xl:hidden") mark
+// hover/click- or breakpoint-revealed menus (dropdown panels, drawers) and
+// are kept — the reading view has no pointer or viewport to resolve them
+// against, and their link data is precisely what ReadPage preserves. Residual
+// blocks the article scorer would remove outright (ads, social, related,
+// comments, cookie bars) are dropped entirely. A later chrome section whose
 // whitespace-normalized text exactly duplicates an earlier section of the
 // same kind (the same menu visibly rendered twice) is dropped; main sections
 // are never deduplicated.
@@ -543,9 +550,9 @@ func (p *Processor) readContentWithContext(ctx context.Context, htmlContent stri
 
 	if p.config.EnableSanitization {
 		if p.audit != nil && p.config.Audit.Enabled {
-			internal.SanitizeDOM(doc, p.audit)
+			internal.SanitizeDOMReader(doc, p.audit)
 		} else {
-			internal.SanitizeDOM(doc, internal.NoOpAuditRecorder{})
+			internal.SanitizeDOMReader(doc, internal.NoOpAuditRecorder{})
 		}
 	}
 
@@ -634,16 +641,29 @@ func (p *Processor) readFromDocument(doc *stdxhtml.Node, meta internal.Metadata)
 	for i := range specs {
 		spec := &specs[i]
 
-		// A section root that is itself hidden (a mobile-duplicate nav marked
-		// d-none, a collapsed <main class="hidden">) is invisible content:
-		// drop the whole section. Cleaning never removes roots, so the check
-		// belongs here.
-		if internal.IsHiddenElement(spec.Node) {
+		// A section root that is itself hidden is invisible content: drop the
+		// whole section (cleaning never removes roots, so the check belongs
+		// here). Chrome roots use the reader-mode hidden test, which drops the
+		// always-hidden roots (d-none, the hidden attribute, inline hiding
+		// styles) but keeps roots revealed only by breakpoint or interaction
+		// (a bare-"hidden" nav drawer, a "hidden md:block" menu) — the reading
+		// view has no viewport or pointer to resolve them against. Main roots
+		// use the strict reader variant, so a token-classed main wrapper
+		// collapsed with a bare "hidden" (an SPA shell) still drops whole
+		// while its responsive form survives. Semantic <main>/<article> roots
+		// are governed by the primary-container class exemption in both
+		// variants: only the hidden attribute, aria-hidden, or an inline
+		// hiding style ever hides them.
+		if spec.Chrome {
+			if internal.IsHiddenElementReader(spec.Node) {
+				continue
+			}
+		} else if internal.IsHiddenElementReaderStrict(spec.Node) {
 			continue
 		}
 
 		if spec.Chrome {
-			internal.RemoveHiddenElements(spec.Node)
+			internal.RemoveHiddenElementsReader(spec.Node)
 		} else {
 			internal.CleanContentNode(spec.Node)
 		}

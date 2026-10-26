@@ -241,6 +241,183 @@ func TestReadPageHiddenSectionsDropped(t *testing.T) {
 	}
 }
 
+// TestReadPageResponsiveNavKept asserts the reader mode preserves a nav whose
+// container is hidden only on one Tailwind breakpoint ("hidden md:flex" = visible
+// from md up). The Extract path has no viewport, so its responsive semantics
+// are a design choice scoped to the ReadPage family only.
+func TestReadPageResponsiveNavKept(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<nav class="hidden md:flex"><a href="/">Home</a><a href="/a">A</a><a href="/b">B</a></nav>
+		<main><p>Article prose dominating the page text by a comfortable margin for the classifier.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	var nav *PageSection
+	for i := range page.Sections {
+		if page.Sections[i].Kind == SectionNavigation {
+			nav = &page.Sections[i]
+			break
+		}
+	}
+	if nav == nil {
+		t.Fatal("no navigation section; responsive nav was dropped")
+	}
+	if !strings.Contains(nav.Text, "A") || !strings.Contains(nav.Text, "B") {
+		t.Fatalf("responsive nav links lost: %q", nav.Text)
+	}
+	if len(nav.Links) != 3 {
+		t.Fatalf("nav links = %d, want 3", len(nav.Links))
+	}
+}
+
+// TestReadPageButtonLabelKept asserts reader mode keeps a menu's top-level
+// label when it is a <button> dropdown trigger. Reader-mode sanitization unwraps
+// the button so the label survives; the Extract path (SanitizeDOM) still drops
+// the button and its text wholesale.
+func TestReadPageButtonLabelKept(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<nav><ul><li><button type="button">Investing</button><ul><li><a href="/stocks">Stocks</a></li></ul></li></ul></nav>
+		<main><p>Article prose dominating the page text by a comfortable margin for the classifier.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	var nav *PageSection
+	for i := range page.Sections {
+		if page.Sections[i].Kind == SectionNavigation {
+			nav = &page.Sections[i]
+			break
+		}
+	}
+	if nav == nil {
+		t.Fatal("no navigation section")
+	}
+	if !strings.Contains(nav.Text, "Investing") {
+		t.Fatalf("button label lost: %q", nav.Text)
+	}
+	if !strings.Contains(nav.Text, "Stocks") {
+		t.Fatalf("dropdown link lost: %q", nav.Text)
+	}
+}
+
+// TestReadPageHiddenDropdownKept asserts reader mode keeps a dropdown menu
+// panel marked with the bare Tailwind "hidden" class (display:none until
+// hover/click reveals it) — the standard disclosure idiom on component-built
+// sites. The reader view has no pointer, so pruning such panels discarded the
+// page's nav link data. The Extract path still treats the class as hidden
+// (matchesHiddenClassToken is unchanged). It also pins the rendering: a <p>
+// child of the <li> continues the marker line, so the item reads
+// "- [Stocks](…)", not a lone bullet with the label on its own paragraph.
+func TestReadPageHiddenDropdownKept(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<header>
+			<nav><ul>
+				<li><button type="button">Investing</button>
+					<ul class="nav-dropdown shadow-md hidden">
+						<li><p><a href="/insights/stocks">Stocks</a></p></li>
+						<li><p><a href="/insights/etfs">ETFs</a></p></li>
+					</ul></li>
+			</ul></nav>
+		</header>
+		<main><p>Article prose dominating the page text by a comfortable margin for the classifier.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	var header *PageSection
+	for i := range page.Sections {
+		if page.Sections[i].Kind == SectionHeader {
+			header = &page.Sections[i]
+			break
+		}
+	}
+	if header == nil {
+		t.Fatal("no header section")
+	}
+	if !strings.Contains(header.Text, "Stocks") || !strings.Contains(header.Text, "ETFs") {
+		t.Fatalf("bare-hidden dropdown links lost: %q", header.Text)
+	}
+	if len(header.Links) != 2 {
+		t.Fatalf("header links = %d, want 2", len(header.Links))
+	}
+	if !strings.Contains(header.Text, "- [Stocks](") || !strings.Contains(header.Text, "- [ETFs](") {
+		t.Fatalf("dropdown items must render as list items with inline links: %q", header.Text)
+	}
+	if !strings.Contains(header.PlainText, "- Stocks") {
+		t.Fatalf("plain form keeps the item on the marker line: %q", header.PlainText)
+	}
+}
+
+// TestReadPageMainRootHiddenSemantics pins the main-region root hidden rules
+// for non-landmark main wrappers (token-classed divs): one collapsed with a
+// bare "hidden" class (an SPA shell) drops whole, while its responsive twin
+// ("hidden lg:block") survives — the reader has no viewport to resolve the
+// breakpoint against.
+func TestReadPageMainRootHiddenSemantics(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<div class="article hidden"><p>Collapsed shell text that must not surface in the reading view at all.</p></div>
+		<div class="article hidden lg:block"><p>Desktop main with enough words to dominate the page text for the classifier.</p></div>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	if got := readerSectionKinds(t, page); len(got) != 1 || got[0] != SectionMain {
+		t.Fatalf("kinds = %v, want exactly one main section", got)
+	}
+	rendered := page.Render()
+	if strings.Contains(rendered, "Collapsed shell") {
+		t.Fatalf("collapsed main wrapper leaked into output: %q", rendered)
+	}
+	if !strings.Contains(rendered, "Desktop main") {
+		t.Fatalf("responsive main wrapper lost: %q", rendered)
+	}
+}
+
+// TestReadPageLandmarkMainClassExempt pins the primary-container exemption at
+// the section-root level: a semantic <main> marked hidden by CLASS is kept (the
+// class test never runs for main/article/role=main), while the hidden
+// ATTRIBUTE still drops it — the two signals readers can actually rely on.
+func TestReadPageLandmarkMainClassExempt(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<main hidden><p>Attribute-hidden main text that must never surface in the reading view.</p></main>
+		<main class="hidden"><p>Landmark main whose class never hides it, holding enough words to dominate classification.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	if got := readerSectionKinds(t, page); len(got) != 1 || got[0] != SectionMain {
+		t.Fatalf("kinds = %v, want exactly one main section", got)
+	}
+	rendered := page.Render()
+	if strings.Contains(rendered, "Attribute-hidden") {
+		t.Fatalf("attribute-hidden main leaked into output: %q", rendered)
+	}
+	if !strings.Contains(rendered, "Landmark main") {
+		t.Fatalf("class-marked landmark main lost: %q", rendered)
+	}
+}
+
 func TestReadPageChromeKeepsNavClassChildren(t *testing.T) {
 	t.Parallel()
 

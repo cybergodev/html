@@ -730,6 +730,110 @@ func TestShouldRemoveElementNil(t *testing.T) {
 	}
 }
 
+// TestIsHiddenElementReader asserts the reader-mode hidden predicate keeps
+// elements hidden only by the bare "hidden"/"hide" class or a responsive
+// breakpoint (Tailwind's "hidden md:block", "xl:hidden") — hover/click
+// disclosure panels a viewport-less, pointer-less reader must preserve — while
+// still stripping the always-hidden classes and the unambiguous signals
+// (d-none, sr-only, the hidden attribute, aria-hidden, inline display:none).
+func TestIsHiddenElementReader(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		html string
+		want bool
+	}{
+		{name: "bare hidden is an interaction hook, kept", html: `<div class="hidden">x</div>`, want: false},
+		{name: "bare hide is an interaction hook, kept", html: `<div class="hide">x</div>`, want: false},
+		{name: "dropdown panel kept", html: `<div class="nav-dropdown shadow-md hidden">x</div>`, want: false},
+		{name: "d-none stays hidden", html: `<div class="d-none">x</div>`, want: true},
+		{name: "sr-only stays hidden", html: `<div class="sr-only">x</div>`, want: true},
+		{name: "visually-hidden stays hidden", html: `<div class="visually-hidden">x</div>`, want: true},
+		{name: "is-hidden stays hidden", html: `<div class="is-hidden">x</div>`, want: true},
+		{name: "invisible stays hidden", html: `<div class="invisible">x</div>`, want: true},
+		{name: "responsive hidden md:block is kept", html: `<div class="hidden md:block">x</div>`, want: false},
+		{name: "responsive hidden lg:flex is kept", html: `<div class="hidden lg:flex">x</div>`, want: false},
+		{name: "responsive hidden 2xl:grid is kept", html: `<div class="hidden 2xl:grid">x</div>`, want: false},
+		{name: "prefixed xl:hidden is kept", html: `<div class="xl:hidden">x</div>`, want: false},
+		{name: "bootstrap hidden-sm is kept", html: `<div class="hidden-sm">x</div>`, want: false},
+		{name: "responsive in longer class list", html: `<div class="flex items-center hidden md:inline-flex">x</div>`, want: false},
+		{name: "d-none plus responsive stays hidden", html: `<div class="d-none hidden md:block">x</div>`, want: true},
+		{name: "hidden attribute stays hidden", html: `<div hidden>visible-ish</div>`, want: true},
+		{name: "aria-hidden true stays hidden", html: `<div aria-hidden="true">x</div>`, want: true},
+		{name: "inline display none stays hidden", html: `<div style="display:none">x</div>`, want: true},
+		{name: "not hidden", html: `<div class="container">x</div>`, want: false},
+		{name: "hidden as part of unrelated word", html: `<div class="not-hiddenize">x</div>`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, _ := html.Parse(strings.NewReader(tt.html))
+			var target *html.Node
+			WalkNodes(doc, func(n *html.Node) bool {
+				if n.Type == html.ElementNode && n.Data == "div" {
+					target = n
+					return false
+				}
+				return true
+			})
+			if target == nil {
+				t.Fatal("could not find div")
+			}
+			if got := IsHiddenElementReader(target); got != tt.want {
+				t.Errorf("IsHiddenElementReader() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsHiddenElementReaderStrict asserts the main-root reader variant: for
+// non-landmark main wrappers (token-classed divs) the bare "hidden" token
+// still hides (an SPA shell, not a menu) while the responsive forms
+// ("hidden md:block", "xl:hidden") stay kept; semantic <main> roots never
+// reach the class test at all (the primary-container exemption), so only the
+// unambiguous signals hide them.
+func TestIsHiddenElementReaderStrict(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		tag  string
+		html string
+		want bool
+	}{
+		{name: "landmark main class-exempt", tag: "main", html: `<main class="hidden">x</main>`, want: false},
+		{name: "landmark main hidden attribute hides", tag: "main", html: `<main hidden>x</main>`, want: true},
+		{name: "wrapper bare hidden collapses", tag: "div", html: `<div class="article hidden">x</div>`, want: true},
+		{name: "responsive hidden md:block kept", tag: "div", html: `<div class="article hidden md:block">x</div>`, want: false},
+		{name: "prefixed xl:hidden kept", tag: "div", html: `<div class="article xl:hidden">x</div>`, want: false},
+		{name: "bootstrap hidden-sm kept", tag: "div", html: `<div class="article hidden-sm">x</div>`, want: false},
+		{name: "d-none collapses", tag: "div", html: `<div class="article d-none">x</div>`, want: true},
+		{name: "d-none plus responsive collapses", tag: "div", html: `<div class="article d-none hidden lg:block">x</div>`, want: true},
+		{name: "visible wrapper", tag: "div", html: `<div class="article container">x</div>`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, _ := html.Parse(strings.NewReader(tt.html))
+			var target *html.Node
+			WalkNodes(doc, func(n *html.Node) bool {
+				if n.Type == html.ElementNode && n.Data == tt.tag {
+					target = n
+					return false
+				}
+				return true
+			})
+			if target == nil {
+				t.Fatalf("could not find %s", tt.tag)
+			}
+			if got := IsHiddenElementReaderStrict(target); got != tt.want {
+				t.Errorf("IsHiddenElementReaderStrict() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestShouldRemoveElementTextNode(t *testing.T) {
 	t.Parallel()
 

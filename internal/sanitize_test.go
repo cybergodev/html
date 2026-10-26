@@ -661,7 +661,42 @@ func TestSanitizeDOM(t *testing.T) {
 	t.Run("nil document is safe", func(t *testing.T) {
 		SanitizeDOM(nil, NoOpAuditRecorder{})
 	})
-
+	t.Run("reader mode unwraps button but keeps its label", func(t *testing.T) {
+		doc := mustParseHTML(t, `<nav><button type="button">Investing</button><a href="/x">X</a></nav>`)
+		SanitizeDOMReader(doc, NoOpAuditRecorder{})
+		result := mustRenderBody(t, doc)
+		if strings.Contains(result, "<button") {
+			t.Errorf("button element should still be removed, got: %s", result)
+		}
+		if !strings.Contains(result, "Investing") {
+			t.Errorf("button label should be preserved in reader mode, got: %s", result)
+		}
+		if !strings.Contains(result, `<a href="/x">X</a>`) {
+			t.Errorf("sibling link should be preserved, got: %s", result)
+		}
+	})
+	t.Run("extract mode still drops button whole", func(t *testing.T) {
+		doc := mustParseHTML(t, `<div><button>Subscribe</button>kept</div>`)
+		SanitizeDOM(doc, NoOpAuditRecorder{})
+		result := mustRenderBody(t, doc)
+		if strings.Contains(result, "Subscribe") {
+			t.Errorf("button text should be dropped in extract mode, got: %s", result)
+		}
+		if !strings.Contains(result, "kept") {
+			t.Errorf("sibling text should be preserved, got: %s", result)
+		}
+	})
+	t.Run("reader mode unwraps nested button content", func(t *testing.T) {
+		doc := mustParseHTML(t, `<div><button><span>Go <b>big</b></span></button></div>`)
+		SanitizeDOMReader(doc, NoOpAuditRecorder{})
+		result := mustRenderBody(t, doc)
+		if strings.Contains(result, "<button") {
+			t.Errorf("button element should be removed, got: %s", result)
+		}
+		if !strings.Contains(result, "Go") || !strings.Contains(result, "<b>big</b>") {
+			t.Errorf("nested button content should survive the unwrap, got: %s", result)
+		}
+	})
 	t.Run("sanitizes style attribute", func(t *testing.T) {
 		doc := mustParseHTML(t, `<div style="color: red; expression(evil)">text</div>`)
 		SanitizeDOM(doc, NoOpAuditRecorder{})
