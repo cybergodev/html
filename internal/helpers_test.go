@@ -12,14 +12,18 @@ func TestWalkNodes(t *testing.T) {
 
 	doc, _ := html.Parse(strings.NewReader(`<html><body><p>Test</p></body></html>`))
 
-	count := 0
+	visited := map[string]bool{}
 	WalkNodes(doc, func(n *html.Node) bool {
-		count++
+		if n.Type == html.ElementNode {
+			visited[n.Data] = true
+		}
 		return true
 	})
 
-	if count == 0 {
-		t.Error("WalkNodes() should visit nodes")
+	for _, want := range []string{"html", "head", "body", "p"} {
+		if !visited[want] {
+			t.Errorf("WalkNodes() never visited <%s>; visited=%v", want, visited)
+		}
 	}
 }
 
@@ -208,6 +212,24 @@ func TestCleanText(t *testing.T) {
 				input: "Line1\nLine2",
 				want:  "Line1\nLine2",
 			},
+			{
+				// Fast-path consistency (from p2_regression_test.go): trailing
+				// blanks are trimmed on both the fast and the regex path, while
+				// leading spaces are indent and preserved by both.
+				name:  "trailing space trimmed",
+				input: "hello ",
+				want:  "hello",
+			},
+			{
+				name:  "trailing tab trimmed",
+				input: "hello\t",
+				want:  "hello",
+			},
+			{
+				name:  "leading spaces kept as indent",
+				input: "  hello",
+				want:  "  hello",
+			},
 		}
 
 		for _, tt := range tests {
@@ -311,6 +333,12 @@ func TestIsExternalURL(t *testing.T) {
 		{"page.html", false},
 		{"#anchor", false},
 		{"", false},
+		// Scheme matching is case-insensitive (rows from the former
+		// TestIsExternalURL_CaseInsensitiveScheme in url_test.go).
+		{"HTTP://example.com", true},
+		{"Http://example.com", true},
+		{"HTTPS://example.com", true},
+		{"hTtPs://example.com", true},
 	}
 
 	for _, tt := range tests {
@@ -502,6 +530,14 @@ func TestIsValidURL(t *testing.T) {
 		{"URL at max length", strings.Repeat("a", MaxURLLength), true},
 		{"data URL too long", "data:text/plain;base64," + strings.Repeat("A", MaxDataURILength+1), false},
 		{"data URL with invalid char", "data:text/plain;base64,\x00invalid", false},
+		// data: URLs are exempt from the flat MaxURLLength gate and bounded by
+		// MaxDataURILength instead (C-2): a base64 image between the two
+		// ceilings is valid — before the exemption every real inline image
+		// died at the gate while the DOM sanitizer kept it.
+		{"data URL above MaxURLLength within MaxDataURILength", "data:image/png;base64," + strings.Repeat("A", MaxURLLength), true},
+		// The ceiling itself is inclusive (the +1 row above pins the reject
+		// side of the same boundary).
+		{"data URL at exactly MaxDataURILength", "data:image/png;base64," + strings.Repeat("A", MaxDataURILength-22), true},
 
 		// Path traversal
 		{"path traversal /../", "/../etc/passwd", false},
@@ -509,6 +545,9 @@ func TestIsValidURL(t *testing.T) {
 		{"protocol relative dangerous", "//javascript:alert(1)", false},
 		{"protocol relative vbscript", "//vbscript:alert(1)", false},
 		{"protocol relative file", "//file:///etc/passwd", false},
+		// Whitespace-disguised protocol-relative schemes are owned by the
+		// containsDangerousScheme gate, not the former "//" block (M-3).
+		{"protocol relative javascript with space", "// javascript:alert(1)", false},
 
 		// Dangerous schemes are now rejected (defense-in-depth: these reach
 		// IsValidURL via the non-sanitizing ExtractAllLinks path and the
@@ -996,5 +1035,132 @@ func TestImgHasValidSrc(t *testing.T) {
 		if got := imgHasValidSrc(node); got != wantVal {
 			t.Errorf("imgHasValidSrc(%s) = %v, want %v", class, got, wantVal)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unsafe conversion helpers (from boundary_gaps_test.go)
+// ---------------------------------------------------------------------------
+
+// TestUnsafeConversionsEmpty pins the zero-length fast paths of the unsafe
+// conversion helpers.
+func TestUnsafeConversionsEmpty(t *testing.T) {
+	t.Parallel()
+
+	if got := BytesToString(nil); got != "" {
+		t.Errorf("BytesToString(nil) = %q, want empty", got)
+	}
+	if got := BytesToString([]byte{}); got != "" {
+		t.Errorf("BytesToString(empty) = %q, want empty", got)
+	}
+	if got := StringToBytes(""); got != nil {
+		t.Errorf("StringToBytes(\"\") = %v, want nil", got)
+	}
+
+	// Round-trip on non-empty input.
+	s := "héllo 世界"
+	if got := string(StringToBytes(s)); got != s {
+		t.Errorf("StringToBytes round-trip = %q, want %q", got, s)
+	}
+	if got := BytesToString([]byte(s)); got != s {
+		t.Errorf("BytesToString round-trip = %q, want %q", got, s)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TextContentLength equivalence oracle (from textlength_test.go)
+// ---------------------------------------------------------------------------
+
+// textLengthCorpus holds documents chosen to hit every branch where
+// TextContentLength could drift from len(GetTextContent): NBSP folding, CR
+// dropping, inter-node space insertion, whitespace-only text nodes, raw-text
+// subtree skips, CJK/emoji multi-byte text, and nested inline spacing.
+var textLengthCorpus = []string{
+	// Compact article with links (inter-node space inside split text runs).
+	`<html><body><article><h1>Title</h1><p>Paragraph with <a href="/x">a link</a> and text.</p></article></body></html>`,
+
+	// Pretty-printed markup: whitespace-only text nodes everywhere, each
+	// carrying newlines, tabs, and CRs the normalizer must fold.
+	"<html>\r\n  <body>\r\n    <div>\n\t  <p>one</p>\n\n\n      <p>two</p>\n    </div>\r\n  </body>\n</html>",
+
+	// NBSP in every position: interior, leading, trailing, doubled.
+	"<p> lead</p><p>trail </p><p>a b  c</p><p>  </p>",
+
+	// CR-only normalization triggers and CR+LF mixes.
+	"<div>a\rb\nc\r\nd</div><span> e\r </span>",
+
+	// Raw-text subtrees are skipped entirely (script/style/noscript).
+	`<div>visible<script>evil() {};</script><style>.x{color:red}</style><noscript>hidden</noscript>after</div>`,
+
+	// Table cells (single text child fast path) and a structure-only table.
+	`<table><tr><td>a</td><td> b&nbsp;c </td></tr><tr><th>H</th><td>x y</td></tr></table>`,
+
+	// CJK and emoji: multi-byte text where byte lengths matter, no spaces.
+	`<p>第1段包含链接以及正文文字内容，中文之间没有空格。</p><p>😀🎉🌍 emoji</p>`,
+
+	// Nested inline elements with significant spaces around them.
+	`<a>alpha <b>beta</b> gamma</a><span>x <em>y</em> <strong>z</strong></span>`,
+
+	// Empty and whitespace-edge shapes.
+	`<p></p><p> </p><p>&nbsp;</p><div><span></span></div>`,
+
+	// Head/meta content that metricsSkipTags-style logic might see.
+	`<html><head><title> T </title><meta charset="utf-8"></head><body><svg>ignore</svg>text</body></html>`,
+}
+
+// TestTextContentLengthMatchesGetTextContent pins the equivalence contract of
+// TextContentLength: for every node of every corpus document, the computed
+// length must equal the length of the string GetTextContent actually builds.
+// GetTextContent is the behavior-defining implementation; this test fails
+// whenever the two drift apart.
+func TestTextContentLengthMatchesGetTextContent(t *testing.T) {
+	checked := 0
+	for _, doc := range textLengthCorpus {
+		root, err := html.Parse(strings.NewReader(doc))
+		if err != nil {
+			t.Fatalf("parse corpus doc %q: %v", doc, err)
+		}
+		WalkNodes(root, func(n *html.Node) bool {
+			want := len(GetTextContent(n))
+			if got := TextContentLength(n); got != want {
+				t.Errorf("TextContentLength(%s %q) = %d, want len(GetTextContent) = %d",
+					nodeKind(n), n.Data, got, want)
+			}
+			checked++
+			return true
+		})
+	}
+	if checked == 0 {
+		t.Fatal("corpus produced no nodes")
+	}
+}
+
+// TestTextContentLengthEmptyInput covers the nil/empty degenerate inputs,
+// which WalkNodes cannot reach from a parsed document.
+func TestTextContentLengthEmptyInput(t *testing.T) {
+	if got := TextContentLength(nil); got != 0 {
+		t.Errorf("TextContentLength(nil) = %d, want 0", got)
+	}
+	empty := &html.Node{Type: html.ElementNode, Data: "p"}
+	if got := TextContentLength(empty); got != 0 {
+		t.Errorf("TextContentLength(empty p) = %d, want 0", got)
+	}
+}
+
+// nodeKind labels a node for failure messages.
+func nodeKind(n *html.Node) string {
+	switch n.Type {
+	case html.ElementNode:
+		return "element"
+	case html.TextNode:
+		return "text"
+	case html.DocumentNode:
+		return "document"
+	case html.CommentNode:
+		return "comment"
+	case html.DoctypeNode:
+		return "doctype"
+	default:
+		return "other"
 	}
 }

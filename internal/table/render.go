@@ -162,6 +162,22 @@ const maxGridCells = 1 << 20
 func calculateMaxColumns(tableData [][]CellData) int {
 	maxCols := 0
 	numRows := len(tableData)
+
+	// Fast path: with no rowspan > 1 anywhere, no cell ever shifts right (the
+	// occupied map below never gains an entry), so the grid width is simply
+	// the longest row — the same fact applyRowspanGrid's anyRowspan shortcut
+	// relies on. Skips the occupied slice allocation and the per-cell probe.
+	if !anyRowspan(tableData) {
+		for _, row := range tableData {
+			if len(row) > maxCols {
+				maxCols = len(row)
+			}
+		}
+		if maxCols > 1 && numRows > maxGridCells/maxCols {
+			maxCols = max(maxGridCells/numRows, 1)
+		}
+		return maxCols
+	}
 	// occupied[r] records columns in row r already taken by a rowspan from an
 	// earlier row. Only rows that receive a span get a non-nil map.
 	occupied := make([]map[int]bool, numRows)

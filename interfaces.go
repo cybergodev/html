@@ -5,9 +5,12 @@ import "context"
 // Extractor defines the complete interface for HTML content extraction.
 // This is the primary interface for mocking and testing.
 //
-// Package-level convenience functions are available for all Extractor methods,
-// accepting an optional Config variadic parameter (cfg ...Config).
-// When no config is provided, DefaultConfig() is used.
+// Package-level convenience functions mirror every extraction method of this
+// interface, accepting an optional Config variadic parameter (cfg ...Config).
+// When no config is provided, DefaultConfig() is used. Close is the one
+// exception: it has no package-level counterpart, because the convenience
+// functions run on pooled or one-shot processors whose cleanup they manage
+// internally.
 //
 // Every method is implemented by [Processor]; see those methods for full
 // semantics and the errors they can return.

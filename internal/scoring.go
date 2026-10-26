@@ -47,6 +47,12 @@ func metricsSkipTags(tag string) bool {
 // collectContentMetrics collects all scoring metrics in a single DOM traversal.
 // This is more efficient than calling separate functions for each metric.
 // Optimized with inline NBSP handling to avoid function call overhead.
+//
+// The subtree skip set (including ShouldRemoveElement) always reflects the
+// SHARED default scorer's policy, even when a custom ScoringConfig is in
+// play: that config's RemovePatterns affects only the node-level guard in
+// scoreWithMetrics. NewDefaultScorerWithConfig is a test/calibration surface,
+// so the mixed granularity is documented here rather than unified.
 func collectContentMetrics(node *html.Node) contentMetrics {
 	var metrics contentMetrics
 
@@ -234,10 +240,8 @@ func isListingContainer(node *html.Node) bool {
 	return totalText > 0 && float64(linkText)/float64(totalText) > listingArticleLinkDensity
 }
 
-// calculateLinkDensityFromMetrics calculates link density from collected metrics.
-// The denominator is textLength: the two were kept as separate always-equal
-// fields (a historical "total" distinction never implemented), and the
-// link-density read was the only consumer of the redundant one.
+// calculateLinkDensityFromMetrics returns the share of a node's text that
+// sits inside links: linkTextLength / textLength. Zero when there is no text.
 func calculateLinkDensityFromMetrics(m contentMetrics) float64 {
 	if m.textLength == 0 {
 		return 0.0

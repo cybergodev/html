@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -107,6 +108,17 @@ func main() {
 		fmt.Printf("  %-10s %3d words %2d links\n", sec.Kind, sec.WordCount, len(sec.Links))
 	}
 
+	// ReadResult is JSON-serializable (each section carries
+	// kind/text/plain_text/links/word_count), for pipelines that route
+	// regions downstream instead of rendering them:
+	if b, jerr := json.Marshal(page); jerr == nil {
+		snippet := string(b)
+		if len(snippet) > 100 {
+			snippet = snippet[:100] + "..."
+		}
+		fmt.Printf("As JSON (%d bytes): %s\n\n", len(b), snippet)
+	}
+
 	// Feed only the main content to the LLM when the chrome is noise:
 	fmt.Println()
 	fmt.Println("Main section only:")
@@ -137,8 +149,7 @@ func main() {
 	fmt.Println("------------------------------------------------")
 
 	cfg := html.DefaultConfig()
-	cfg.InlineLinkFormat = "html"
-	cfg.MaxCacheEntries = 0
+	cfg.InlineLinkFormat = html.FormatHTML
 	anchorPage, err := html.ReadPage(doc, cfg)
 	if err != nil {
 		log.Fatal(err)

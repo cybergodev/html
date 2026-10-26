@@ -6,7 +6,7 @@
 [![Security](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
 [![Thread Safe](https://img.shields.io/badge/thread%20safe-yes-brightgreen.svg)](#-thread-safety)
 
-**A high-performance Go library for intelligent HTML content extraction**, built on `golang.org/x/net/html`.
+**A Go library for extracting clean text, structured metadata, links, and media from HTML pages**, built on `golang.org/x/net/html`.
 
 **[中文文档](README_zh-CN.md)** | **[www.cybergo.dev/html](https://www.cybergo.dev/html)**
 
@@ -17,7 +17,7 @@
 | Feature | Description |
 |---------|-------------|
 | 🚀 **One-Line Extraction** | Extract clean text from HTML in a single function call |
-| 🔍 **Smart Article Detection** | Identifies main content using scoring algorithms |
+| 🔍 **Article Detection** | A scoring algorithm identifies the main content block |
 | 📋 **Metadata Extraction** | author, published time, description, site name, canonical URL |
 | 🎚️ **Extraction Confidence** | Per-document quality signal (article / listing / fallback / paywall detection) |
 | 📖 **Reader Mode** | Full-page structured reading view — header / navigation / main / aside / footer kept as labeled sections with inline links, for feeding clean pages to LLMs |
@@ -26,7 +26,7 @@
 | 📦 **Multiple Output Formats** | Text, Markdown, JSON |
 | 🛡️ **Security First** | HTML sanitization, XSS protection, audit logging |
 | 🧵 **Thread-Safe** | Concurrent use without external synchronization |
-| 🔗 **Built on golang.org/x/net/html** | Uses the standard HTML parser internally |
+| 🔗 **Built on x/net/html** | No custom parser; HTML5 error-recovery parsing |
 
 ---
 
@@ -49,7 +49,7 @@
 go get github.com/cybergodev/html
 ```
 
-**Requirements**: Go 1.26+
+**Requirements**: Go 1.26+ · Runtime dependencies: `golang.org/x/net` (HTML parsing), `golang.org/x/text` (encoding conversion)
 
 ---
 
@@ -87,6 +87,7 @@ func main() {
 - ✅ Removes navigation, footers, ads, scripts
 - ✅ Detects main content using scoring algorithms
 - ✅ Handles character encoding (UTF-8, Windows-1252, GBK, etc.)
+- ✅ Renders headings with Markdown-style prefixes (h1 → `#`, h2 → `##`)
 - ✅ Cleans up whitespace
 
 ---
@@ -132,7 +133,7 @@ func main() {
 
 ### 2️⃣ Processor Usage (Recommended for Multiple Extractions)
 
-For multiple extractions, create a Processor to leverage caching:
+For repeated extractions, create a Processor — results are cached between calls (package-level functions run on one-shot processors with caching disabled):
 
 ```go
 package main
@@ -198,6 +199,8 @@ func main() {
     fmt.Printf("Found %d images\n", len(result.Images))
 }
 ```
+
+> The format values above are also exported as constants: `html.FormatNone`, `html.FormatMarkdown`, `html.FormatHTML`, and `html.FormatPlaceholder` (`InlineImageFormat` only).
 
 ---
 
@@ -389,6 +392,11 @@ processor.ClearCache()
 // Reset statistics (preserves cache entries)
 processor.ResetStatistics()
 ```
+
+> The cache and statistics exist only on a `Processor`. Package-level convenience
+> functions (`html.Extract`, `html.ExtractToMarkdown`, …) run on one-shot
+> processors with caching disabled — create a `Processor` via `New` to use the
+> cache.
 
 ---
 
@@ -692,6 +700,21 @@ type Config struct {
 }
 ```
 
+### Validation Limits
+
+`Config.Validate` (called by `New`) rejects out-of-range values:
+
+| Field | Valid range |
+|-------|-------------|
+| `MaxInputSize` | 1 – 50 MB |
+| `MaxCacheEntries` | 0 – 100,000 (0 = disabled) |
+| `CacheTTL`, `CacheCleanup` | ≥ 0 |
+| `WorkerPoolSize` | 1 – 256 |
+| `MaxDepth` | 1 – 500 |
+| `ProcessingTimeout` | ≥ 0 (0 = no timeout) |
+| `Audit.MaxEntries` | 0 – 100,000 (0 = default 10,000) |
+| `Audit.MaxRawValueLength` | ≥ 0 (0 = default 200) |
+
 ### Default Configuration Values
 
 | Setting | Default | High Security |
@@ -704,6 +727,8 @@ type Config struct {
 | ProcessingTimeout | 30s | 10s |
 | MaxDepth | 500 | 100 |
 | Audit | Disabled | Enabled |
+
+> **Large-document workloads**: `ProcessingTimeout` is a wall-clock deadline, not CPU time. If you intentionally process very large documents (tens of thousands of nodes) under CPU pressure — batch pipelines, container CPU limits, race-instrumented test builds — legitimate work can outlast the 30s default and surface as `ErrProcessingTimeout`. Size the value to your largest expected document, or set `0` to disable the watchdog when input size is already bounded by `MaxInputSize`.
 
 ---
 
@@ -824,8 +849,6 @@ defer processor.Close()
 result, _ := processor.Extract(htmlBytes)
 fmt.Println(result.Text)
 ```
-
-See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the full API reference and migration guide.
 
 ---
 
@@ -983,6 +1006,14 @@ if err != nil {
     }
 }
 ```
+
+For more context, match the typed errors with `errors.As()`:
+
+- `*FileError` — failed file access; fields `Op`, `Path`, `FileErr`, plus `SafePath()` for a disclosure-safe path
+- `*InputError` — rejected input; fields `Op`, `Size`, `MaxSize`
+- `*ConfigError` — invalid configuration; fields `Field`, `Value`, `Message`
+
+Each unwraps to its sentinel error, so the `errors.Is` checks above keep working.
 
 ---
 

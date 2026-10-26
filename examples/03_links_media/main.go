@@ -33,6 +33,8 @@ func main() {
 					<h1>Go Programming</h1>
 					<img src="hero.jpg" alt="Hero Image" width="800" height="400">
 					<p>Read more at <a href="tutorial.html">Tutorial</a></p>
+					<p>Sponsor: <a href="https://partner.example.org" rel="nofollow">Partner</a> ·
+						<a href="#top">Back to top</a> · <a href="javascript:void(0)">Popup</a></p>
 					<video src="demo.mp4" poster="thumb.jpg" width="640">
 						<source src="demo.webm" type="video/webm">
 					</video>
@@ -80,9 +82,27 @@ func main() {
 	}
 
 	// ============================================================
-	// PART 2: URL resolution with an explicit BaseURL
+	// PART 2: Content links from the extracted article (Result.Links)
 	// ============================================================
-	fmt.Println("\nPart 2: URL Resolution (BaseURL)")
+	fmt.Println("\nPart 2: Content Links (Result.Links)")
+	fmt.Println("------------------------------------")
+
+	// Result.Links lists the <a> elements of the SELECTED content (the
+	// <article> — the nav above is excluded) in document order, each with its
+	// Position. Fragment-only hrefs ("#top") and unsafe schemes (javascript:)
+	// are page-internal or unsafe navigation and produce no LinkInfo — the
+	// same rule ExtractAllLinks applies in Part 1.
+	result, _ := processor.Extract([]byte(htmlContent))
+	fmt.Printf("Found %d content links (article only, nav excluded):\n", len(result.Links))
+	for _, l := range result.Links {
+		fmt.Printf("  #%d %q -> %s (external=%v, nofollow=%v)\n",
+			l.Position, l.Text, l.URL, l.IsExternal, l.IsNoFollow)
+	}
+
+	// ============================================================
+	// PART 3: URL resolution with an explicit BaseURL
+	// ============================================================
+	fmt.Println("\nPart 3: URL Resolution (BaseURL)")
 	fmt.Println("--------------------------------")
 
 	// The fixture above carried its own <base> tag. A fetched page usually has
@@ -112,9 +132,9 @@ func main() {
 	}
 
 	// ============================================================
-	// PART 3: Filter links by type using custom config
+	// PART 4: Filter links by type using custom config
 	// ============================================================
-	fmt.Println("\nPart 3: Filter Links by Type")
+	fmt.Println("\nPart 4: Filter Links by Type")
 	fmt.Println("----------------------------")
 
 	filterCfg := html.DefaultConfig()
@@ -129,9 +149,11 @@ func main() {
 	filteredLinks, _ := filterProcessor.ExtractAllLinks([]byte(htmlContent))
 	fmt.Printf("Content links only (CSS/JS excluded): %d\n", len(filteredLinks))
 
-	// Internal links only: IncludeExternalLinks=false drops every link whose
-	// host differs from the (detected) BaseURL. The fixture's one external
-	// link — https://golang.org — disappears from the result.
+	// Internal links only. Mind the semantics: IncludeExternalLinks=false
+	// drops every ABSOLUTE link regardless of host ("external" means
+	// absolute http/https, NOT "different domain than BaseURL"); relative
+	// references survive. The fixture's absolute links — golang.org and
+	// partner.example.org — disappear from the result.
 	internalCfg := html.DefaultConfig()
 	internalCfg.IncludeExternalLinks = false
 	internalProcessor, err := html.New(internalCfg)
@@ -151,12 +173,10 @@ func main() {
 		len(internalLinks), hasExternal)
 
 	// ============================================================
-	// PART 4: Image extraction
+	// PART 5: Image extraction
 	// ============================================================
-	fmt.Println("\nPart 4: Image Extraction")
+	fmt.Println("\nPart 5: Image Extraction")
 	fmt.Println("------------------------")
-
-	result, _ := processor.Extract([]byte(htmlContent))
 
 	fmt.Printf("Found %d images:\n", len(result.Images))
 	for i, img := range result.Images {
@@ -168,9 +188,9 @@ func main() {
 	}
 
 	// ============================================================
-	// PART 5: Video extraction
+	// PART 6: Video extraction
 	// ============================================================
-	fmt.Println("\nPart 5: Video Extraction")
+	fmt.Println("\nPart 6: Video Extraction")
 	fmt.Println("------------------------")
 
 	fmt.Printf("Found %d videos:\n", len(result.Videos))
@@ -187,9 +207,9 @@ func main() {
 	}
 
 	// ============================================================
-	// PART 6: Audio extraction
+	// PART 7: Audio extraction
 	// ============================================================
-	fmt.Println("\nPart 6: Audio Extraction")
+	fmt.Println("\nPart 7: Audio Extraction")
 	fmt.Println("------------------------")
 
 	fmt.Printf("Found %d audio files:\n", len(result.Audios))
@@ -203,9 +223,9 @@ func main() {
 	}
 
 	// ============================================================
-	// PART 7: Selective media extraction
+	// PART 8: Selective media extraction
 	// ============================================================
-	fmt.Println("\nPart 7: Selective Media Extraction")
+	fmt.Println("\nPart 8: Selective Media Extraction")
 	fmt.Println("----------------------------------")
 
 	// Images only (disable video and audio)
@@ -239,6 +259,10 @@ func main() {
 	// Summary
 	// ============================================================
 	fmt.Println("\n=== Quick Reference ===")
+	fmt.Println("Two link views:")
+	fmt.Println("  ExtractAllLinks → every resource on the whole page (LinkResource)")
+	fmt.Println("  Result.Links    → <a> elements of the selected content (LinkInfo)")
+	fmt.Println()
 	fmt.Println("Link filtering (in Config):")
 	fmt.Println("  IncludeCSS, IncludeJS, IncludeImages, IncludeVideos, IncludeAudios")
 	fmt.Println("  IncludeContentLinks, IncludeExternalLinks, IncludeIcons")

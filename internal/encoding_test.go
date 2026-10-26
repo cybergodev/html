@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1260,4 +1261,152 @@ func TestUTF8BOMStrippedOnFastPath(t *testing.T) {
 	} else if strings.ContainsRune(got, rune(0xFEFF)) {
 		t.Errorf("safe variant leaked UTF-8 BOM: %q", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Latin-family aliases, forced-UTF-8 validation, and the charset cache bound
+// (from p2_regression_test.go)
+// ---------------------------------------------------------------------------
+
+func TestNormalizeCharsetLatinFamily(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"latin1": "iso-8859-1", "latin-1": "iso-8859-1",
+		"latin2": "iso-8859-2", "latin-2": "iso-8859-2",
+		"latin9": "iso-8859-15", "latin-9": "iso-8859-15",
+		"latin10": "iso-8859-16", "latin-10": "iso-8859-16",
+	}
+	for in, want := range cases {
+		if got := normalizeCharset(in); got != want {
+			t.Errorf("normalizeCharset(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestToUTF8Latin2Decodes(t *testing.T) {
+	t.Parallel()
+	// "ěščř" encoded in ISO-8859-2 (IANA alias latin2): ě=0xEC š=0xB9 č=0xE8 ř=0xF8.
+	ed := NewEncodingDetector()
+	out, err := ed.ToUTF8([]byte{0xEC, 0xB9, 0xE8, 0xF8}, "latin2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != "ěščř" {
+		t.Errorf("latin2 decode = %q, want %q", out, "ěščř")
+	}
+}
+
+func TestToUTF8RejectsInvalidUTF8Passthrough(t *testing.T) {
+	t.Parallel()
+	ed := NewEncodingDetector()
+	// A forced "utf-8" on invalid bytes must error, not return undecodable
+	// data with a nil error.
+	if _, err := ed.ToUTF8([]byte{0xEF, 0x00, 0xC3, 0x28, 0xFF}, "utf-8"); err == nil {
+		t.Error("ToUTF8(invalid, \"utf-8\") = nil error, want error")
+	}
+}
+
+func TestToUTF8StripsUTF8BOM(t *testing.T) {
+	t.Parallel()
+	ed := NewEncodingDetector()
+	out, err := ed.ToUTF8([]byte{0xEF, 0xBB, 0xBF, 'h', 'i'}, "utf-8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != "hi" {
+		t.Errorf("ToUTF8 with BOM = %q, want %q", out, "hi")
+	}
+}
+
+func TestCharsetNormCacheCardinalityBounded(t *testing.T) {
+	t.Parallel()
+	count := func() int {
+		n := 0
+		charsetNormCache.Range(func(_, _ any) bool {
+			n++
+			return true
+		})
+		return n
+	}
+	before := count()
+	for i := 0; i < maxCachedCharsetEntries+50; i++ {
+		normalizeCharset("zz" + strings.Repeat("x", i%20+1) + string(rune('a'+i%26)) + strconv.Itoa(i))
+	}
+	after := count()
+	if after > before+maxCachedCharsetEntries {
+		t.Errorf("cache grew by %d entries, want <= %d", after-before, maxCachedCharsetEntries)
+	}
+}
+
+func TestExtractCharsetFromBytesAllowsWhitespaceAroundEquals(t *testing.T) {
+	t.Parallel()
+	if got := extractCharsetFromBytes([]byte(`<meta charset = "gbk">`)); got != "gbk" {
+		t.Errorf("extractCharsetFromBytes = %q, want gbk", got)
+	}
+	if got := extractCharsetFromBytes([]byte(`<meta charset="gbk">`)); got != "gbk" {
+		t.Errorf("extractCharsetFromBytes (no spaces) = %q, want gbk", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Charset wrapper and sample-size defaults (from boundary_gaps_test.go)
+// ---------------------------------------------------------------------------
+
+// TestExtractCharsetFromHTMLEmpleteness pins the empty-input branch of the
+// string convenience wrapper and its delegation to the byte scanner.
+func TestExtractCharsetFromHTMLEmpleteness(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		html string
+		want string
+	}{
+		{"empty input", "", ""},
+		{"meta charset tag", `<html><head><meta charset="utf-8"></head>`, "utf-8"},
+		{"content-type form", `<meta http-equiv="Content-Type" content="text/html; charset=gbk">`, "gbk"},
+		{"no charset present", `<html><head><title>x</title></head>`, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := extractCharsetFromHTML(tt.html); got != tt.want {
+				t.Errorf("extractCharsetFromHTML(%q) = %q, want %q", tt.html, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSampleSizeOrDefault pins both branches: an explicit positive sample size
+// wins, and an unset (zero) value falls back to the documented 10240 default.
+func TestSampleSizeOrDefault(t *testing.T) {
+	t.Parallel()
+
+	t.Run("explicit size honored", func(t *testing.T) {
+		t.Parallel()
+		ed := &EncodingDetector{MaxSampleSize: 512}
+		if got := ed.sampleSizeOrDefault(); got != 512 {
+			t.Errorf("sampleSizeOrDefault() = %d, want 512", got)
+		}
+	})
+
+	t.Run("unset falls back to default", func(t *testing.T) {
+		t.Parallel()
+		ed := &EncodingDetector{}
+		if got := ed.sampleSizeOrDefault(); got != 10240 {
+			t.Errorf("sampleSizeOrDefault() = %d, want 10240", got)
+		}
+	})
+}
+
+// extractCharsetFromHTML extracts charset from an HTML string. Test-only
+// since DetectCharsetBasic switched to the byte-based extractor directly (its
+// sole remaining caller is the table below); production never materializes a
+// string for the pre-decode scan.
+func extractCharsetFromHTML(html string) string {
+	if len(html) == 0 {
+		return ""
+	}
+	return extractCharsetFromBytes(StringToBytes(html))
 }

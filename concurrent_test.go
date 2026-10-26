@@ -1,9 +1,13 @@
-// Package html provides concurrent safety tests for the HTML processor.
-// These tests verify thread-safety and detect race conditions.
 package html
 
+// concurrent_test.go — concurrency stress tests for cache, audit, pool,
+// links, and batch, now including the P-002 race-window hardening tests
+// merged from race_hardening_test.go (sections marked below).
+
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +15,12 @@ import (
 
 	"github.com/cybergodev/html/internal"
 )
+
+// /////////////////////////////////////////////////////////////////////////////
+// From concurrent_test.go
+// /////////////////////////////////////////////////////////////////////////////
+
+// These tests verify thread-safety and detect race conditions.
 
 // TestConcurrentProcessorExtraction tests concurrent HTML extraction.
 func TestConcurrentProcessorExtraction(t *testing.T) {
@@ -928,4 +938,225 @@ func TestConcurrentPackageLevelExtract(t *testing.T) {
 	if errorCount.Load() > 0 {
 		t.Errorf("Concurrent package-level Extract had %d errors", errorCount.Load())
 	}
+}
+
+// /////////////////////////////////////////////////////////////////////////////
+// From race_hardening_test.go
+// /////////////////////////////////////////////////////////////////////////////
+
+// They pin race windows the existing concurrent_test.go suite does not
+// exercise:
+//
+//   - ChannelAuditSink.Write racing Close (a send-on-closed-channel panic is
+//     the failure this hunts; the existing test closes only after writers quit)
+//   - the whole package-level API surface mixed under one load (pooled
+//     processors, format transients sharing the parent's stats/audit, reader
+//     mode), rather than Extract alone
+//   - withTimeout's straggler goroutine outliving the caller's Extract return,
+//     racing the deferred processor teardown on the one-shot (non-pooled) path
+
+// mixedDoc exercises every extraction pass at once: article selection, inline
+// link/image formatting, tables, and reader-mode section classification.
+const mixedDoc = `<!DOCTYPE html>
+<html><head><title>Mixed</title><meta charset="utf-8"></head>
+<body>
+<header><nav><a href="/a">A</a> <a href="/b">B</a></nav></header>
+<main><article><h1>Headline</h1>
+<p>Hello <a href="https://example.com/x">world</a> and an <img src="pic.png" alt="pic"> image.</p>
+<table><tr><th>K</th><td>V</td></tr></table>
+</article></main>
+<footer><p>Bye</p></footer>
+</body></html>`
+
+// TestChannelAuditSinkCloseRacesWrites hammers Write concurrently with Close.
+// Write holds closeMu.RLock while sending and Close takes closeMu.Lock before
+// close(s.ch), so the two are mutually exclusive; any regression of that
+// ordering surfaces here as a send-on-closed-channel panic (or a race report).
+// Repeated rounds with a tiny buffer force the drop counter and the closed
+// gate into the interleaving as well.
+func TestChannelAuditSinkCloseRacesWrites(t *testing.T) {
+	const (
+		writers      = 8
+		writesEach   = 200
+		closeAtWrite = 20 // close once this many writes have been observed
+	)
+
+	for round := range 10 {
+		sink := NewChannelAuditSink(4)
+
+		var received atomic.Int64
+		var written atomic.Int64
+		consumerDone := make(chan struct{})
+		go func() {
+			defer close(consumerDone)
+			for range sink.Channel() {
+				received.Add(1)
+			}
+		}()
+
+		var wg sync.WaitGroup
+
+		// Closer: wait until writes are demonstrably in flight, then close
+		// mid-stream so later Writes hit the isClosed gate and earlier ones
+		// may still be racing the close itself.
+		wg.Go(func() {
+			deadline := time.Now().Add(100 * time.Millisecond)
+			for written.Load() < closeAtWrite && time.Now().Before(deadline) {
+				time.Sleep(50 * time.Microsecond)
+			}
+			if err := sink.Close(); err != nil {
+				t.Errorf("Close() = %v, want nil", err)
+			}
+		})
+
+		for i := range writers {
+			wg.Go(func() {
+				for j := range writesEach {
+					sink.Write(AuditEntry{
+						EventType: AuditEventBlockedTag,
+						Message:   fmt.Sprintf("w%d-%d", i, j),
+					})
+					written.Add(1)
+				}
+			})
+		}
+
+		wg.Wait()
+		<-consumerDone // terminates only via the channel close
+
+		// A second Close must remain a safe no-op (guarded double close).
+		if err := sink.Close(); err != nil {
+			t.Fatalf("second Close() = %v, want nil", err)
+		}
+
+		// Every Write either delivered, was counted dropped, or no-opped
+		// after close — none may vanish from the accounting above that gate.
+		total := int64(writers * writesEach)
+		if got := received.Load() + sink.DroppedCount(); got > total {
+			t.Fatalf("round %d: received+dropped = %d exceeds total writes %d", round, got, total)
+		}
+	}
+}
+
+// TestConcurrentPackageLevelMixedAPIs runs every package-level entry point
+// family against the shared processor pool at once: plain Extract/ExtractText,
+// the format-transient paths (ExtractToMarkdown/ExtractToJSON, whose transient
+// processors share the pooled parent's stats and audit collector), link
+// extraction, reader mode, and batch extraction. The race detector verifies
+// the pool hand-off, the shared disabled format cache, and the transient's
+// shared-state contract under mixed traffic.
+func TestConcurrentPackageLevelMixedAPIs(t *testing.T) {
+	const goroutines = 28
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines)
+
+	for i := range goroutines {
+		wg.Go(func() {
+			doc := []byte(mixedDoc)
+			for j := range 10 {
+				switch (i + j) % 7 {
+				case 0:
+					if _, err := Extract(doc); err != nil {
+						errCh <- fmt.Errorf("Extract: %w", err)
+						return
+					}
+				case 1:
+					text, err := ExtractText(doc)
+					if err != nil {
+						errCh <- fmt.Errorf("ExtractText: %w", err)
+						return
+					}
+					if !strings.Contains(text, "Headline") {
+						errCh <- fmt.Errorf("ExtractText: headline missing from %q", text)
+						return
+					}
+				case 2:
+					md, err := ExtractToMarkdown(doc)
+					if err != nil {
+						errCh <- fmt.Errorf("ExtractToMarkdown: %w", err)
+						return
+					}
+					if !strings.Contains(md, "https://example.com/x") {
+						errCh <- fmt.Errorf("ExtractToMarkdown: inline link missing from %q", md)
+						return
+					}
+				case 3:
+					js, err := ExtractToJSON(doc)
+					if err != nil {
+						errCh <- fmt.Errorf("ExtractToJSON: %w", err)
+						return
+					}
+					if len(js) == 0 {
+						errCh <- errors.New("ExtractToJSON: empty output")
+						return
+					}
+				case 4:
+					links, err := ExtractAllLinks(doc)
+					if err != nil {
+						errCh <- fmt.Errorf("ExtractAllLinks: %w", err)
+						return
+					}
+					if len(links) == 0 {
+						errCh <- errors.New("ExtractAllLinks: no links extracted")
+						return
+					}
+				case 5:
+					rr, err := ReadPage(doc)
+					if err != nil {
+						errCh <- fmt.Errorf("ReadPage: %w", err)
+						return
+					}
+					if len(rr.Sections) == 0 {
+						errCh <- errors.New("ReadPage: no sections")
+						return
+					}
+				case 6:
+					br := ExtractBatch([][]byte{doc, doc, doc})
+					if br.Failed > 0 && br.Errors[0] != nil {
+						errCh <- fmt.Errorf("ExtractBatch: %w", br.Errors[0])
+						return
+					}
+				}
+			}
+		})
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+}
+
+// TestTimeoutStragglerRacesTeardown pins the straggler contract documented on
+// withTimeout and detectEncoding: when the processing timeout fires, Extract
+// returns immediately while the watchdog goroutine keeps running fn until its
+// next cooperative cancellation check. On the one-shot (non-pooled) package
+// path, withProcessor's deferred Close() therefore runs concurrently with the
+// straggler's remaining work. The straggler must touch no state that Close
+// mutates (closed flag, cache lifecycle, audit sink); the race detector fails
+// this test if that contract regresses.
+func TestTimeoutStragglerRacesTeardown(t *testing.T) {
+	// Large enough that parsing exceeds the 1ms deadline on any machine, so
+	// the straggler is reliably inside the parse (touching only locals and the
+	// Safe-copy of the input) when the caller's teardown runs.
+	big := strings.Repeat("<p>filler paragraph with <a href='/f'>link</a> content</p>", 20000)
+	doc := []byte("<html><body><article>" + big + "</article></body></html>")
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			cfg := DefaultConfig()
+			cfg.ProcessingTimeout = time.Millisecond
+			_, err := Extract(doc, cfg)
+			// Either outcome is valid — a fast run may complete within the
+			// deadline; the point of the test is the teardown race, not the
+			// timeout error itself.
+			if err != nil && !errors.Is(err, ErrProcessingTimeout) {
+				t.Errorf("Extract with 1ms timeout: err = %v, want ErrProcessingTimeout or nil", err)
+			}
+		})
+	}
+	wg.Wait()
 }

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -241,6 +242,183 @@ func TestReadPageHiddenSectionsDropped(t *testing.T) {
 	}
 }
 
+// TestReadPageResponsiveNavKept asserts the reader mode preserves a nav whose
+// container is hidden only on one Tailwind breakpoint ("hidden md:flex" = visible
+// from md up). The Extract path has no viewport, so its responsive semantics
+// are a design choice scoped to the ReadPage family only.
+func TestReadPageResponsiveNavKept(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<nav class="hidden md:flex"><a href="/">Home</a><a href="/a">A</a><a href="/b">B</a></nav>
+		<main><p>Article prose dominating the page text by a comfortable margin for the classifier.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	var nav *PageSection
+	for i := range page.Sections {
+		if page.Sections[i].Kind == SectionNavigation {
+			nav = &page.Sections[i]
+			break
+		}
+	}
+	if nav == nil {
+		t.Fatal("no navigation section; responsive nav was dropped")
+	}
+	if !strings.Contains(nav.Text, "A") || !strings.Contains(nav.Text, "B") {
+		t.Fatalf("responsive nav links lost: %q", nav.Text)
+	}
+	if len(nav.Links) != 3 {
+		t.Fatalf("nav links = %d, want 3", len(nav.Links))
+	}
+}
+
+// TestReadPageButtonLabelKept asserts reader mode keeps a menu's top-level
+// label when it is a <button> dropdown trigger. Reader-mode sanitization unwraps
+// the button so the label survives; the Extract path (SanitizeDOM) still drops
+// the button and its text wholesale.
+func TestReadPageButtonLabelKept(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<nav><ul><li><button type="button">Investing</button><ul><li><a href="/stocks">Stocks</a></li></ul></li></ul></nav>
+		<main><p>Article prose dominating the page text by a comfortable margin for the classifier.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	var nav *PageSection
+	for i := range page.Sections {
+		if page.Sections[i].Kind == SectionNavigation {
+			nav = &page.Sections[i]
+			break
+		}
+	}
+	if nav == nil {
+		t.Fatal("no navigation section")
+	}
+	if !strings.Contains(nav.Text, "Investing") {
+		t.Fatalf("button label lost: %q", nav.Text)
+	}
+	if !strings.Contains(nav.Text, "Stocks") {
+		t.Fatalf("dropdown link lost: %q", nav.Text)
+	}
+}
+
+// TestReadPageHiddenDropdownKept asserts reader mode keeps a dropdown menu
+// panel marked with the bare Tailwind "hidden" class (display:none until
+// hover/click reveals it) — the standard disclosure idiom on component-built
+// sites. The reader view has no pointer, so pruning such panels discarded the
+// page's nav link data. The Extract path still treats the class as hidden
+// (matchesHiddenClassToken is unchanged). It also pins the rendering: a <p>
+// child of the <li> continues the marker line, so the item reads
+// "- [Stocks](…)", not a lone bullet with the label on its own paragraph.
+func TestReadPageHiddenDropdownKept(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<header>
+			<nav><ul>
+				<li><button type="button">Investing</button>
+					<ul class="nav-dropdown shadow-md hidden">
+						<li><p><a href="/insights/stocks">Stocks</a></p></li>
+						<li><p><a href="/insights/etfs">ETFs</a></p></li>
+					</ul></li>
+			</ul></nav>
+		</header>
+		<main><p>Article prose dominating the page text by a comfortable margin for the classifier.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	var header *PageSection
+	for i := range page.Sections {
+		if page.Sections[i].Kind == SectionHeader {
+			header = &page.Sections[i]
+			break
+		}
+	}
+	if header == nil {
+		t.Fatal("no header section")
+	}
+	if !strings.Contains(header.Text, "Stocks") || !strings.Contains(header.Text, "ETFs") {
+		t.Fatalf("bare-hidden dropdown links lost: %q", header.Text)
+	}
+	if len(header.Links) != 2 {
+		t.Fatalf("header links = %d, want 2", len(header.Links))
+	}
+	if !strings.Contains(header.Text, "- [Stocks](") || !strings.Contains(header.Text, "- [ETFs](") {
+		t.Fatalf("dropdown items must render as list items with inline links: %q", header.Text)
+	}
+	if !strings.Contains(header.PlainText, "- Stocks") {
+		t.Fatalf("plain form keeps the item on the marker line: %q", header.PlainText)
+	}
+}
+
+// TestReadPageMainRootHiddenSemantics pins the main-region root hidden rules
+// for non-landmark main wrappers (token-classed divs): one collapsed with a
+// bare "hidden" class (an SPA shell) drops whole, while its responsive twin
+// ("hidden lg:block") survives — the reader has no viewport to resolve the
+// breakpoint against.
+func TestReadPageMainRootHiddenSemantics(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<div class="article hidden"><p>Collapsed shell text that must not surface in the reading view at all.</p></div>
+		<div class="article hidden lg:block"><p>Desktop main with enough words to dominate the page text for the classifier.</p></div>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	if got := readerSectionKinds(t, page); len(got) != 1 || got[0] != SectionMain {
+		t.Fatalf("kinds = %v, want exactly one main section", got)
+	}
+	rendered := page.Render()
+	if strings.Contains(rendered, "Collapsed shell") {
+		t.Fatalf("collapsed main wrapper leaked into output: %q", rendered)
+	}
+	if !strings.Contains(rendered, "Desktop main") {
+		t.Fatalf("responsive main wrapper lost: %q", rendered)
+	}
+}
+
+// TestReadPageLandmarkMainClassExempt pins the primary-container exemption at
+// the section-root level: a semantic <main> marked hidden by CLASS is kept (the
+// class test never runs for main/article/role=main), while the hidden
+// ATTRIBUTE still drops it — the two signals readers can actually rely on.
+func TestReadPageLandmarkMainClassExempt(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<main hidden><p>Attribute-hidden main text that must never surface in the reading view.</p></main>
+		<main class="hidden"><p>Landmark main whose class never hides it, holding enough words to dominate classification.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	if got := readerSectionKinds(t, page); len(got) != 1 || got[0] != SectionMain {
+		t.Fatalf("kinds = %v, want exactly one main section", got)
+	}
+	rendered := page.Render()
+	if strings.Contains(rendered, "Attribute-hidden") {
+		t.Fatalf("attribute-hidden main leaked into output: %q", rendered)
+	}
+	if !strings.Contains(rendered, "Landmark main") {
+		t.Fatalf("class-marked landmark main lost: %q", rendered)
+	}
+}
+
 func TestReadPageChromeKeepsNavClassChildren(t *testing.T) {
 	t.Parallel()
 
@@ -295,6 +473,67 @@ func TestReadPageAdjacentSectionMerge(t *testing.T) {
 	if len(nav.Links) != 2 {
 		t.Fatalf("merged nav links = %d, want 2", len(nav.Links))
 	}
+}
+
+// TestReadPageAdjacentSectionMergeImages pins C-1: merging adjacent same-kind
+// sections must concatenate Images alongside Links — the second nav's logo
+// used to be silently dropped while its links survived.
+func TestReadPageAdjacentSectionMergeImages(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<nav><a href="/a">MenuA</a><img src="/logo-a.png" alt="logo a"></nav>
+		<nav><a href="/b">MenuB</a><img src="/logo-b.png" alt="logo b"></nav>
+		<main><p>One main region with enough words to dominate and be selected without ambiguity whatsoever.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	want := []SectionKind{SectionNavigation, SectionMain}
+	if got := readerSectionKinds(t, page); !slices.Equal(got, want) {
+		t.Fatalf("kinds = %v, want %v (adjacent navs must merge)", got, want)
+	}
+	nav := page.Sections[0]
+	if len(nav.Links) != 2 {
+		t.Fatalf("merged nav links = %d, want 2", len(nav.Links))
+	}
+	if len(nav.Images) != 2 {
+		t.Fatalf("merged nav images = %d, want 2 (a merged section's images must concatenate like its links)", len(nav.Images))
+	}
+	if nav.Images[1].URL != "/logo-b.png" {
+		t.Fatalf("merged nav images = %v, want the second nav's logo kept", nav.Images)
+	}
+}
+
+// TestReadPageOrderedListMarkerContinuation pins M-1 end to end: an ordered
+// list item whose label is wrapped in <p> keeps the label on its "N." marker
+// line, exactly as the unordered form does.
+func TestReadPageOrderedListMarkerContinuation(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body>
+		<nav>
+			<ol><li><p><a href="/o1">OL-Label</a></p></li></ol>
+		</nav>
+		<main><p>Main article body with a reasonable amount of text so the region is identified without ambiguity here.</p></main>
+		</body></html>`
+
+	page, err := ReadPage([]byte(doc))
+	if err != nil {
+		t.Fatalf("ReadPage: %v", err)
+	}
+	for _, s := range page.Sections {
+		if s.Kind != SectionNavigation {
+			continue
+		}
+		if !strings.Contains(s.Text, "1. [OL-Label](/o1)") {
+			t.Fatalf("nav text = %q, want the ordered marker and its label on one line", s.Text)
+		}
+		return
+	}
+	t.Fatal("no navigation section found")
 }
 
 func TestReadPageEmptyAndErrors(t *testing.T) {
@@ -1235,5 +1474,82 @@ func TestReadPageTableLinks(t *testing.T) {
 		if strings.Contains(sec.PlainText, "](/events/q3-call)") {
 			t.Errorf("plain text leaked a link construct:\n%s", sec.PlainText)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative-cancellation stage boundaries ([FIX-001] boundary additions)
+// ---------------------------------------------------------------------------
+
+// cancelAfterCtx cancels itself after its Done method has been probed n
+// times, letting a test stop a cooperative-cancellation pipeline at an exact
+// stage: each `select { case <-ctx.Done(); default: }` probe decrements the
+// countdown, and the probe that reaches zero sees the closed channel.
+type cancelAfterCtx struct {
+	mu        sync.Mutex
+	remaining int32
+	done      chan struct{}
+}
+
+func newCancelAfter(n int32) *cancelAfterCtx {
+	return &cancelAfterCtx{remaining: n, done: make(chan struct{})}
+}
+
+func (c *cancelAfterCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *cancelAfterCtx) Done() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.remaining--
+	if c.remaining <= 0 {
+		select {
+		case <-c.done:
+			// already closed
+		default:
+			close(c.done)
+		}
+	}
+	return c.done
+}
+
+func (c *cancelAfterCtx) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.remaining <= 0 {
+		return context.Canceled
+	}
+	return nil
+}
+
+func (c *cancelAfterCtx) Value(any) any { return nil }
+
+// TestReadContentCooperativeCancellationStages pins that every cancellation
+// checkpoint in readContentWithContext (entry, pre-parse, post-parse,
+// post-sanitize) returns the caller's context error. Each row cancels after
+// exactly that many Done() probes, so all four selects are reached
+// deterministically.
+func TestReadContentCooperativeCancellationStages(t *testing.T) {
+	t.Parallel()
+
+	p, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+
+	const doc = `<html><body><article><p>Body text.</p></article></body></html>`
+	stages := []string{"entry", "pre-parse", "post-parse", "post-sanitize"}
+
+	for i, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			t.Parallel()
+			rr, err := p.readContentWithContext(newCancelAfter(int32(i+1)), doc)
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("readContentWithContext(cancel at %s) error = %v, want context.Canceled", stage, err)
+			}
+			if rr != nil {
+				t.Errorf("readContentWithContext(cancel at %s) = %+v, want nil result", stage, rr)
+			}
+		})
 	}
 }

@@ -508,34 +508,11 @@ func TestExtractToJSONFromFile(t *testing.T) {
 // File Encoding Detection Tests
 // ============================================================================
 
-func TestFileEncodingDetection(t *testing.T) {
-	t.Parallel()
-
-	t.Run("UTF-8 file detected correctly", func(t *testing.T) {
-		htmlContent := `<html><head><meta charset="UTF-8"></head><body><p>UTF-8 Content: 你好</p></body></html>`
-		tmpFile := testutil.CreateTempHTML(t, htmlContent)
-
-		result, err := html.ExtractFromFile(tmpFile)
-		testutil.AssertNoError(t, err, "ExtractFromFile failed")
-		testutil.AssertContains(t, result.Text, "你好", "Should preserve Chinese characters")
-	})
-
-	t.Run("UTF-8 BOM handled", func(t *testing.T) {
-		// UTF-8 BOM is EF BB BF
-		bom := []byte{0xEF, 0xBB, 0xBF}
-		content := []byte(`<html><body><p>BOM Test</p></body></html>`)
-		fullContent := append(bom, content...)
-
-		// Create temp file manually to preserve BOM
-		tmpDir := t.TempDir()
-		tmpFile := filepath.Join(tmpDir, "bom_test.html")
-		_ = os.WriteFile(tmpFile, fullContent, 0644)
-
-		result, err := html.ExtractFromFile(tmpFile)
-		testutil.AssertNoError(t, err, "ExtractFromFile with BOM failed")
-		testutil.AssertContains(t, result.Text, "BOM Test", "Should extract text")
-	})
-}
+// Removed TestFileEncodingDetection: the From-file UTF-8 row moved to
+// encoding_bytes_test.go (TestExtractWithEncodingDetection/"UTF-8 file detected
+// correctly") next to the other encoding-detection entry points; the BOM row
+// was subsumed by the stronger fast/slow-parity BOM regression
+// (TestExtractStripsUTF8BOM in regressions_internal_test.go).
 
 // ============================================================================
 // Edge Cases and Error Handling

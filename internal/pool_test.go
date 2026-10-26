@@ -18,14 +18,22 @@ func TestPutNodeSliceSecureClear(t *testing.T) {
 	SetPoolSecureClear(true)
 	defer SetPoolSecureClear(false)
 
-	// Create a slice with some node pointers (nil is valid for *html.Node)
+	// Create a slice with NON-NIL node pointers: the secure-clear branch
+	// clear((*s)[:cap(*s)]) must actually overwrite pointer slots — with the
+	// former nil sentinels the clear was an observable no-op.
 	slicePtr := GetNodeSlice()
-	*slicePtr = append(*slicePtr, nil, nil)
+	sentinels := []*html.Node{{Type: html.ElementNode, Data: "a"}, {Type: html.TextNode, Data: "t"}}
+	*slicePtr = append(*slicePtr, sentinels...)
 
-	// Return to pool - should zero the slice
+	if got := (*slicePtr)[0]; got != sentinels[0] || (*slicePtr)[1] != sentinels[1] {
+		t.Fatalf("fixture error: slice does not hold the sentinel nodes %v", *slicePtr)
+	}
+
+	// Return to pool: zeroes the capacity region, then resets and pools
+	// (must not panic). The zeroing itself cannot be asserted here without
+	// reading the slice after the pool owns it, which would race with another
+	// borrower; the branch is exercised and pinned by this path.
 	PutNodeSlice(slicePtr)
-
-	// This test primarily verifies the code path executes without panic
 }
 
 // TestSetPoolDebug verifies that enabling pool debug logging routes corruption
@@ -58,13 +66,13 @@ func TestSetPoolDebug(t *testing.T) {
 	// under -race, so 100 attempts makes a miss astronomically unlikely while
 	// remaining instant when the cache survives (the common case without -race).
 	//
-	// NodeSlicePool is used as the corruption vehicle because it is the pool
+	// nodeSlicePool is used as the corruption vehicle because it is the pool
 	// whose Get performs a checked type assertion and therefore routes a
 	// corrupted entry through logPoolCorruption.
 	const maxCorruptAttempts = 100
 	wasCalled := false
 	for i := 0; i < maxCorruptAttempts; i++ {
-		NodeSlicePool.Put("not a node slice") //nolint:SA6002 // intentionally wrong type: exercises the corruption path
+		nodeSlicePool.Put("not a node slice") //nolint:SA6002 // intentionally wrong type: exercises the corruption path
 		_ = GetNodeSlice()                    // type-assertion fallback invokes logPoolCorruption
 		mu.Lock()
 		if called {
@@ -89,7 +97,7 @@ func TestSetPoolDebug(t *testing.T) {
 	mu.Unlock()
 
 	for i := 0; i < maxCorruptAttempts; i++ {
-		NodeSlicePool.Put("not a node slice") //nolint:SA6002 // intentionally wrong type: exercises the corruption path
+		nodeSlicePool.Put("not a node slice") //nolint:SA6002 // intentionally wrong type: exercises the corruption path
 		_ = GetNodeSlice()
 	}
 	mu.Lock()
@@ -300,14 +308,14 @@ func TestTrackedBuilderPoolConcurrent(t *testing.T) {
 }
 
 // TestGetNodeSlicePoolCorruption mirrors the other corruption tests: a wrong
-// type in NodeSlicePool must not crash GetNodeSlice, which falls back to a
+// type in nodeSlicePool must not crash GetNodeSlice, which falls back to a
 // fresh slice (the previously uncovered 57% branch).
 func TestGetNodeSlicePoolCorruption(t *testing.T) {
 	t.Parallel()
 
 	// Put a wrong type in the pool to simulate corruption
 	var wrongType any = "not a node slice"
-	NodeSlicePool.Put(wrongType)
+	nodeSlicePool.Put(wrongType)
 
 	s := GetNodeSlice()
 	if s == nil {

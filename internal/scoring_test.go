@@ -58,16 +58,6 @@ func TestScoreContentNode(t *testing.T) {
 			html:      `<div class="sidebar"><p>Content</p></div>`,
 			checkFunc: func(score int) bool { return score == 0 }, // ShouldRemove guard: removable nodes score 0
 		},
-		{
-			name:      "with headings",
-			html:      `<div><h1>Title</h1><p>Content</p></div>`,
-			checkFunc: func(score int) bool { return true }, // Score can vary
-		},
-		{
-			name:      "with commas",
-			html:      `<div>Text with, many, commas, here, and, more</div>`,
-			checkFunc: func(score int) bool { return true }, // Score can vary based on text length
-		},
 	}
 
 	for _, tt := range tests {
@@ -94,12 +84,60 @@ func TestScoreContentNode(t *testing.T) {
 	}
 }
 
-func TestScoreContentNodeNil(t *testing.T) {
+// TestScoreContentNodeHeadingBonus replaces the former tautological
+// "with headings"/"with commas" rows of TestScoreContentNode (checkFunc
+// always true): adding one heading to the same document must raise the
+// score by the deterministic heading bonus.
+func TestScoreContentNodeHeadingBonus(t *testing.T) {
 	t.Parallel()
 
-	score := ScoreContentNode(nil)
-	if score != 0 {
-		t.Errorf("ScoreContentNode(nil) = %d, want 0", score)
+	scoreFirstDiv := func(markup string) int {
+		t.Helper()
+		doc, err := parseHTML(markup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var div *html.Node
+		WalkNodes(doc, func(n *html.Node) bool {
+			if n.Type == html.ElementNode && n.Data == "div" && div == nil {
+				div = n
+			}
+			return true
+		})
+		if div == nil {
+			t.Fatal("no div in fixture")
+		}
+		return ScoreContentNode(div)
+	}
+
+	without := scoreFirstDiv(`<div><p>Content paragraph text here.</p></div>`)
+	with := scoreFirstDiv(`<div><p>Content paragraph text here.</p><h1>Title</h1></div>`)
+	if with <= without {
+		t.Errorf("heading bonus not applied: with=<%d> without=<%d>, want with > without", with, without)
+	}
+}
+
+// TestScoringNilGuards merges the former per-function nil-guard tests
+// (TestScoreContentNodeNil, TestScoreAttributesNil, TestCountTagsNil,
+// TestCountDescendantElementsNil, TestShouldRemoveElementNil): every scoring
+// helper must return its zero value for a nil node instead of panicking.
+func TestScoringNilGuards(t *testing.T) {
+	t.Parallel()
+
+	if got := ScoreContentNode(nil); got != 0 {
+		t.Errorf("ScoreContentNode(nil) = %d, want 0", got)
+	}
+	if got := ScoreAttributes(nil); got != 0 {
+		t.Errorf("ScoreAttributes(nil) = %d, want 0", got)
+	}
+	if got := CountTags(nil); got != 0 {
+		t.Errorf("CountTags(nil) = %d, want 0", got)
+	}
+	if got := CountDescendantElements(nil, "p"); got != 0 {
+		t.Errorf("CountDescendantElements(nil, \"p\") = %d, want 0", got)
+	}
+	if ShouldRemoveElement(nil) {
+		t.Error("ShouldRemoveElement(nil) = true, want false")
 	}
 }
 
@@ -205,40 +243,9 @@ func TestScoreAttributes(t *testing.T) {
 	}
 }
 
-func TestScoreAttributesNil(t *testing.T) {
-	t.Parallel()
-
-	score := ScoreAttributes(nil)
-	if score != 0 {
-		t.Errorf("ScoreAttributes(nil) = %d, want 0", score)
-	}
-}
-
-func TestMatchesPattern(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		value    string
-		patterns map[string]bool
-		want     bool
-	}{
-		{"article-content", map[string]bool{"article": true, "content": true}, true},
-		{"sidebar", map[string]bool{"article": true, "content": true}, false},
-		{"main-article", map[string]bool{"article": true}, true},
-		{"navigation-menu", map[string]bool{"nav": true, "menu": true}, true},
-		{"", map[string]bool{"article": true}, false},
-		{"test", map[string]bool{}, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.value, func(t *testing.T) {
-			result := MatchesPattern(tt.value, tt.patterns)
-			if result != tt.want {
-				t.Errorf("MatchesPattern(%q, %v) = %v, want %v", tt.value, tt.patterns, result, tt.want)
-			}
-		})
-	}
-}
+// Removed TestScoreAttributesNil and TestMatchesPattern: the nil guard lives
+// in TestScoringNilGuards above, and the multi-pattern rows of TestMatchesPattern
+// were folded into TestPatternMatchesEdgeCases as single-pattern rows.
 
 func TestCalculateContentDensity(t *testing.T) {
 	t.Parallel()
@@ -319,14 +326,7 @@ func TestCountTags(t *testing.T) {
 	}
 }
 
-func TestCountTagsNil(t *testing.T) {
-	t.Parallel()
-
-	count := CountTags(nil)
-	if count != 0 {
-		t.Errorf("CountTags(nil) = %d, want 0", count)
-	}
-}
+// Removed TestCountTagsNil: covered by TestScoringNilGuards.
 
 // TestBlockDensityIgnoresInlineMarkup guards the P1 density redefinition: content
 // density counts block elements, not inline formatting tags, so prose with heavy
@@ -478,14 +478,7 @@ func TestCountDescendantElements(t *testing.T) {
 	}
 }
 
-func TestCountDescendantElementsNil(t *testing.T) {
-	t.Parallel()
-
-	count := CountDescendantElements(nil, "p")
-	if count != 0 {
-		t.Errorf("CountDescendantElements(nil) = %d, want 0", count)
-	}
-}
+// Removed TestCountDescendantElementsNil: covered by TestScoringNilGuards.
 
 func TestShouldRemoveElement(t *testing.T) {
 	t.Parallel()
@@ -648,10 +641,12 @@ func TestShouldRemoveElement(t *testing.T) {
 			want: false,
 		},
 		{
-			// "hidden" inside an unrelated word must not trigger: the token list
-			// is prefix-matched, and no token begins with these bytes except at a
-			// true token start. Guarded so a careless future token ("hid", ...)
-			// cannot silently widen this to a substring match over "schoold..." etc.
+			// "hidden" inside an unrelated word must not trigger: the trailing
+			// boundary check rejects a token that continues into alphanumeric
+			// bytes, so only a token-shaped occurrence can fire — never
+			// "not-hiddenize". Guarded so a careless future token ("hid", ...)
+			// cannot silently widen this to a substring match over
+			// "schoold..." etc.
 			name: "hidden as part of unrelated word",
 			html: `<div class="not-hiddenize">content</div>`,
 			want: false,
@@ -672,6 +667,51 @@ func TestShouldRemoveElement(t *testing.T) {
 			name: "responsive hidden-lg-down is visible elsewhere",
 			html: `<div class="hidden-lg-down">content</div>`,
 			want: false,
+		},
+		{
+			// Tailwind's overflow clipping utilities are fully visible: their
+			// trailing "hidden" token describes the paint clip, not visibility
+			// (C-3). Before the visible-compound exemption this dropped whole
+			// cards on Tailwind sites.
+			name: "overflow-hidden utility is visible",
+			html: `<div class="rounded-xl overflow-hidden shadow">content</div>`,
+			want: false,
+		},
+		{
+			name: "overflow-x-hidden utility is visible",
+			html: `<div class="overflow-x-hidden">content</div>`,
+			want: false,
+		},
+		{
+			name: "scrollbar-hide utility is visible",
+			html: `<div class="scrollbar-hide">content</div>`,
+			want: false,
+		},
+		{
+			// A breakpoint-prefixed "hidden" hides only at that breakpoint and
+			// above; a viewport-less extractor cannot resolve it, so it is
+			// kept — the same rule the reader path applies. Any Tailwind
+			// variant prefix ends with ':' and receives the same treatment.
+			name: "breakpoint xl:hidden is kept",
+			html: `<div class="prose xl:hidden">content</div>`,
+			want: false,
+		},
+		{
+			name: "interaction variant hover:hidden is kept",
+			html: `<div class="hover:hidden">content</div>`,
+			want: false,
+		},
+		{
+			name: "print variant print:hidden is kept",
+			html: `<div class="print:hidden">content</div>`,
+			want: false,
+		},
+		{
+			// The exemption is narrow: an unknown hyphen compound still hides.
+			// This is the no-leading-boundary rule's real beneficiary.
+			name: "x-hidden compound still hides",
+			html: `<div class="x-hidden">content</div>`,
+			want: true,
 		},
 		{
 			// Sitemap blocks are large link directories, never main content.
@@ -721,12 +761,109 @@ func TestShouldRemoveElement(t *testing.T) {
 	}
 }
 
-func TestShouldRemoveElementNil(t *testing.T) {
+// Removed TestShouldRemoveElementNil: covered by TestScoringNilGuards.
+
+// TestIsHiddenElementReader asserts the reader-mode hidden predicate keeps
+// elements hidden only by the bare "hidden"/"hide" class or a responsive
+// breakpoint (Tailwind's "hidden md:block", "xl:hidden") — hover/click
+// disclosure panels a viewport-less, pointer-less reader must preserve — while
+// still stripping the always-hidden classes and the unambiguous signals
+// (d-none, sr-only, the hidden attribute, aria-hidden, inline display:none).
+func TestIsHiddenElementReader(t *testing.T) {
 	t.Parallel()
 
-	result := ShouldRemoveElement(nil)
-	if result != false {
-		t.Error("ShouldRemoveElement(nil) should return false")
+	tests := []struct {
+		name string
+		html string
+		want bool
+	}{
+		{name: "bare hidden is an interaction hook, kept", html: `<div class="hidden">x</div>`, want: false},
+		{name: "bare hide is an interaction hook, kept", html: `<div class="hide">x</div>`, want: false},
+		{name: "dropdown panel kept", html: `<div class="nav-dropdown shadow-md hidden">x</div>`, want: false},
+		{name: "d-none stays hidden", html: `<div class="d-none">x</div>`, want: true},
+		{name: "sr-only stays hidden", html: `<div class="sr-only">x</div>`, want: true},
+		{name: "visually-hidden stays hidden", html: `<div class="visually-hidden">x</div>`, want: true},
+		{name: "is-hidden stays hidden", html: `<div class="is-hidden">x</div>`, want: true},
+		{name: "invisible stays hidden", html: `<div class="invisible">x</div>`, want: true},
+		{name: "responsive hidden md:block is kept", html: `<div class="hidden md:block">x</div>`, want: false},
+		{name: "responsive hidden lg:flex is kept", html: `<div class="hidden lg:flex">x</div>`, want: false},
+		{name: "responsive hidden 2xl:grid is kept", html: `<div class="hidden 2xl:grid">x</div>`, want: false},
+		{name: "prefixed xl:hidden is kept", html: `<div class="xl:hidden">x</div>`, want: false},
+		{name: "bootstrap hidden-sm is kept", html: `<div class="hidden-sm">x</div>`, want: false},
+		{name: "responsive in longer class list", html: `<div class="flex items-center hidden md:inline-flex">x</div>`, want: false},
+		{name: "d-none plus responsive stays hidden", html: `<div class="d-none hidden md:block">x</div>`, want: true},
+		{name: "hidden attribute stays hidden", html: `<div hidden>visible-ish</div>`, want: true},
+		{name: "aria-hidden true stays hidden", html: `<div aria-hidden="true">x</div>`, want: true},
+		{name: "inline display none stays hidden", html: `<div style="display:none">x</div>`, want: true},
+		{name: "not hidden", html: `<div class="container">x</div>`, want: false},
+		{name: "hidden as part of unrelated word", html: `<div class="not-hiddenize">x</div>`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, _ := html.Parse(strings.NewReader(tt.html))
+			var target *html.Node
+			WalkNodes(doc, func(n *html.Node) bool {
+				if n.Type == html.ElementNode && n.Data == "div" {
+					target = n
+					return false
+				}
+				return true
+			})
+			if target == nil {
+				t.Fatal("could not find div")
+			}
+			if got := IsHiddenElementReader(target); got != tt.want {
+				t.Errorf("IsHiddenElementReader() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsHiddenElementReaderStrict asserts the main-root reader variant: for
+// non-landmark main wrappers (token-classed divs) the bare "hidden" token
+// still hides (an SPA shell, not a menu) while the responsive forms
+// ("hidden md:block", "xl:hidden") stay kept; semantic <main> roots never
+// reach the class test at all (the primary-container exemption), so only the
+// unambiguous signals hide them.
+func TestIsHiddenElementReaderStrict(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		tag  string
+		html string
+		want bool
+	}{
+		{name: "landmark main class-exempt", tag: "main", html: `<main class="hidden">x</main>`, want: false},
+		{name: "landmark main hidden attribute hides", tag: "main", html: `<main hidden>x</main>`, want: true},
+		{name: "wrapper bare hidden collapses", tag: "div", html: `<div class="article hidden">x</div>`, want: true},
+		{name: "responsive hidden md:block kept", tag: "div", html: `<div class="article hidden md:block">x</div>`, want: false},
+		{name: "prefixed xl:hidden kept", tag: "div", html: `<div class="article xl:hidden">x</div>`, want: false},
+		{name: "bootstrap hidden-sm kept", tag: "div", html: `<div class="article hidden-sm">x</div>`, want: false},
+		{name: "d-none collapses", tag: "div", html: `<div class="article d-none">x</div>`, want: true},
+		{name: "d-none plus responsive collapses", tag: "div", html: `<div class="article d-none hidden lg:block">x</div>`, want: true},
+		{name: "visible wrapper", tag: "div", html: `<div class="article container">x</div>`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, _ := html.Parse(strings.NewReader(tt.html))
+			var target *html.Node
+			WalkNodes(doc, func(n *html.Node) bool {
+				if n.Type == html.ElementNode && n.Data == tt.tag {
+					target = n
+					return false
+				}
+				return true
+			})
+			if target == nil {
+				t.Fatalf("could not find %s", tt.tag)
+			}
+			if got := IsHiddenElementReaderStrict(target); got != tt.want {
+				t.Errorf("IsHiddenElementReaderStrict() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -912,6 +1049,20 @@ func TestPatternMatchesEdgeCases(t *testing.T) {
 			value:   "post-article-content",
 			pattern: "article-content",
 			want:    true,
+		},
+		// Rows folded in from the former TestMatchesPattern (multi-pattern maps
+		// expressed as their decisive single pattern).
+		{
+			name:    "first of several patterns hits",
+			value:   "navigation-menu",
+			pattern: "menu",
+			want:    true,
+		},
+		{
+			name:    "no pattern in a populated map matches",
+			value:   "sidebar",
+			pattern: "article",
+			want:    false,
 		},
 	}
 
@@ -1230,6 +1381,11 @@ func TestIsHiddenByStyle(t *testing.T) {
 		{"display none with spaces", "display: none", true},
 		{"display none uppercase", "DISPLAY: NONE", true},
 		{"display none in declaration list", "color:red;display:none", true},
+		// A newline between declarations (template-formatted multi-line style)
+		// used to leave the second property name as "\ndisplay", which the
+		// space/tab-only trim never equaled with "display" — the hidden
+		// element survived the style check.
+		{"display none after newline", "color:red;\ndisplay:none", true},
 		{"visibility hidden", "visibility:hidden", true},
 		{"visibility hidden with space", "visibility: hidden", true},
 		{"display block", "display:block", false},
@@ -1650,5 +1806,299 @@ func TestFindBestArticleNode(t *testing.T) {
 				t.Errorf("FindBestArticleNode picked <%s> with score %d, want the max score %d", best.Data, got, maxScore)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// P2 text-quality rules, listing detection, and climb guards
+// (from scoring_p2_test.go — applyScoringRules data-grid/label-soup penalties,
+// FindListingContainer, climbToContentWrapper guard branches)
+// ---------------------------------------------------------------------------
+
+// scoreDivWithMetrics applies the default scorer's rules to a parsed <div>
+// with the given metrics, isolating the rule under test from markup effects.
+func scoreDivWithMetrics(t *testing.T, m contentMetrics) int {
+	t.Helper()
+	doc, err := parseHTML(`<div></div>`)
+	if err != nil {
+		t.Fatalf("parseHTML: %v", err)
+	}
+	var div *html.Node
+	WalkNodes(doc, func(n *html.Node) bool {
+		if n.Type == html.ElementNode && n.Data == "div" && div == nil {
+			div = n
+		}
+		return true
+	})
+	if div == nil {
+		t.Fatal("no div in parsed document")
+	}
+	scorer := NewDefaultScorer()
+	return scorer.applyScoringRules(div, m)
+}
+
+func TestApplyScoringRulesDataGridPenalty(t *testing.T) {
+	t.Parallel()
+
+	prose := contentMetrics{
+		paragraphCount: 4, headingCount: 0, blockCount: 10,
+		textLength: 400, digitCount: 40, sentenceCount: 8, commaCount: 10,
+	}
+	grid := prose
+	grid.digitCount = 200 // 50% digits — screener/stat-card shape
+
+	if gridScore := scoreDivWithMetrics(t, grid); gridScore >= scoreDivWithMetrics(t, prose) {
+		t.Errorf("digit-heavy metrics (%d digits/%d chars) must score below prose metrics", grid.digitCount, grid.textLength)
+	}
+}
+
+func TestApplyScoringRulesLabelSoupPenalty(t *testing.T) {
+	t.Parallel()
+
+	prose := contentMetrics{
+		paragraphCount: 4, blockCount: 10,
+		textLength: 400, sentenceCount: 12, commaCount: 10,
+	}
+	labels := prose
+	labels.sentenceCount = 0
+	labels.commaCount = 0 // 400 chars, zero punctuation — tag-cloud shape
+
+	if labelScore := scoreDivWithMetrics(t, labels); labelScore >= scoreDivWithMetrics(t, prose) {
+		t.Errorf("punctuation-free metrics must score below punctuated prose metrics")
+	}
+}
+
+func TestApplyScoringRulesShortTextExemptFromQualityPenalties(t *testing.T) {
+	t.Parallel()
+
+	// Short fragments (captions, headings, small table rows) must not be
+	// penalized even when digit-heavy or punctuation-free: the features are
+	// gated on longTextThreshold.
+	short := contentMetrics{textLength: 120, digitCount: 110, blockCount: 2}
+	if shortScore := scoreDivWithMetrics(t, short); shortScore == 0 {
+		t.Errorf("short digit-heavy fragment scored 0; quality penalties must not gate on short text")
+	}
+}
+
+func TestFindListingContainer(t *testing.T) {
+	t.Parallel()
+
+	doc, err := parseHTML(`<body><div class="feed">
+<article><h2><a href="/1">Card headline one</a></h2><p>Excerpt one with some more words here.</p></article>
+<article><h2><a href="/2">Card headline two</a></h2><p>Excerpt two with some more words here.</p></article>
+<article><h2><a href="/3">Card headline three</a></h2><p>Excerpt three with some more words here.</p></article>
+</div></body>`)
+	if err != nil {
+		t.Fatalf("parseHTML: %v", err)
+	}
+	if got := FindListingContainer(doc); got == nil {
+		t.Fatal("FindListingContainer = nil for a 3-card link-dense feed")
+	}
+}
+
+func TestFindListingContainerRejectsChromeWrapper(t *testing.T) {
+	t.Parallel()
+
+	doc, err := parseHTML(`<body><div class="related">
+<article><a href="/1">Card one</a></article>
+<article><a href="/2">Card two</a></article>
+<article><a href="/3">Card three</a></article>
+</div></body>`)
+	if err != nil {
+		t.Fatalf("parseHTML: %v", err)
+	}
+	if got := FindListingContainer(doc); got != nil {
+		t.Fatalf("FindListingContainer returned a removal-marked wrapper (%v), want nil", got)
+	}
+}
+
+func TestFindListingContainerNeedsThreeArticles(t *testing.T) {
+	t.Parallel()
+
+	doc, err := parseHTML(`<body><div class="feed">
+<article><a href="/1">Card one</a></article>
+<article><a href="/2">Card two</a></article>
+</div></body>`)
+	if err != nil {
+		t.Fatalf("parseHTML: %v", err)
+	}
+	if got := FindListingContainer(doc); got != nil {
+		t.Fatalf("FindListingContainer returned a container for 2 cards, want nil (minimum 3)")
+	}
+}
+
+// findNodeByClass returns the first element with the given class attribute.
+func findNodeByClass(t *testing.T, root *html.Node, class string) *html.Node {
+	t.Helper()
+	var found *html.Node
+	WalkNodes(root, func(n *html.Node) bool {
+		if found != nil {
+			return false
+		}
+		if n.Type == html.ElementNode {
+			for _, attr := range n.Attr {
+				if attr.Key == "class" && attr.Val == class {
+					found = n
+					return false
+				}
+			}
+		}
+		return true
+	})
+	if found == nil {
+		t.Fatalf("no element with class %q", class)
+	}
+	return found
+}
+
+// TestClimbToContentWrapperGuards drives the climb's individual stop
+// conditions directly. The end-to-end selection is pinned by the root
+// package's article tests; here every guard branch (nil parent, body/html
+// ceiling, removal-marked parent, dominance, score regression) is reached
+// deterministically by passing bestScore explicitly.
+func TestClimbToContentWrapperGuards(t *testing.T) {
+	t.Parallel()
+
+	scorer := NewDefaultScorer()
+	climb := scorer.climbToContentWrapper
+
+	t.Run("node directly under body stays", func(t *testing.T) {
+		t.Parallel()
+		doc, err := parseHTML(`<body><div class="prose"><p>body text here</p></div></body>`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		best := findNodeByClass(t, doc, "prose")
+		if got := climb(best, 100); got != best {
+			t.Error("node under <body> was climbed past the body ceiling")
+		}
+	})
+
+	t.Run("detached node stays", func(t *testing.T) {
+		t.Parallel()
+		doc, err := parseHTML(`<body><div class="prose"><p>text</p></div></body>`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		best := findNodeByClass(t, doc, "prose")
+		best.Parent.RemoveChild(best) // best becomes root: parent nil
+		if got := climb(best, 100); got != best {
+			t.Error("detached node was climbed")
+		}
+	})
+
+	t.Run("removal-marked parent stops the climb", func(t *testing.T) {
+		t.Parallel()
+		doc, err := parseHTML(`<body><nav><div class="prose"><p>nav text content</p></div></nav></body>`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		best := findNodeByClass(t, doc, "prose")
+		if got := climb(best, 1); got != best {
+			t.Error("climb entered a removal-marked parent (<nav>)")
+		}
+	})
+
+	t.Run("dominance guard stops the climb", func(t *testing.T) {
+		t.Parallel()
+		// The sibling holds far more text than best, so best does not carry
+		// at least half the parent's text.
+		doc, err := parseHTML(`<body><div class="wrap"><div class="prose"><p>tiny</p></div><div><p>` +
+			repeatWord("rival ", 300) + `</p></div></div></body>`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		best := findNodeByClass(t, doc, "prose")
+		if got := climb(best, 1); got != best {
+			t.Error("climb widened past a rival sibling despite the dominance guard")
+		}
+	})
+
+	t.Run("score regression stops the climb", func(t *testing.T) {
+		t.Parallel()
+		// A bestScore no ancestor can match (1<<30) must stop the first step.
+		doc, err := parseHTML(`<body><div class="wrap"><div class="prose"><p>` + repeatWord("body ", 60) + `</p></div></div></body>`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		best := findNodeByClass(t, doc, "prose")
+		if got := climb(best, 1<<30); got != best {
+			t.Error("climb continued although the parent scored below best")
+		}
+	})
+
+	t.Run("dominating parent with a healthy score is climbed to", func(t *testing.T) {
+		t.Parallel()
+		// bestScore of 1 is matched by the wrapper (positive "post" class,
+		// prose content), and best holds most of the parent's text.
+		doc, err := parseHTML(`<body><div class="post"><div class="prose"><p>` + repeatWord("body ", 60) + `</p></div><p>tail</p></div></body>`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		best := findNodeByClass(t, doc, "prose")
+		parent := findNodeByClass(t, doc, "post")
+		got := climb(best, 1)
+		if got != parent {
+			gotData := "<nil>"
+			if got != nil {
+				gotData = got.Data
+			}
+			t.Errorf("climb = %s, want the dominating wrapper .post (score gate should pass)", gotData)
+		}
+	})
+}
+
+// repeatWord builds s repeated n times (test-local convenience for long text).
+func repeatWord(s string, n int) string {
+	var b strings.Builder
+	for range n {
+		b.WriteString(s)
+	}
+	return b.String()
+}
+
+// TestAsciiTrimSpaceLower pins the single-pass trim+lowercase helper,
+// including its empty result and non-ASCII fallback.
+func TestAsciiTrimSpaceLower(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"   ", ""},
+		{" \t\r\n ", ""},
+		{"abc", "abc"},
+		{"  Mixed Case  ", "mixed case"},
+		{"\tTabs\tAnd\nNewlines\r", "tabs\tand\nnewlines"},
+		// Only ASCII letters are lowercased: pure non-ASCII input takes the
+		// no-allocation fast path and passes through unchanged.
+		{"ÁÉÍÓÚ", "ÁÉÍÓÚ"},
+		// ASCII uppercase inside non-ASCII input forces the strings.ToLower
+		// fallback, which lowercases everything it can.
+		{"ÁBC", "ábc"},
+	}
+	for _, tt := range tests {
+		if got := asciiTrimSpaceLower(tt.in); got != tt.want {
+			t.Errorf("asciiTrimSpaceLower(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestGetTagScoreDegenerateReceivers pins the nil guards; unknown tags score
+// zero on a configured scorer.
+func TestGetTagScoreDegenerateReceivers(t *testing.T) {
+	t.Parallel()
+
+	var nilScorer *DefaultScorer
+	if got := nilScorer.getTagScore("article"); got != 0 {
+		t.Errorf("nil scorer getTagScore = %d, want 0", got)
+	}
+	if got := (&DefaultScorer{}).getTagScore("article"); got != 0 {
+		t.Errorf("nil-config getTagScore = %d, want 0", got)
+	}
+	if got := NewDefaultScorer().getTagScore("definitely-not-a-real-tag"); got != 0 {
+		t.Errorf("unknown tag score = %d, want 0", got)
 	}
 }

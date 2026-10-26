@@ -70,13 +70,12 @@ func main() {
 	fmt.Println("2. Custom Configuration")
 	fmt.Println("-----------------------")
 
-	// Start from preset, modify as needed
+	// Start from preset, modify as needed (PreserveImages/PreserveLinks
+	// already default to true)
 	cfg := html.DefaultConfig()
-	cfg.PreserveImages = true
-	cfg.PreserveLinks = true
 	cfg.PreserveVideos = false
 	cfg.PreserveAudios = false
-	cfg.InlineImageFormat = "markdown"
+	cfg.InlineImageFormat = html.FormatMarkdown
 
 	customProcessor, err := html.New(cfg)
 	if err != nil {
@@ -94,7 +93,7 @@ func main() {
 
 	// InlineImageFormat controls how <img> is rendered in Text.
 	imageHTML := `<img src="photo.jpg" alt="Photo" width="800">`
-	for _, format := range []string{"none", "markdown", "html", "placeholder"} {
+	for _, format := range []string{html.FormatNone, html.FormatMarkdown, html.FormatHTML, html.FormatPlaceholder} {
 		cfg := html.DefaultConfig()
 		cfg.InlineImageFormat = format
 		r, _ := html.Extract([]byte(imageHTML), cfg)
@@ -103,7 +102,7 @@ func main() {
 
 	// InlineLinkFormat controls how <a> is rendered in Text.
 	linkHTML := `<p>See the <a href="https://go.dev">Go site</a> for docs.</p>`
-	for _, format := range []string{"none", "markdown", "html"} {
+	for _, format := range []string{html.FormatNone, html.FormatMarkdown, html.FormatHTML} {
 		cfg := html.DefaultConfig()
 		cfg.InlineLinkFormat = format
 		r, _ := html.Extract([]byte(linkHTML), cfg)
@@ -120,7 +119,7 @@ func main() {
 	// A table-only fixture keeps the rendering comparison free of unrelated
 	// image/link noise. Markdown (default) is compact; html preserves the tags.
 	tableHTML := "<table><tr><th>Lang</th><th>Year</th></tr><tr><td>Go</td><td>2009</td></tr></table>"
-	for _, format := range []string{"markdown", "html"} {
+	for _, format := range []string{html.FormatMarkdown, html.FormatHTML} {
 		cfg := html.DefaultConfig()
 		cfg.TableFormat = format
 		r, _ := html.Extract([]byte(tableHTML), cfg)

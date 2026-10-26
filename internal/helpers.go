@@ -764,7 +764,17 @@ func normalizedLength(s string) int {
 // This is a centralized URL validation function with size limits for security.
 func IsValidURL(url string) bool {
 	urlLen := len(url)
-	if urlLen == 0 || urlLen > MaxURLLength {
+	if urlLen == 0 {
+		return false
+	}
+	// data: URLs are exempt from the MaxURLLength gate: they carry their own,
+	// much larger ceiling (MaxDataURILength) inside the data: branch below,
+	// and legitimate base64 images routinely exceed MaxURLLength. This mirrors
+	// isSafeURIWithAudit's exemption (sanitize.go); before it, this gate made
+	// the MaxDataURILength check unreachable and every real inline base64
+	// image was silently dropped at collection while the sanitizer kept it.
+	isDataURL := urlLen >= 5 && strings.EqualFold(url[:5], "data:")
+	if urlLen > MaxURLLength && !isDataURL {
 		return false
 	}
 
@@ -792,11 +802,12 @@ func IsValidURL(url string) bool {
 	// no raw <>"' and passed the charset scan below — would reach results as a
 	// clickable link. dataURLMediaType is shared with isValidDataURLWithAudit
 	// so the two gates enforce one policy (see isSafeURIWithAudit).
-	// Fold case on the scheme prefix: schemes are case-insensitive (RFC 3986
-	// §3.1) and isValidDataURLWithAudit folds the same test, so the two gates
-	// share one policy. A case-sensitive test here let "DATA:text/html,…" skip
-	// the whitelist while "DATA:image/png" images were rejected.
-	if len(url) >= 5 && strings.EqualFold(url[:5], "data:") {
+	// isDataURL (see its definition above) folds case on the scheme prefix:
+	// schemes are case-insensitive (RFC 3986 §3.1) and isValidDataURLWithAudit
+	// folds the same test, so the two gates share one policy. A case-sensitive
+	// test let "DATA:text/html,…" skip the whitelist while "DATA:image/png"
+	// images were rejected.
+	if isDataURL {
 		if urlLen > MaxDataURILength {
 			return false
 		}
@@ -809,6 +820,15 @@ func IsValidURL(url string) bool {
 		if !ok || !isValidMediaType(mediaType) || !isSafeMediaType(mediaType) {
 			return false
 		}
+		// The data-part scan is deliberately STRICTER than
+		// isValidDataURLWithAudit's (see the counterpart comment there):
+		// that gate decides whether the attribute may stay in the sanitized
+		// DOM (browsers strip \r\n while decoding folded base64), while this
+		// one decides whether the URL may enter output text — and a raw
+		// newline breaks a Markdown link destination while non-ASCII bytes
+		// are never percent-encoded on output. A data: URL can pass the
+		// sanitizer and still be declined here, never the reverse for these
+		// byte classes.
 		for i := commaIdx + 1; i < urlLen; i++ {
 			b := url[i]
 			if b < 32 || b > 126 || b == '<' || b == '>' || b == '"' || b == '\'' || b == '\\' {
@@ -826,20 +846,14 @@ func IsValidURL(url string) bool {
 		}
 	}
 
-	// Check for dangerous protocol-relative URL patterns
-	// Block //javascript:, //vbscript:, etc.
-	// Also handle whitespace before dangerous schemes (e.g., // javascript:)
-	if strings.HasPrefix(url, "//") {
-		// Trim leading whitespace to prevent bypass attempts
-		lowerRest := strings.ToLower(strings.TrimLeft(url[2:], " \t\n\r"))
-		if strings.HasPrefix(lowerRest, "javascript:") ||
-			strings.HasPrefix(lowerRest, "vbscript:") ||
-			strings.HasPrefix(lowerRest, "data:") ||
-			strings.HasPrefix(lowerRest, "file:") {
-			return false
-		}
-		return true
-	}
+	// Protocol-relative URLs ("//host/path") need no dedicated branch here:
+	// their dangerous-scheme disguises ("//javascript:…", "// javascript:…")
+	// were already rejected above by containsDangerousScheme, whose
+	// protocolRelativeBlockedPrefixes table is a superset of the literal
+	// prefix list a former block used to re-check (an unconsolidated copy of
+	// the scheme policy that could drift from the tables); benign ones fall
+	// through to the '/' branch below, which accepts them exactly as the
+	// block's early return did.
 
 	// Accept absolute URLs (scheme is case-insensitive per RFC 3986 §3.1).
 	if hasHTTPScheme(url) {
@@ -900,7 +914,12 @@ func imgHasValidSrc(n *html.Node) bool {
 }
 
 // SelectBestCandidate returns the candidate node with the highest score, or nil
-// if candidates is empty. Ties are resolved by map iteration order.
+// if candidates is empty. Ties are resolved by map iteration order, so the
+// result is not reproducible across runs on exact ties. It has no production
+// caller: the custom-Scorer fallback in the root package tracks its best
+// candidate inline in walk order (first-wins ties). Like
+// ScoreArticleCandidates, it is kept as the map-based comparison anchor the
+// scoring tests assert against.
 func SelectBestCandidate(candidates map[*html.Node]int) *html.Node {
 	var bestNode *html.Node
 	bestScore := -1

@@ -14,7 +14,7 @@ import (
 // writeInt writes a non-negative integer to the builder without allocating a string.
 func writeInt(tb *table.TrackedBuilder, n int) {
 	if n < 10 {
-		_ = tb.WriteByte(byte('0' + n))
+		_ = tb.WriteByte(byte('0' + n)) //nolint:gosec // G115: bounded by the n<10 guard above, so '0'+n <= '9'
 		return
 	}
 	var buf [20]byte
@@ -269,8 +269,16 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 		}
 
 		startLen := tb.Len()
+		// continuesListItem records whether this block skipped the leading
+		// newline to continue its parent list item's marker line (see
+		// continuesListItem); its exit then also skips the extra blank line so
+		// the item stays a tight "- [label](URL)" line.
+		continuedMarker := false
 		if isBlockElement && startLen > 0 {
-			table.EnsureNewline(tb)
+			continuedMarker = continuesListItem(node, parentBlock, tb, chromeMode)
+			if !continuedMarker {
+				table.EnsureNewline(tb)
+			}
 			// Add Markdown list/indentation prefix (list markers for <li>,
 			// padding-left based indentation for other indented blocks).
 			if listPrefix := blockListPrefix(node); listPrefix != "" {
@@ -297,7 +305,7 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 		if isBlockElement && hasContent {
 			table.EnsureNewline(tb)
 			// Add an extra newline for paragraph-level blocks to create paragraph spacing in Markdown
-			if isParagraphBlock && tb.LastChar == '\n' {
+			if isParagraphBlock && tb.LastChar == '\n' && !continuedMarker {
 				_ = tb.WriteByte('\n')
 			}
 		}
@@ -311,6 +319,66 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 			extractTextWithStructure(child, tb, imageCounter, linkCounter, tableFormat, parentBlock, depth+1, inPre, chromeMode)
 		}
 	}
+}
+
+// continuesListItem reports whether node is about to become the first content
+// of its list item: a p/div child of an li/dd whose Markdown marker was just
+// written and is still the only thing on the current line. Such a child
+// continues the marker line instead of breaking after it, so the dropdown-menu
+// idiom <li><p><a>label</a></p></li> renders as "- [label](URL)" rather than a
+// lone bullet followed by the label on a paragraph of its own. Chrome mode
+// only — the Extract path's text formatting is unchanged.
+func continuesListItem(node, parentBlock *html.Node, tb *table.TrackedBuilder, chromeMode bool) bool {
+	if !chromeMode || node == nil || parentBlock == nil {
+		return false
+	}
+	if node.Data != "p" && node.Data != "div" {
+		return false
+	}
+	if parentBlock.Data != "li" && parentBlock.Data != "dd" {
+		return false
+	}
+	return pendingListMarkerLine(tb)
+}
+
+// pendingListMarkerLine reports whether the builder's current line holds only
+// a list marker in progress — indentation, one marker character ("-", "*",
+// "+", ":" for <dd>, or ordered "N."), trailing spaces — with none of the
+// item's content written yet.
+func pendingListMarkerLine(tb *table.TrackedBuilder) bool {
+	b := tb.Bytes()
+	i := len(b)
+	for i > 0 && (b[i-1] == ' ' || b[i-1] == '\t') {
+		i--
+	}
+	if i == 0 {
+		return false
+	}
+	switch b[i-1] {
+	case '-', '*', '+', ':':
+		i--
+	default:
+		// An ordered marker ends the line with "N.": require the '.', then at
+		// least one digit to its left, then a line start. The previous scan
+		// required the char BEFORE the digits to be a '.', matching
+		// ".<digits>" — a shape no marker writer produces, so the "N." that
+		// listItemPrefix writes never registered as pending.
+		if b[i-1] != '.' {
+			return false
+		}
+		j := i - 1
+		for j > 0 && b[j-1] >= '0' && b[j-1] <= '9' {
+			j--
+		}
+		if j == i-1 {
+			return false
+		}
+		i = j
+	}
+	for i > 0 && (b[i-1] == ' ' || b[i-1] == '\t') {
+		i--
+	}
+	return i == 0 || b[i-1] == '\n'
 }
 
 // tableTokenText returns node's flattened visible text with [LINK:n]…[/LINK]
@@ -330,23 +398,28 @@ func extractTextWithStructure(node *html.Node, tb *table.TrackedBuilder, imageCo
 // Unlike the linear text pass, this flattener never emits newlines (a
 // markdown table row is one line); whitespace between fragments collapses to
 // single spaces.
+//
+// The scratch is a pooled, capacity-retaining []byte rather than a fresh
+// strings.Builder per cell: tableTokenText runs once per table cell and
+// caption on this path, and the builder's Grow(64) was one allocation each.
+// string(*bp) copies at exact size, so nothing aliases the pooled buffer.
 func tableTokenText(node *html.Node, imageCounter, linkCounter *int, chromeMode bool) string {
 	if node == nil {
 		return ""
 	}
-	var b strings.Builder
-	b.Grow(64)
-	writeTokenText(&b, node, imageCounter, linkCounter, chromeMode)
-	return strings.TrimSpace(b.String())
+	bp := GetByteBuf()
+	defer PutByteBuf(bp)
+	writeTokenText(bp, node, imageCounter, linkCounter, chromeMode)
+	return strings.TrimSpace(string(*bp))
 }
 
 // writeTokenText is tableTokenText's recursive worker.
-func writeTokenText(b *strings.Builder, node *html.Node, imageCounter, linkCounter *int, chromeMode bool) {
+func writeTokenText(bp *[]byte, node *html.Node, imageCounter, linkCounter *int, chromeMode bool) {
 	switch node.Type {
 	case html.TextNode:
 		if text := strings.TrimSpace(node.Data); text != "" {
-			ensureTokenSpace(b)
-			b.WriteString(text)
+			ensureTokenSpace(bp)
+			*bp = append(*bp, text...)
 		}
 		return
 	case html.CommentNode, html.DoctypeNode:
@@ -365,44 +438,41 @@ func writeTokenText(b *strings.Builder, node *html.Node, imageCounter, linkCount
 		case "a":
 			if linkCounter != nil {
 				*linkCounter++
-				ensureTokenSpace(b)
-				b.WriteString("[LINK:")
-				b.WriteString(strconv.Itoa(*linkCounter))
-				b.WriteString("]")
+				ensureTokenSpace(bp)
+				*bp = append(*bp, "[LINK:"...)
+				*bp = strconv.AppendInt(*bp, int64(*linkCounter), 10)
+				*bp = append(*bp, ']')
 				for child := node.FirstChild; child != nil; child = child.NextSibling {
-					writeTokenText(b, child, imageCounter, linkCounter, chromeMode)
+					writeTokenText(bp, child, imageCounter, linkCounter, chromeMode)
 				}
-				b.WriteString("[/LINK]")
+				*bp = append(*bp, "[/LINK]"...)
 				return
 			}
 		case "img":
 			if imageCounter != nil && imgHasValidSrc(node) {
 				*imageCounter++
-				ensureTokenSpace(b)
-				b.WriteString("[IMAGE:")
-				b.WriteString(strconv.Itoa(*imageCounter))
-				b.WriteString("]")
+				ensureTokenSpace(bp)
+				*bp = append(*bp, "[IMAGE:"...)
+				*bp = strconv.AppendInt(*bp, int64(*imageCounter), 10)
+				*bp = append(*bp, ']')
 				return
 			}
 			return
 		case "br":
-			ensureTokenSpace(b)
+			ensureTokenSpace(bp)
 			return
 		}
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			writeTokenText(b, child, imageCounter, linkCounter, chromeMode)
+			writeTokenText(bp, child, imageCounter, linkCounter, chromeMode)
 		}
 	}
 }
 
 // ensureTokenSpace appends a single separating space when needed so flattened
 // fragments never run together and never double-space.
-func ensureTokenSpace(b *strings.Builder) {
-	if b.Len() > 0 {
-		last := b.String()[b.Len()-1]
-		if last != ' ' {
-			b.WriteByte(' ')
-		}
+func ensureTokenSpace(bp *[]byte) {
+	if b := *bp; len(b) > 0 && b[len(b)-1] != ' ' {
+		*bp = append(b, ' ')
 	}
 }
 
@@ -494,21 +564,29 @@ func CleanContentNode(node *html.Node) *html.Node {
 	return pruneDescendants(node, ShouldRemoveElement)
 }
 
-// RemoveHiddenElements removes hidden elements from node's subtree in place:
-// the hidden attribute, aria-hidden="true", a display:none/visibility:hidden
-// style, or a hidden class token (hidden, sr-only, d-none, ...). It is the
-// light-weight cleaner for page-chrome sections in reader mode: CleanContentNode
-// applies the content scorer's class removal, which would strip a nav region's
-// own "nav-menu" children along with the ads, so chrome regions clear only
-// what is invisible. The root node itself is never removed (callers decide its
-// fate; see IsHiddenElement).
-func RemoveHiddenElements(node *html.Node) *html.Node {
-	return pruneDescendants(node, IsHiddenElement)
+// RemoveHiddenElementsReader removes hidden elements from node's subtree in
+// place, testing hidden-ness with IsHiddenElementReader: the hidden attribute,
+// aria-hidden="true", a display:none/visibility:hidden style, or an
+// always-hidden class token (d-none, sr-only, ...). It is the light-weight
+// cleaner for page-chrome sections in reader mode: CleanContentNode applies
+// the content scorer's class removal, which would strip a nav region's own
+// "nav-menu" children along with the ads, so chrome regions clear only what is
+// invisible — and a viewport-less, pointer-less reader cannot resolve
+// responsive visibility (Tailwind's "hidden md:block", "xl:hidden") or
+// bare-"hidden" hover/click disclosure panels (dropdown menus, drawers) to
+// invisible, so those are kept: they are precisely the nav link data ReadPage
+// exists to preserve. The root node itself is never removed (callers decide
+// its fate; read.go tests section roots with IsHiddenElementReader /
+// IsHiddenElementReaderStrict). The Extract path keeps applying its hidden
+// semantics through DefaultScorer.ShouldRemove (class token, style, hidden
+// attribute, aria-hidden), unchanged.
+func RemoveHiddenElementsReader(node *html.Node) *html.Node {
+	return pruneDescendants(node, IsHiddenElementReader)
 }
 
 // pruneDescendants detaches every element child for which remove returns
 // true, in place, and returns node. It is the single implementation of the
-// detach-while-iterating walk CleanContentNode and RemoveHiddenElements
+// detach-while-iterating walk CleanContentNode and RemoveHiddenElementsReader
 // share. Marked children are detached immediately — saving next BEFORE
 // RemoveChild, which clears the child's sibling links — instead of being
 // collected into a toRemove slice for a second pass; detached subtrees are

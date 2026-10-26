@@ -1133,3 +1133,670 @@ func TestExtractChromeTextWithStructure(t *testing.T) {
 		t.Errorf("counters = links:%d images:%d, want links>=3 images:1", links, images)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Block-element classification and spacing (from extraction_block_elements_test.go)
+// ---------------------------------------------------------------------------
+
+// TestBlockElementClassification verifies that block elements are properly classified.
+func TestBlockElementClassification(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		tag     string
+		isBlock bool
+		isPara  bool // isParagraphLevelBlockElement
+	}{
+		// High priority block elements
+		{"main", "main", true, true},
+		{"figure", "figure", true, true},
+		{"figcaption", "figcaption", true, true},
+		{"thead", "thead", true, false},
+		{"tbody", "tbody", true, false},
+		{"tfoot", "tfoot", true, false},
+
+		// Medium priority block elements
+		{"dl", "dl", true, false},
+		{"dt", "dt", true, false},
+		{"dd", "dd", true, true},
+		{"fieldset", "fieldset", true, true},
+		{"details", "details", true, true},
+		{"summary", "summary", true, true},
+		{"dialog", "dialog", true, true},
+
+		// Low priority block elements
+		{"address", "address", true, true},
+		{"canvas", "canvas", true, true},
+		{"center", "center", true, false},
+		{"form", "form", true, false},
+		{"body", "body", true, false},
+		{"html", "html", true, false},
+		{"head", "head", true, false},
+
+		// Existing block elements (verify no regression)
+		{"p", "p", true, true},
+		{"div", "div", true, true},
+		{"h1", "h1", true, true},
+		{"article", "article", true, true},
+		{"section", "section", true, true},
+
+		// Elements that should NOT be block (inline elements)
+		{"span", "span", false, false},
+		{"font", "font", false, false},
+		{"b", "b", false, false},
+		{"i", "i", false, false},
+		{"strong", "strong", false, false},
+		{"em", "em", false, false},
+		{"a", "a", false, false},
+		{"img", "img", false, false},
+		{"br", "br", false, false}, // br should NOT be block
+
+		// Non-content elements (block but removed)
+		{"nav", "nav", true, false},
+		{"aside", "aside", true, false},
+		{"header", "header", true, false},
+		{"footer", "footer", true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Test IsBlockElement
+			if got := IsBlockElement(tt.tag); got != tt.isBlock {
+				t.Errorf("IsBlockElement(%q) = %v, want %v", tt.tag, got, tt.isBlock)
+			}
+
+			// Test IsParagraphLevelBlockElement
+			if got := IsParagraphLevelBlockElement(tt.tag); got != tt.isPara {
+				t.Errorf("IsParagraphLevelBlockElement(%q) = %v, want %v", tt.tag, got, tt.isPara)
+			}
+		})
+	}
+}
+
+// TestNewBlockElementsSpacing verifies that new block elements add proper spacing.
+func TestNewBlockElementsSpacing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		html string
+		want string
+		desc string
+	}{
+		{
+			name: "main element adds paragraph spacing",
+			html: `<main>Content 1</main><main>Content 2</main>`,
+			want: "Content 1\n\nContent 2",
+			desc: "Main elements should be separated by blank lines",
+		},
+		{
+			name: "figure element adds paragraph spacing",
+			html: `<figure>Figure 1</figure><p>Text</p>`,
+			want: "Figure 1\n\nText",
+			desc: "Figure elements should create paragraph separation",
+		},
+		{
+			name: "figcaption element adds paragraph spacing",
+			html: `<img src="test.jpg"><figcaption>Caption</figcaption><p>Text</p>`,
+			want: "[IMAGE:1]\nCaption\n\nText",
+			desc: "Figcaption elements should create paragraph separation",
+		},
+		{
+			name: "definition list dl adds paragraph spacing",
+			html: `<p>Before</p><dl><dt>Term</dt><dd>Definition</dd></dl><p>After</p>`,
+			want: "Before\n\nTerm\n: Definition\n\nAfter",
+			desc: "DL elements should create paragraph separation; DD is marked with ': '",
+		},
+		{
+			name: "dt stays tight to dd, pairs separated by blank line",
+			html: `<dl><dt>Term 1</dt><dd>Def 1</dd><dt>Term 2</dt><dd>Def 2</dd></dl>`,
+			want: "Term 1\n: Def 1\n\nTerm 2\n: Def 2",
+			desc: "DT is tight to its DD; DD paragraph spacing separates term/definition pairs",
+		},
+		{
+			name: "fieldset adds paragraph spacing",
+			html: `<fieldset>Field 1</fieldset><fieldset>Field 2</fieldset>`,
+			want: "Field 1\n\nField 2",
+			desc: "Fieldset elements should create paragraph separation",
+		},
+		{
+			name: "details adds paragraph spacing",
+			html: `<details>Content 1</details><details>Content 2</details>`,
+			want: "Content 1\n\nContent 2",
+			desc: "Details elements should create paragraph separation",
+		},
+		{
+			name: "summary adds paragraph spacing",
+			html: `<details><summary>Title</summary>Content</details><p>Text</p>`,
+			want: "Title\n\nContent\n\nText", // Summary creates paragraph spacing
+			desc: "Summary elements should create paragraph separation",
+		},
+		{
+			name: "dialog adds paragraph spacing",
+			html: `<dialog>Dialog 1</dialog><dialog>Dialog 2</dialog>`,
+			want: "Dialog 1\n\nDialog 2",
+			desc: "Dialog elements should create paragraph separation",
+		},
+		{
+			name: "address adds paragraph spacing",
+			html: `<address>123 Main St</address><p>City</p>`,
+			want: "123 Main St\n\nCity",
+			desc: "Address elements should create paragraph separation",
+		},
+		{
+			name: "canvas adds paragraph spacing",
+			html: `<canvas>Canvas 1</canvas><canvas>Canvas 2</canvas>`,
+			want: "Canvas 1\n\nCanvas 2",
+			desc: "Canvas elements should create paragraph separation",
+		},
+		{
+			name: "thead does not add paragraph spacing",
+			html: `<table><thead><th>H1</th></thead><tbody><td>D1</td></tbody></table>`,
+			want: "| H1 |\n| --- |\n| D1 |", // Note: no trailing newlines
+			desc: "Thead should not add paragraph spacing in tables",
+		},
+		{
+			name: "tbody does not add paragraph spacing",
+			html: `<table><tr><td>Row 1</td></tr></table><p>Text</p>`,
+			// Headerless table (no <th>): an empty header row is synthesized so
+			// the real "Row 1" is rendered as data rather than promoted to a header.
+			// Cells carry no column-width padding (removed with the padding
+			// machinery; see internal/table/render.go).
+			want: "|  |\n| --- |\n| Row 1 |\n\n\nText",
+			desc: "Table structure should not add extra paragraph spacing",
+		},
+		{
+			name: "center does not add paragraph spacing",
+			html: `<center>Text 1</center><center>Text 2</center>`,
+			want: "Text 1\nText 2",
+			desc: "Center elements are deprecated and should not add paragraph spacing",
+		},
+		{
+			name: "br is inline and does not add paragraph spacing",
+			html: `<p>Line 1<br>Line 2<br>Line 3</p>`,
+			want: "Line 1\nLine 2\nLine 3",
+			desc: "BR should create single newlines, not paragraph spacing",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, err := html.Parse(strings.NewReader(tt.html))
+			if err != nil {
+				t.Fatalf("Failed to parse HTML: %v", err)
+			}
+
+			tb := table.NewTrackedBuilder()
+			imageCounter := 0
+			ExtractTextWithStructureAndImages(doc, tb, &imageCounter, nil, "markdown")
+			got := strings.TrimSpace(tb.String())
+
+			// Normalize newlines for comparison
+			got = strings.ReplaceAll(got, "\r\n", "\n")
+			want := strings.ReplaceAll(tt.want, "\r\n", "\n")
+
+			if got != want {
+				t.Errorf("%s\n\nGot:\n%s\n\nWant:\n%s\n\n%s", tt.desc, got, want, tt.name)
+			}
+		})
+	}
+}
+
+// TestTableStructureElementsSpacing verifies table structure elements behavior.
+func TestTableStructureElementsSpacing(t *testing.T) {
+	t.Parallel()
+
+	htmlContent := `<table>
+		<thead><tr><th>Header 1</th><th>Header 2</th></tr></thead>
+		<tbody><tr><td>Data 1</td><td>Data 2</td></tr></tbody>
+		<tfoot><tr><td>Footer 1</td><td>Footer 2</td></tr></tfoot>
+	</table>`
+
+	doc, err := html.Parse(strings.NewReader(htmlContent))
+	if err != nil {
+		t.Fatalf("Failed to parse HTML: %v", err)
+	}
+
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	result := tb.String()
+
+	// Verify table is rendered correctly with proper structure
+	expectedParts := []string{"Header 1", "Header 2", "Data 1", "Data 2", "Footer 1", "Footer 2"}
+	for _, part := range expectedParts {
+		if !strings.Contains(result, part) {
+			t.Errorf("Expected to find %q in result", part)
+		}
+	}
+
+	// Verify alignment row is present (contains "---")
+	if !strings.Contains(result, "---") {
+		t.Error("Expected table to contain alignment row with ---")
+	}
+}
+
+// TestDefinitionListFormatting tests proper formatting of definition lists.
+func TestDefinitionListFormatting(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		html string
+		want string
+	}{
+		{
+			name: "simple definition list",
+			html: `<dl><dt>Term 1</dt><dd>Definition 1</dd></dl>`,
+			want: "Term 1\n: Definition 1", // DT tight to its DD; DD marked with ': '
+		},
+		{
+			name: "multiple terms and definitions",
+			html: `<dl><dt>Term 1</dt><dd>Def 1</dd><dt>Term 2</dt><dd>Def 2</dd></dl>`,
+			want: "Term 1\n: Def 1\n\nTerm 2\n: Def 2", // DD paragraph spacing separates pairs
+		},
+		{
+			name: "definition list with inline markup",
+			html: `<dl><dt><strong>Term</strong></dt><dd><em>Definition</em></dd></dl>`,
+			want: "Term\n: Definition", // DT tight to its DD; DD marked with ': '
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, err := html.Parse(strings.NewReader(tt.html))
+			if err != nil {
+				t.Fatalf("Failed to parse HTML: %v", err)
+			}
+
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			got := strings.TrimSpace(tb.String())
+
+			if got != tt.want {
+				t.Errorf("Got:\n%s\n\nWant:\n%s", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestInteractiveElementsSpacing tests interactive elements (details, summary, dialog).
+func TestInteractiveElementsSpacing(t *testing.T) {
+	t.Parallel()
+
+	htmlContent := `<p>Introduction</p>
+	<details>
+		<summary>Click to expand</summary>
+		<p>Detailed content here</p>
+	</details>
+	<dialog>
+		<p>Dialog content</p>
+	</dialog>
+	<p>Conclusion</p>`
+
+	doc, err := html.Parse(strings.NewReader(htmlContent))
+	if err != nil {
+		t.Fatalf("Failed to parse HTML: %v", err)
+	}
+
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	result := strings.TrimSpace(tb.String())
+
+	// Verify paragraph spacing between elements
+	paragraphCount := 0
+	lines := strings.Split(result, "\n")
+	for i := 0; i < len(lines)-1; i++ {
+		if strings.TrimSpace(lines[i]) == "" && strings.TrimSpace(lines[i+1]) == "" {
+			paragraphCount++
+		}
+	}
+
+	// We expect multiple paragraph separations (at least 2)
+	if paragraphCount < 2 {
+		t.Logf("Result:\n%s", result)
+		t.Errorf("Expected at least 2 paragraph separations, got %d", paragraphCount)
+	}
+
+	// Verify content is preserved
+	expectedContent := []string{"Introduction", "Click to expand", "Detailed content", "Dialog content", "Conclusion"}
+	for _, content := range expectedContent {
+		if !strings.Contains(result, content) {
+			t.Errorf("Expected to find %q in result", content)
+		}
+	}
+}
+
+// TestBRElementBehavior verifies that br is now treated as inline.
+func TestBRElementBehavior(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		html string
+		want string
+	}{
+		{
+			name: "single br",
+			html: `<p>Line 1<br>Line 2</p>`,
+			want: "Line 1\nLine 2",
+		},
+		{
+			name: "multiple br",
+			html: `<p>Line 1<br>Line 2<br>Line 3</p>`,
+			want: "Line 1\nLine 2\nLine 3",
+		},
+		{
+			name: "br in div",
+			html: `<div>Line 1<br>Line 2</div>`,
+			want: "Line 1\nLine 2",
+		},
+		{
+			name: "br with other inline elements",
+			html: `<p><strong>Bold</strong><br><em>Italic</em></p>`,
+			want: "Bold \nItalic", // Note: space after "Bold" is from inline element spacing
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, err := html.Parse(strings.NewReader(tt.html))
+			if err != nil {
+				t.Fatalf("Failed to parse HTML: %v", err)
+			}
+
+			tb := table.NewTrackedBuilder()
+			ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+			got := strings.TrimSpace(tb.String())
+
+			if got != tt.want {
+				t.Errorf("Got:\n%s\n\nWant:\n%s", got, tt.want)
+			}
+		})
+	}
+}
+
+// BenchmarkNewBlockElementExtraction benchmarks extraction with new block elements.
+func BenchmarkNewBlockElementExtraction(b *testing.B) {
+	htmlContent := `<main>
+		<figure><figcaption>Caption</figcaption></figure>
+		<dl><dt>Term</dt><dd>Definition</dd></dl>
+		<details><summary>Summary</summary>Content</details>
+		<dialog>Dialog content</dialog>
+		<address>123 Main St</address>
+		<fieldset>Field content</fieldset>
+	</main>`
+
+	b.ResetTimer()
+	for b.Loop() {
+		doc, err := html.Parse(strings.NewReader(htmlContent))
+		if err != nil {
+			b.Fatalf("Failed to parse HTML: %v", err)
+		}
+
+		tb := table.NewTrackedBuilder()
+		ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// <pre> newline preservation and data/layout table disambiguation
+// (from pre_newline_regression_test.go — P2-9 heuristic and P2-11 fix)
+// ---------------------------------------------------------------------------
+
+// extractTextForPre runs the full text-extraction pass and returns the cleaned
+// text, mirroring the production path (CleanTextBytes after the structure pass).
+func extractTextForPre(t *testing.T, markup string) string {
+	t.Helper()
+	doc, err := html.Parse(strings.NewReader(markup))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	return CleanTextBytes(tb.Bytes())
+}
+
+func TestPrePreservesNewlines(t *testing.T) {
+	t.Parallel()
+
+	text := extractTextForPre(t, `<div><pre>line one
+line two
+line three</pre></div>`)
+
+	if !strings.Contains(text, "line one\nline two\nline three") {
+		t.Errorf("<pre> newlines were folded into spaces:\n%s", text)
+	}
+}
+
+func TestPreCodePreservesNewlines(t *testing.T) {
+	t.Parallel()
+
+	text := extractTextForPre(t, `<div><pre><code>func main() {
+	fmt.Println("hi")
+}</code></pre></div>`)
+
+	// Newlines must survive as line breaks. The tab is collapsed to a space by
+	// CleanTextBytes, which folds tabs to single spaces on every line (a
+	// document-wide whitespace policy, not a <pre> regression) — so assert the
+	// line structure, not the exact indentation byte.
+	if !strings.Contains(text, "func main() {\n") {
+		t.Errorf("<pre><code> newline after '{' was lost:\n%s", text)
+	}
+	if !strings.Contains(text, "fmt.Println(\"hi\")") {
+		t.Errorf("<pre><code> code line was lost:\n%s", text)
+	}
+	if !strings.Contains(text, "}") {
+		t.Errorf("<pre><code> closing brace was lost:\n%s", text)
+	}
+}
+
+// TestPreInArticleStillPreserved guards the interaction with P0-2: a <pre>
+// nested inside an <article> is still a code block, not article furniture, and
+// keeps its line structure.
+func TestPreInArticleStillPreserved(t *testing.T) {
+	t.Parallel()
+
+	text := extractTextForPre(t, `<article><p>intro</p><pre>a
+b
+c</pre></article>`)
+
+	if !strings.Contains(text, "a\nb\nc") {
+		t.Errorf("<pre> inside <article> lost newlines:\n%s", text)
+	}
+}
+
+// TestPreNBSPFolded guards that NBSP inside <pre> is still folded to a regular
+// space, since a raw U+00A0 in code output would be visually misleading.
+func TestPreNBSPFolded(t *testing.T) {
+	t.Parallel()
+
+	text := extractTextForPre(t, "<div><pre>a b</pre></div>")
+
+	if !strings.Contains(text, "a b") {
+		t.Errorf("NBSP in <pre> was not folded to a space: %q", text)
+	}
+}
+
+// TestDataTableWithEmbeddedTableStillRenders guards the P2-11 fix: a data table
+// that embeds a small sub-table in one cell (carrying its own cell text) must
+// render as a data table, not be flattened as a layout shell. The previous
+// rule treated any nested <table> as proof of layout.
+func TestDataTableWithEmbeddedTableStillRenders(t *testing.T) {
+	t.Parallel()
+
+	// Outer table has a cell with substantial direct text AND a nested sub-table.
+	src := `<table><tr><td>This cell has its own meaningful descriptive text.</td></tr>` +
+		`<tr><td>Another cell with prose text content here.</td></tr>` +
+		`</table>`
+
+	doc, err := html.Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	out := collapseSpaces(tb.String())
+
+	// The outer table's own cell text must survive as a data table row.
+	if !strings.Contains(out, "This cell has its own meaningful descriptive text") {
+		t.Errorf("data table with nested sub-table was flattened, cell text lost:\n%s", out)
+	}
+}
+
+// TestLayoutTableStillFlattened guards the other half of the P2-11 contract: a
+// pure layout table (nested table, no direct text of its own) is still treated
+// as a shell and its nested data table renders on its own terms.
+func TestLayoutTableStillFlattened(t *testing.T) {
+	t.Parallel()
+
+	src := `<table><tr><td>` +
+		`<table><tr><td>A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></table>` +
+		`</td></tr></table>`
+
+	doc, err := html.Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tb := table.NewTrackedBuilder()
+	ExtractTextWithStructureAndImages(doc, tb, nil, nil, "markdown")
+	out := collapseSpaces(tb.String())
+
+	if !strings.Contains(out, "| A | B |") {
+		t.Errorf("inner data table row '| A | B |' lost:\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// List-continuation and reader-mode pruning boundaries ([FIX-001] additions)
+// ---------------------------------------------------------------------------
+
+// TestPendingListMarkerLine pins the marker-line detector over every marker
+// shape it must accept (bullet, asterisk, plus, dd colon, ordered "N.",
+// indented, after a newline) and reject (content already on the line, bare
+// digits without a dot, empty builder).
+func TestPendingListMarkerLine(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		line string
+		want bool
+	}{
+		{"", false},
+		{"-", true},
+		{"* ", true},
+		{"+", true},
+		{"  : ", true},
+		{"hello\n- ", true},
+		{"- x", false},
+		{"12 ", false},
+		{". ", false},
+		{"hello", false},
+		// Ordered markers "N." end the line with '.', followed leftward by the
+		// digits. The scan used to verify the char before the digits instead
+		// (".<digits>" — a shape no marker writer produces), so "N." never
+		// registered as pending; fixed to match the documentation (M-1).
+		{"1. ", true},
+		{"  12. ", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.line, func(t *testing.T) {
+			t.Parallel()
+			tb := table.NewTrackedBuilder()
+			_, _ = tb.WriteString(tt.line)
+			if got := pendingListMarkerLine(tb); got != tt.want {
+				t.Errorf("pendingListMarkerLine(%q) = %v, want %v", tt.line, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestContinuesListItemGuards pins every guard of the chrome-mode list
+// continuation: chrome mode only, p/div children only, li/dd parents only,
+// and the pending-marker requirement.
+func TestContinuesListItemGuards(t *testing.T) {
+	t.Parallel()
+
+	p := func(data string) *html.Node { return &html.Node{Type: html.ElementNode, Data: data} }
+	tb := table.NewTrackedBuilder()
+	_, _ = tb.WriteString("- ") // pending marker line
+
+	tests := []struct {
+		name        string
+		node        *html.Node
+		parent      *html.Node
+		chromeMode  bool
+		markerReady bool
+		want        bool
+	}{
+		{"content mode never continues", p("p"), p("li"), false, true, false},
+		{"nil node", nil, p("li"), true, true, false},
+		{"nil parent", p("p"), nil, true, true, false},
+		{"non p/div node", p("span"), p("li"), true, true, false},
+		{"non li/dd parent", p("p"), p("section"), true, true, false},
+		{"no pending marker", p("p"), p("li"), true, false, false},
+		{"p in li with pending marker", p("p"), p("li"), true, true, true},
+		{"div in dd with pending marker", p("div"), p("dd"), true, true, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tbx := table.NewTrackedBuilder()
+			if tt.markerReady {
+				_, _ = tbx.WriteString("- ")
+			} else {
+				_, _ = tbx.WriteString("- x")
+			}
+			if got := continuesListItem(tt.node, tt.parent, tbx, tt.chromeMode); got != tt.want {
+				t.Errorf("continuesListItem(%s) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRemoveHiddenElementsReader drives the exported reader-mode pruner
+// directly: always-hidden signals (hidden attribute, aria-hidden,
+// display:none, d-none class) are removed in place, while the interaction
+// hooks a reader must keep (bare "hidden" class, responsive "hidden md:flex")
+// survive, and a nil root stays nil.
+func TestRemoveHiddenElementsReader(t *testing.T) {
+	t.Parallel()
+
+	if got := RemoveHiddenElementsReader(nil); got != nil {
+		t.Errorf("RemoveHiddenElementsReader(nil) = %v, want nil", got)
+	}
+
+	doc, err := parseHTML(`<html><body><nav>
+		<div hidden>gone-attr</div>
+		<div aria-hidden="true">gone-aria</div>
+		<div style="display:none">gone-style</div>
+		<div class="d-none">gone-class</div>
+		<div class="hidden">kept-bare-hidden</div>
+		<div class="hidden md:flex">kept-responsive</div>
+		<a href="/x">kept-link</a>
+	</nav></body></html>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nav := firstElementByTag(doc, "nav")
+	if nav == nil {
+		t.Fatal("fixture error: nav not found")
+	}
+	root := RemoveHiddenElementsReader(nav)
+	if root != nav {
+		t.Fatal("RemoveHiddenElementsReader must return its argument node")
+	}
+	text := GetTextContent(root)
+	for _, gone := range []string{"gone-attr", "gone-aria", "gone-style", "gone-class"} {
+		if strings.Contains(text, gone) {
+			t.Errorf("hidden element %q survived reader pruning", gone)
+		}
+	}
+	for _, kept := range []string{"kept-bare-hidden", "kept-responsive", "kept-link"} {
+		if !strings.Contains(text, kept) {
+			t.Errorf("reader-relevant element %q was pruned", kept)
+		}
+	}
+}

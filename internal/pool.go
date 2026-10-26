@@ -112,7 +112,15 @@ var byteBufPool = sync.Pool{
 // the buffer with PutByteBuf. The returned slice must not be retained past
 // PutByteBuf (the backing array is reused).
 func GetByteBuf() *[]byte {
-	bp := byteBufPool.Get().(*[]byte)
+	v := byteBufPool.Get()
+	bp, ok := v.(*[]byte)
+	if !ok {
+		// Same corruption posture as every pool Get: never panic, log under
+		// debug, hand out a fresh object.
+		logPoolCorruption("byteBufPool", "*[]byte", v)
+		b := make([]byte, 0, 256)
+		return &b
+	}
 	*bp = (*bp)[:0]
 	return bp
 }
@@ -154,7 +162,14 @@ var trackedBuilderPool = sync.Pool{
 // GetTrackedBuilder returns a reset TrackedBuilder from the pool. Return it with
 // PutTrackedBuilder. The returned buffer retains capacity across uses.
 func GetTrackedBuilder() *table.TrackedBuilder {
-	tb := trackedBuilderPool.Get().(*table.TrackedBuilder)
+	v := trackedBuilderPool.Get()
+	tb, ok := v.(*table.TrackedBuilder)
+	if !ok {
+		// Same corruption posture as every pool Get: never panic, log under
+		// debug, hand out a fresh object.
+		logPoolCorruption("trackedBuilderPool", "*table.TrackedBuilder", v)
+		return table.NewTrackedBuilder()
+	}
 	tb.Reset()
 	return tb
 }
@@ -211,6 +226,9 @@ const maxPooledResultScratchElems = 512
 // the returned result.
 type SlicePool[T any] struct {
 	pool sync.Pool
+	// initialCap backs the corruption fallback in Get with the same capacity
+	// New would have allocated.
+	initialCap int
 }
 
 // NewSlicePool creates a SlicePool whose first borrowed slice starts with the
@@ -223,12 +241,21 @@ func NewSlicePool[T any](initialCap int) *SlicePool[T] {
 				return &s
 			},
 		},
+		initialCap: initialCap,
 	}
 }
 
 // Get returns a zero-length slice backed by a capacity-retaining pooled array.
 func (sp *SlicePool[T]) Get() *[]T {
-	s := sp.pool.Get().(*[]T)
+	v := sp.pool.Get()
+	s, ok := v.(*[]T)
+	if !ok {
+		// Same corruption posture as every pool Get: never panic, log under
+		// debug, hand out a fresh object.
+		logPoolCorruption("SlicePool", "*[]T", v)
+		newS := make([]T, 0, sp.initialCap)
+		return &newS
+	}
 	*s = (*s)[:0]
 	return s
 }
@@ -246,9 +273,10 @@ func (sp *SlicePool[T]) Put(s *[]T) {
 	sp.pool.Put(s)
 }
 
-// NodeSlicePool is a sync.Pool for HTML node slices used in tree traversal.
+// nodeSlicePool is a sync.Pool for HTML node slices used in tree traversal.
 // This reduces allocations in WalkNodes and similar traversal functions.
-var NodeSlicePool = sync.Pool{
+// Unexported like its sibling pools: nothing outside the package may reach it.
+var nodeSlicePool = sync.Pool{
 	New: func() any {
 		s := make([]*html.Node, 0, 64)
 		return &s
@@ -259,10 +287,10 @@ var NodeSlicePool = sync.Pool{
 // The returned slice has zero length but retained capacity.
 // Call PutNodeSlice when done to return it to the pool.
 func GetNodeSlice() *[]*html.Node {
-	v := NodeSlicePool.Get()
+	v := nodeSlicePool.Get()
 	s, ok := v.(*[]*html.Node)
 	if !ok {
-		logPoolCorruption("NodeSlicePool", "*[]*html.Node", v)
+		logPoolCorruption("nodeSlicePool", "*[]*html.Node", v)
 		newS := make([]*html.Node, 0, 64)
 		return &newS
 	}
@@ -295,5 +323,5 @@ func PutNodeSlice(s *[]*html.Node) {
 		clear((*s)[:cap(*s)])
 	}
 	*s = (*s)[:0]
-	NodeSlicePool.Put(s)
+	nodeSlicePool.Put(s)
 }

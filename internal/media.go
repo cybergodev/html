@@ -104,13 +104,10 @@ func init() {
 	for _, pattern := range embedPatterns {
 		addSignature(pattern)
 	}
-	// Densify the non-empty buckets behind the one-byte class table.
-	for b, bucket := range &mediaPatterns {
-		if len(bucket) > 0 {
-			mediaScanClass[b] = uint8(len(mediaScanBuckets) + 1)
-			mediaScanBuckets = append(mediaScanBuckets, bucket)
-		}
-	}
+	// Densify the non-empty buckets behind the one-byte class table — via
+	// the shared helper this loop was a verbatim copy of (see
+	// densifyFirstByteIndex in scorer.go).
+	mediaScanClass, mediaScanBuckets = densifyFirstByteIndex(mediaPatterns)
 }
 
 // IsVideoURL checks if a URL is a video based on extension or embed pattern

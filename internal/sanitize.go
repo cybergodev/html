@@ -34,21 +34,53 @@ func isRemovedTag(tag string) bool {
 	return false
 }
 
-// dangerousAttributes are always removed during sanitization.
-// All on* event handlers are blocked by prefix check in sanitizeNodeWithAudit.
-var dangerousAttributes = map[string]bool{
-	// Other dangerous attributes
-	"formaction": true, // Can override form action
-	"autofocus":  true, // Can be used for phishing
+// isDangerousAttrKey reports whether an attribute key (already lowercased by
+// the parser or the caller) is always removed during sanitization. All on*
+// event handlers are blocked separately by the prefix check in
+// sanitizeNodeInPlace. A switch rather than a map: it runs once per attribute
+// per element on the sanitize walk, the same hot-path reason as the element
+// classifications in elements.go.
+func isDangerousAttrKey(key string) bool {
+	switch key {
+	case "formaction", // Can override form action
+		"autofocus": // Can be used for phishing
+		return true
+	}
+	return false
 }
 
-// dangerousCSSPatterns are stripped from style attribute values during sanitization.
+// dangerousCSSPatterns are stripped from style attribute values during
+// sanitization as plain substring matches — function-call and scheme-prefix
+// shapes, whose spelling cannot legally contain internal whitespace.
 var dangerousCSSPatterns = []string{
 	"expression(",
-	"behavior:",
-	"-moz-binding:",
 	"javascript:",
 	"vbscript:",
+}
+
+// dangerousCSSProperties are CSS property names whose declaration is always
+// dangerous. They are matched as a declaration — the name followed by
+// optional CSS whitespace and a ':' — because CSS permits whitespace between
+// a property name and its colon, and "behavior :url(…)" slipped past the
+// former plain-substring form ("behavior:").
+var dangerousCSSProperties = []string{"behavior", "-moz-binding"}
+
+// cssDeclPresent reports whether lower (already lowercased) declares name as
+// a property: name directly followed by optional CSS whitespace and a ':'.
+func cssDeclPresent(lower, name string) bool {
+	for i := 0; i+len(name) <= len(lower); i++ {
+		if lower[i:i+len(name)] != name {
+			continue
+		}
+		j := i + len(name)
+		for j < len(lower) && (lower[j] == ' ' || lower[j] == '\t' || lower[j] == '\n' || lower[j] == '\r' || lower[j] == '\f') {
+			j++
+		}
+		if j < len(lower) && lower[j] == ':' {
+			return true
+		}
+	}
+	return false
 }
 
 // c0ControlOrSpace is the byte set browsers strip from the leading and trailing
@@ -95,30 +127,35 @@ func sanitizeStyleValue(style string) string {
 			return ""
 		}
 	}
+	for _, name := range dangerousCSSProperties {
+		if cssDeclPresent(lower, name) {
+			return ""
+		}
+	}
 	return style
 }
 
-var uriAttributes = map[string]bool{
-	"href":   true,
-	"src":    true,
-	"cite":   true,
-	"action": true,
-	"data":   true,
-	// Note: "formaction" is not included here as it's already in dangerousAttributes
-	// which blocks it completely. Having it here would be redundant.
-	"poster":     true,
-	"background": true,
-	"longdesc":   true,
-	"usemap":     true,
-	"profile":    true,
-	// Multi-URL attributes: srcset lists image candidates ("a.png 1x, b.png
-	// 2x"), ping lists beacon URLs. Neither is a single URL, but the scheme
-	// policy below still applies to the value as a whole, so a hidden
-	// "javascript:" or scriptable data: prefix cannot ride through unchecked.
-	"srcset": true,
-	"ping":   true,
-	// SVG attack vectors - xlink:href can execute JavaScript
-	"xlink:href": true,
+// isURIAttrKey reports whether an attribute key (already lowercased) carries a
+// URI value subject to the scheme policy in isSafeURIWithAudit. A switch for
+// the same per-attribute hot-path reason as isDangerousAttrKey.
+func isURIAttrKey(key string) bool {
+	switch key {
+	case "href", "src", "cite", "action", "data",
+		"poster", "background", "longdesc", "usemap", "profile",
+		// Multi-URL attributes: srcset lists image candidates ("a.png 1x,
+		// b.png 2x"), ping lists beacon URLs. Neither is a single URL, but the
+		// scheme policy still applies to the value as a whole, so a hidden
+		// "javascript:" or scriptable data: prefix cannot ride through
+		// unchecked.
+		"srcset", "ping",
+		// SVG attack vectors - xlink:href can execute JavaScript
+		"xlink:href":
+		// Note: "formaction" is not included here as it's already in
+		// isDangerousAttrKey which blocks it completely. Having it here would
+		// be redundant.
+		return true
+	}
+	return false
 }
 
 // SanitizeDOM sanitizes an already-parsed HTML DOM tree in-place.
@@ -128,10 +165,27 @@ func SanitizeDOM(doc *html.Node, audit AuditRecorder) {
 	if doc == nil {
 		return
 	}
-	sanitizeNodeWithAudit(doc, audit)
+	sanitizeNodeWithAuditMode(doc, audit, false)
 }
 
-// sanitizeNodeWithAudit sanitizes n and its entire subtree in place.
+// SanitizeDOMReader sanitizes an already-parsed HTML DOM tree in place with
+// reader-mode (ReadPage family) semantics. It differs from SanitizeDOM in one
+// way: a <button> element is unwrapped — the element is removed but its child
+// text (and safe inline markup) is spliced into the parent — instead of being
+// dropped whole with its subtree. ReadPage keeps page-chrome navigation, where
+// a menu's top-level labels are routinely <button> dropdown triggers; dropping
+// the button also dropped the label. The <button> element itself is still gone
+// in both modes (no interactive form control survives), so the unwrap preserves
+// no control surface — only the visible label. The Extract path keeps
+// SanitizeDOM, whose whole-subtree removal of <button> is unchanged.
+func SanitizeDOMReader(doc *html.Node, audit AuditRecorder) {
+	if doc == nil {
+		return
+	}
+	sanitizeNodeWithAuditMode(doc, audit, true)
+}
+
+// sanitizeNodeWithAuditMode sanitizes n and its entire subtree in place.
 //
 // The traversal is iterative with an explicit stack rather than recursive:
 // SanitizeDOM's callers pre-validate nesting depth, but the traversal must not
@@ -142,7 +196,11 @@ func SanitizeDOM(doc *html.Node, audit AuditRecorder) {
 // unaffected by removals performed deeper in the walk. The stack is pooled,
 // but — unlike WalkNodes — deliberately has no node-count cap: sanitization
 // must never be silently truncated.
-func sanitizeNodeWithAudit(n *html.Node, audit AuditRecorder) {
+//
+// When unwrapButtons is true (reader mode), a <button> is intercepted before
+// the generic removed-tag path: its children are queued for sanitization and
+// the button is unwrapped, keeping the label text without keeping the control.
+func sanitizeNodeWithAuditMode(n *html.Node, audit AuditRecorder, unwrapButtons bool) {
 	if n == nil {
 		return
 	}
@@ -156,6 +214,22 @@ func sanitizeNodeWithAudit(n *html.Node, audit AuditRecorder) {
 	for len(stack) > 0 {
 		node := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+
+		if unwrapButtons && node.Type == html.ElementNode && strings.EqualFold(node.Data, "button") {
+			audit.RecordBlockedTag(node.Data)
+			// Queue the button's children for sanitization before unwrapping:
+			// after the unwrap they are ordinary siblings at the button's former
+			// position and would otherwise never be reached by the stack walk.
+			segStart := len(stack)
+			for child := node.FirstChild; child != nil; child = child.NextSibling {
+				stack = append(stack, child)
+			}
+			for i, j := segStart, len(stack)-1; i < j; i, j = i+1, j-1 {
+				stack[i], stack[j] = stack[j], stack[i]
+			}
+			unwrapNode(node)
+			continue
+		}
 
 		if !sanitizeNodeInPlace(node, audit) {
 			continue
@@ -202,7 +276,7 @@ func sanitizeNodeInPlace(n *html.Node, audit AuditRecorder) bool {
 					modified = true
 					continue
 				}
-				if dangerousAttributes[attrKey] {
+				if isDangerousAttrKey(attrKey) {
 					audit.RecordBlockedAttr(attr.Key, attr.Val)
 					modified = true
 					continue
@@ -221,7 +295,7 @@ func sanitizeNodeInPlace(n *html.Node, audit AuditRecorder) bool {
 						continue
 					}
 				}
-				if uriAttributes[attrKey] {
+				if isURIAttrKey(attrKey) {
 					if !isSafeURIWithAudit(attr.Val, audit) {
 						modified = true
 						continue
@@ -249,6 +323,26 @@ func removeNode(n *html.Node) {
 	if n.Parent != nil {
 		n.Parent.RemoveChild(n)
 	}
+}
+
+// unwrapNode replaces n with its children in place: each child is inserted
+// before n in the parent's child list (preserving order), then n is detached.
+// It is the reader-mode alternative to removeNode for <button>: the interactive
+// control disappears but the label text survives. The re-parented children keep
+// their original subtree untouched, so any descendant sanitization still owed to
+// them must be done separately (sanitizeNodeWithAuditMode queues them before the
+// unwrap). Like removeNode, it is a no-op for a detached node.
+func unwrapNode(n *html.Node) {
+	if n.Parent == nil {
+		return
+	}
+	for child := n.FirstChild; child != nil; {
+		next := child.NextSibling
+		n.RemoveChild(child) // detach (clears child.Parent) before re-parenting
+		n.Parent.InsertBefore(child, n)
+		child = next
+	}
+	n.Parent.RemoveChild(n)
 }
 
 // dangerousSchemePrefixes lists the scheme prefixes blocked everywhere a URI
@@ -679,6 +773,12 @@ func isValidDataURLWithAudit(url string, audit AuditRecorder) bool {
 		return false
 	}
 
+	// The data-part policy here is deliberately WIDER than IsValidURL's (see
+	// the counterpart comment there): this gate decides whether the attribute
+	// may stay in the sanitized DOM — browsers strip \r\n while decoding
+	// folded base64 — while that gate decides whether the URL may enter
+	// output text, where a raw newline breaks a Markdown link destination. A
+	// data: URL can pass here and still be declined at collection.
 	isBase64 := strings.Contains(mediaPart, ";base64")
 	for i := 0; i < len(dataPart); i++ {
 		b := dataPart[i]

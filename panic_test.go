@@ -1,8 +1,12 @@
 package html_test
 
-// panic_protection_test.go - Verifies that all public API surfaces
-// recover from internal panics and return ErrInternalPanic instead of crashing.
-// This implements the SEC-003 security hardening requirement.
+// panic_test.go — black-box panic-safety suite (SEC-003), consolidating
+// panic_protection_test.go (the recoverable ErrInternalPanic contract across
+// processor methods, package functions, batch operations, and concurrent
+// extraction) and panic_audit_test.go (the panic-audit gap-fill: the
+// ExtractAllLinks family’s nil/closed/hostile-input coverage and the ReadPage
+// custom-Scorer panic recovery). The white-box counterpart lives in
+// panic_api_regression_test.go (package html).
 
 import (
 	"context"
@@ -14,6 +18,13 @@ import (
 
 	"github.com/cybergodev/html"
 )
+
+// /////////////////////////////////////////////////////////////////////////////
+// From panic_protection_test.go
+// /////////////////////////////////////////////////////////////////////////////
+
+// recover from internal panics and return ErrInternalPanic instead of crashing.
+// This implements the SEC-003 security hardening requirement.
 
 // panicScorer is a Scorer implementation that panics when Score is called.
 type panicScorer struct{}
@@ -491,4 +502,280 @@ func TestPanicRecovery_BatchNilContext(t *testing.T) {
 	if brf.Failed != 1 || brf.Success != 0 || !errors.Is(brf.Errors[0], html.ErrInternalPanic) {
 		t.Fatalf("expected ErrInternalPanic for nil context (files), got: %v", brf.Errors)
 	}
+}
+
+// /////////////////////////////////////////////////////////////////////////////
+// From panic_audit_test.go
+// /////////////////////////////////////////////////////////////////////////////
+
+// audit: the ExtractAllLinks family had no panic-path coverage at all (nil and
+// closed processors, hostile inputs, scorer independence), and the ReadPage
+// family never asserted the recoverable ErrInternalPanic contract when a
+// custom Scorer panics on the article-node fallback path.
+
+// mustNotPanic runs fn, converting a panic into a test failure that names
+// the call. It is the html_test counterpart of mustNotPanic in the internal
+// panic_api_regression_test.go.
+func mustNotPanic(t *testing.T, what string, fn func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%s panicked: %v", what, r)
+		}
+	}()
+	fn()
+}
+
+// linksDoc carries several resource kinds (anchor, stylesheet, image, script)
+// so ExtractAllLinks has something to find on every path below.
+const linksDoc = `<html><head>
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js"></script>
+</head><body>
+<p>See <a href="https://example.com/docs">the docs</a> and
+<img src="/img/pic.png" alt="pic">.</p>
+</body></html>`
+
+// TestSEC003ExtractAllLinksNilAndClosedProcessor verifies the nil/closed
+// receiver contract on the four ExtractAllLinks methods — the family was
+// absent from TestPanicRecovery_NilAndClosedProcessor's method table.
+func TestSEC003ExtractAllLinksNilAndClosedProcessor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	calls := []struct {
+		name string
+		call func(p *html.Processor) error
+	}{
+		{"ExtractAllLinks", func(p *html.Processor) error {
+			_, err := p.ExtractAllLinks([]byte(linksDoc))
+			return err
+		}},
+		{"ExtractAllLinksWithContext", func(p *html.Processor) error {
+			_, err := p.ExtractAllLinksWithContext(ctx, []byte(linksDoc))
+			return err
+		}},
+		{"ExtractAllLinksFromFile", func(p *html.Processor) error {
+			_, err := p.ExtractAllLinksFromFile("no-such.html")
+			return err
+		}},
+		{"ExtractAllLinksFromFileWithContext", func(p *html.Processor) error {
+			_, err := p.ExtractAllLinksFromFileWithContext(ctx, "no-such.html")
+			return err
+		}},
+	}
+
+	t.Run("nil processor", func(t *testing.T) {
+		t.Parallel()
+		var p *html.Processor
+		for _, c := range calls {
+			mustNotPanic(t, "(*Processor)(nil)."+c.name, func() {
+				if err := c.call(p); !errors.Is(err, html.ErrProcessorClosed) {
+					t.Errorf("%s on nil processor = %v, want ErrProcessorClosed", c.name, err)
+				}
+			})
+		}
+	})
+
+	t.Run("closed processor", func(t *testing.T) {
+		t.Parallel()
+		p, err := html.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := p.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range calls {
+			mustNotPanic(t, "closed processor "+c.name, func() {
+				if err := c.call(p); !errors.Is(err, html.ErrProcessorClosed) {
+					t.Errorf("%s on closed processor = %v, want ErrProcessorClosed", c.name, err)
+				}
+			})
+		}
+	})
+}
+
+// TestSEC003ExtractAllLinksHostileInputsNoPanic drives the package-level
+// link extractors with the same hostile input classes the ReadPage surface
+// regression covers: nil, empty, blank, binary junk, and oversize input
+// (rejected by the MaxInputSize guard), plus an already-cancelled context.
+func TestSEC003ExtractAllLinksHostileInputsNoPanic(t *testing.T) {
+	t.Parallel()
+
+	inputs := map[string][]byte{
+		"nil":    nil,
+		"empty":  {},
+		"blank":  []byte(" \t\n\r "),
+		"binary": {0xFF, 0xFE, 0x00, 0x01, 0x80},
+	}
+	for name, in := range inputs {
+		mustNotPanic(t, "ExtractAllLinks("+name+")", func() { _, _ = html.ExtractAllLinks(in) })
+		mustNotPanic(t, "ExtractAllLinksFromFileWithContext("+name+" ctx)", func() {
+			_, _ = html.ExtractAllLinksWithContext(context.Background(), in)
+		})
+	}
+
+	oversize := make([]byte, html.DefaultConfig().MaxInputSize+1)
+	mustNotPanic(t, "ExtractAllLinks(oversize)", func() {
+		if _, err := html.ExtractAllLinks(oversize); !errors.Is(err, html.ErrInputTooLarge) {
+			t.Errorf("ExtractAllLinks(oversize) = %v, want ErrInputTooLarge", err)
+		}
+	})
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	mustNotPanic(t, "ExtractAllLinksWithContext(cancelled)", func() {
+		_, _ = html.ExtractAllLinksWithContext(cancelled, []byte(linksDoc))
+	})
+}
+
+// TestSEC003ExtractAllLinksIndependentOfScorer pins that the link-enumeration
+// path never invokes the configured Scorer: a processor whose scorer panics on
+// every Score call still enumerates links successfully. If a future change
+// routes ExtractAllLinks through article selection, this test fails and the
+// recover contract (rather than success) must be re-established deliberately.
+func TestSEC003ExtractAllLinksIndependentOfScorer(t *testing.T) {
+	t.Parallel()
+
+	cfg := newPanicScorerConfig()
+	p, err := html.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+
+	links, err := p.ExtractAllLinks([]byte(linksDoc))
+	if err != nil {
+		t.Fatalf("ExtractAllLinks with panicking scorer: %v, want success (links path must not use the scorer)", err)
+	}
+	if len(links) == 0 {
+		t.Fatal("ExtractAllLinks returned no links for linksDoc")
+	}
+}
+
+// TestSEC003ReadPageScorerPanicRecovered exercises the ReadPage family's
+// recoverable-panic contract with a panicking custom Scorer. The article-node
+// fallback runs the scorer only when no <main>-carrying region is recognized,
+// so the div-soup document must come back as ErrInternalPanic (recovered,
+// never a crash) while the landmark document succeeds without ever consulting
+// the scorer.
+func TestSEC003ReadPageScorerPanicRecovered(t *testing.T) {
+	t.Parallel()
+
+	const divSoup = `<html><body>` +
+		`<div><p>First block with <a href="/x">a link</a>.</p></div>` +
+		`<div><p>Second block of body text.</p></div>` +
+		`</body></html>`
+	const landmark = `<html><body><main><article><h1>Title</h1>` +
+		`<p>Body with <a href="/y">a link</a>.</p></article></main></body></html>`
+
+	ctx := context.Background()
+	panicCalls := []struct {
+		name string
+		call func(p *html.Processor) error
+	}{
+		{"ReadPage", func(p *html.Processor) error {
+			_, err := p.ReadPage([]byte(divSoup))
+			return err
+		}},
+		{"ReadPageWithContext", func(p *html.Processor) error {
+			_, err := p.ReadPageWithContext(ctx, []byte(divSoup))
+			return err
+		}},
+		{"ReadPageToMarkdown", func(p *html.Processor) error {
+			_, err := p.ReadPageToMarkdown([]byte(divSoup))
+			return err
+		}},
+		{"ReadPageToMarkdownText", func(p *html.Processor) error {
+			_, err := p.ReadPageToMarkdownText([]byte(divSoup))
+			return err
+		}},
+		{"package ReadPage", func(p *html.Processor) error {
+			_, err := html.ReadPage([]byte(divSoup), newPanicScorerConfig())
+			return err
+		}},
+	}
+
+	for _, c := range panicCalls {
+		t.Run(c.name+" div-soup panicking scorer", func(t *testing.T) {
+			t.Parallel()
+			p, err := html.New(newPanicScorerConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = p.Close() }()
+			mustNotPanic(t, c.name, func() {
+				if err := c.call(p); !errors.Is(err, html.ErrInternalPanic) {
+					t.Errorf("%s with panicking scorer = %v, want ErrInternalPanic", c.name, err)
+				}
+			})
+		})
+	}
+
+	t.Run("landmark document skips the scorer", func(t *testing.T) {
+		t.Parallel()
+		p, err := html.New(newPanicScorerConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = p.Close() }()
+		mustNotPanic(t, "ReadPage(landmark)", func() {
+			rr, err := p.ReadPage([]byte(landmark))
+			if err != nil {
+				t.Errorf("ReadPage(landmark) with panicking scorer = %v, want success (landmark path does not consult the scorer)", err)
+				return
+			}
+			if len(rr.Sections) == 0 {
+				t.Error("ReadPage(landmark) returned no sections")
+			}
+		})
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Processor method nil-safety (from the dissolved boundary_test.go)
+// ---------------------------------------------------------------------------
+
+// TestProcessorMethodsNilSafety checks GetAuditLog/ClearAuditLog/ClearCache/
+// ResetStatistics on a no-audit processor (from boundary_test.go; the nil
+// receiver guards are pinned white-box in extract_test.go's
+// TestProcessorNilGuardMethods and processor_adapter_internal_test.go).
+func TestProcessorMethodsNilSafety(t *testing.T) {
+	t.Parallel()
+
+	t.Run("GetAuditLog on no-audit processor", func(t *testing.T) {
+		p, _ := html.New()
+		defer func() { _ = p.Close() }()
+
+		entries := p.GetAuditLog()
+		if len(entries) != 0 {
+			t.Errorf("expected empty entries without audit, got %d", len(entries))
+		}
+	})
+
+	t.Run("ClearAuditLog on no-audit processor", func(t *testing.T) {
+		p, _ := html.New()
+		defer func() { _ = p.Close() }()
+
+		p.ClearAuditLog() // should not panic
+	})
+
+	t.Run("ClearCache on valid processor", func(t *testing.T) {
+		p, _ := html.New()
+		defer func() { _ = p.Close() }()
+
+		p.ClearCache() // should not panic
+	})
+
+	t.Run("ResetStatistics on valid processor", func(t *testing.T) {
+		p, _ := html.New()
+		defer func() { _ = p.Close() }()
+
+		p.ResetStatistics()
+		stats := p.GetStatistics()
+		if stats.TotalProcessed != 0 {
+			t.Error("expected 0 after reset")
+		}
+	})
 }

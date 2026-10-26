@@ -169,12 +169,18 @@ func (p *Processor) extractTableData(table *html.Node, tableFormat string, cellT
 		}
 		// <template> is the one non-cell element the HTML parser keeps
 		// between rows (phrasing strays are foster-parented out of the
-		// table), and its parsed anchors are numbered by the section-wide
-		// collector. Burn them — text discarded, exactly like stray row
-		// children — so the counters stay aligned; rows below this node
-		// still process normally.
-		if cellText != nil && node.Data == "template" {
-			_ = cellText(node)
+		// table). Its content is inert by HTML semantics — never rendered —
+		// so its rows are not table content and BOTH paths prune it; before,
+		// the plain path (cellText == nil) descended into the template and
+		// rendered its rows, so the inline-format config silently changed the
+		// table's content. The token path additionally burns the template's
+		// anchors (text discarded, exactly like stray row children) so the
+		// counters stay aligned with the section-wide collector, which
+		// numbers them.
+		if node.Data == "template" {
+			if cellText != nil {
+				_ = cellText(node)
+			}
 			return false
 		}
 		if node.Data != "tr" {

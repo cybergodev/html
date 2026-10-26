@@ -368,3 +368,159 @@ func TestContainsLowConfidencePhrase(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Position lookup and body-length boundaries ([FIX-001] boundary additions)
+// ---------------------------------------------------------------------------
+
+// TestLinkByPositionBoundaries pins linkByPosition's guard and fallback
+// branches: non-positive positions stay not-found, skipped positions in an
+// ascending slice miss, and a non-ascending (hand-built) slice takes the
+// last-wins linear scan instead of the binary search.
+func TestLinkByPositionBoundaries(t *testing.T) {
+	t.Parallel()
+
+	ascending := []LinkInfo{
+		{URL: "a", Position: 1},
+		{URL: "b", Position: 2},
+		{URL: "c", Position: 4}, // ascending, position 3 skipped
+	}
+	if l, ok := linkByPosition(ascending, 2); !ok || l.URL != "b" {
+		t.Errorf("linkByPosition(ascending, 2) = (%v, %v), want (b, true)", l.URL, ok)
+	}
+	if _, ok := linkByPosition(ascending, 3); ok {
+		t.Error("linkByPosition(ascending, 3) found a skipped position, want not-found")
+	}
+	if _, ok := linkByPosition(ascending, 9); ok {
+		t.Error("linkByPosition(ascending, 9) = found, want not-found past the end")
+	}
+	for _, pos := range []int{0, -1} {
+		if _, ok := linkByPosition(ascending, pos); ok {
+			t.Errorf("linkByPosition(ascending, %d) = found, want not-found for non-positive positions", pos)
+		}
+	}
+
+	manual := []LinkInfo{
+		{URL: "first", Position: 2},
+		{URL: "second", Position: 1},
+		{URL: "dup-late", Position: 2},
+	}
+	if l, ok := linkByPosition(manual, 2); !ok || l.URL != "dup-late" {
+		t.Errorf("linkByPosition(non-ascending, 2) = (%v, %v), want last-wins (dup-late, true)", l.URL, ok)
+	}
+	if _, ok := linkByPosition(manual, 3); ok {
+		t.Error("linkByPosition(non-ascending, 3) = found, want not-found")
+	}
+}
+
+// TestBodyTextLengthBoundaries pins bodyTextLength's no-body fallback: a
+// fragment node with no <body> descendant measures zero instead of panicking,
+// while a full document measures its body text.
+func TestBodyTextLengthBoundaries(t *testing.T) {
+	t.Parallel()
+
+	p, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+
+	fragment := &html.Node{Type: html.ElementNode, Data: "div"}
+	if got := p.bodyTextLength(fragment); got != 0 {
+		t.Errorf("bodyTextLength(body-less fragment) = %d, want 0", got)
+	}
+
+	doc, err := html.Parse(strings.NewReader(`<html><body><p>hello world</p></body></html>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := p.bodyTextLength(doc); got == 0 {
+		t.Error("bodyTextLength(full document) = 0, want the body's text length")
+	}
+}
+
+// TestExtractInlineDataURLImage pins C-2 end to end: a base64 inline image
+// between MaxURLLength and MaxDataURILength is collected. IsValidURL's flat
+// MaxURLLength gate used to reject every real inline image before its data:
+// branch (and its 100KB ceiling) could ever run, silently dropping it from
+// Result.Images while the DOM sanitizer kept the attribute.
+func TestExtractInlineDataURLImage(t *testing.T) {
+	t.Parallel()
+
+	src := "data:image/png;base64," + strings.Repeat("A", 3000) // > MaxURLLength (2000), < MaxDataURILength (100000)
+	doc := `<html><body><article><h1>Title</h1><img src="` + src + `" alt="chart"><p>Body text long enough for stable article selection by the scoring pass.</p></article></body></html>`
+
+	res, err := Extract([]byte(doc))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if len(res.Images) != 1 {
+		t.Fatalf("images = %d, want 1 (a data URL within MaxDataURILength must be collected)", len(res.Images))
+	}
+	if res.Images[0].URL != src {
+		t.Fatalf("image URL = %.40s…, want the data URL verbatim", res.Images[0].URL)
+	}
+}
+
+// TestExtractOverflowHiddenCardKept pins C-3 end to end: Tailwind's
+// overflow-hidden wrapper (a paint clip, fully visible content) must not
+// remove the card subtree from the extraction. Before the visible-compound
+// exemption, matchesHiddenClassToken matched the trailing "hidden" of
+// "overflow-hidden" and ShouldRemove dropped the whole card.
+func TestExtractOverflowHiddenCardKept(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body><nav>Home News About</nav><article><h1>Card demo</h1><div class="rounded-xl overflow-hidden shadow"><img src="/shot.png" alt="screenshot"><p>CARD BODY TEXT with plenty of words so the card carries substantial visible content for the check.</p></div><p>Trailing paragraph outside the card, also with a fair number of words for selection stability.</p></article><footer>Copyright</footer></body></html>`
+
+	res, err := Extract([]byte(doc))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if !strings.Contains(res.Text, "CARD BODY TEXT") {
+		t.Fatalf("text = %q, want the visible overflow-hidden card kept", res.Text)
+	}
+	if len(res.Images) != 1 {
+		t.Fatalf("images = %d, want 1 (the card's image must survive with it)", len(res.Images))
+	}
+}
+
+// TestExtractTableTemplateRowsNotRendered pins M-2: rows nested inside a
+// <template> between table rows are inert content — never rendered by a
+// browser — and must not appear in the rendered table on either path. The
+// plain path (both inline formats "none", the DefaultConfig) used to descend
+// into the template and render its rows while the token path dropped them, so
+// an unrelated format knob changed the table's content.
+func TestExtractTableTemplateRowsNotRendered(t *testing.T) {
+	t.Parallel()
+
+	doc := `<html><body><article>
+		<table>
+			<tr><th>Name</th></tr>
+			<template><tr><td>TPLROW</td></tr></template>
+			<tr><td>RealRow</td></tr>
+		</table>
+		<p>Tail paragraph with enough text for article selection to be stable.</p>
+		</article></body></html>`
+
+	plain, err := ExtractText([]byte(doc))
+	if err != nil {
+		t.Fatalf("ExtractText: %v", err)
+	}
+	if strings.Contains(plain, "TPLROW") {
+		t.Fatalf("plain path rendered the template row: %q", plain)
+	}
+	if !strings.Contains(plain, "RealRow") {
+		t.Fatalf("plain path lost the real row: %q", plain)
+	}
+
+	md, err := ExtractToMarkdown([]byte(doc))
+	if err != nil {
+		t.Fatalf("ExtractToMarkdown: %v", err)
+	}
+	if strings.Contains(md, "TPLROW") {
+		t.Fatalf("token path rendered the template row: %q", md)
+	}
+	if !strings.Contains(md, "RealRow") {
+		t.Fatalf("token path lost the real row: %q", md)
+	}
+}

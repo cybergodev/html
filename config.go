@@ -31,6 +31,23 @@ const (
 	DefaultProcessingTimeout = 30 * time.Second
 )
 
+// Format values accepted by Config.InlineImageFormat, Config.InlineLinkFormat,
+// and Config.TableFormat. Validation is case-insensitive and trims surrounding
+// whitespace; the empty string falls back to the field default.
+const (
+	// FormatNone omits the element from text output. Not valid for TableFormat.
+	// Reader mode (ReadPage*) always preserves links and treats FormatNone for
+	// Config.InlineLinkFormat as FormatMarkdown.
+	FormatNone = "none"
+	// FormatMarkdown formats the element as Markdown. Valid for all three fields.
+	FormatMarkdown = "markdown"
+	// FormatHTML keeps the element as inline HTML. Valid for all three fields.
+	FormatHTML = "html"
+	// FormatPlaceholder emits a positional placeholder such as [IMAGE:1].
+	// Valid for Config.InlineImageFormat only.
+	FormatPlaceholder = "placeholder"
+)
+
 // Configuration limits - reference Default* constants for consistency
 const (
 	// maxConfigInputSize limits the maximum allowed MaxInputSize configuration.
@@ -66,11 +83,10 @@ const (
 	maxRegexMatches = 1000
 
 	// Buffer size estimates for pre-allocation
-	initialSliceCap   = 16 // Initial capacity for result slices
-	initialMapCap     = 8  // Initial capacity for result maps
-	imageHTMLBufExtra = 64 // Extra buffer for HTML image tag generation
-	extractTagCap     = 16 // Initial capacity for tag attribute extraction
-	linkMapCap        = 64 // Initial capacity for link deduplication map
+	initialSliceCap = 16 // Initial capacity for result slices
+	initialMapCap   = 8  // Initial capacity for result maps
+	extractTagCap   = 16 // Initial capacity for tag attribute extraction
+	linkMapCap      = 64 // Initial capacity for link deduplication map
 
 	// Processing thresholds
 	wordsPerMinute    = 200 // Average reading speed for reading time estimation
@@ -106,7 +122,7 @@ type Config struct {
 	CacheTTL          time.Duration // Time-to-live for cache entries. Default: 1 hour. Ignored by the package-level convenience functions (see MaxCacheEntries).
 	CacheCleanup      time.Duration // Interval for background cleanup of expired cache entries. Set to 0 to disable. Default: 5 minutes. Ignored by the package-level convenience functions (see MaxCacheEntries).
 	WorkerPoolSize    int           // Number of concurrent workers for batch processing. Default: 4. Must be positive and <= 256.
-	ProcessingTimeout time.Duration // Maximum time allowed for processing a single document. Default: 30 seconds. Set to 0 for no timeout.
+	ProcessingTimeout time.Duration // Maximum wall-clock time allowed for processing a single document. Default: 30 seconds. Set to 0 for no timeout. The deadline is wall-clock, not CPU time: batch pipelines or CPU-throttled containers intentionally processing very large documents should raise it (or set 0, with input size still bounded by MaxInputSize).
 
 	// === Security ===
 	EnableSanitization bool        // Controls whether HTML sanitization is applied. Default: true. Should only be disabled for trusted input.
@@ -186,9 +202,9 @@ func DefaultConfig() Config {
 		PreserveAudios:  true,
 
 		// Output Formats
-		InlineImageFormat: "none",
-		InlineLinkFormat:  "none",
-		TableFormat:       "markdown",
+		InlineImageFormat: FormatNone,
+		InlineLinkFormat:  FormatNone,
+		TableFormat:       FormatMarkdown,
 
 		// Link Extraction
 		ResolveRelativeURLs:  true,
@@ -228,22 +244,20 @@ func (c Config) Validate() error {
 		return newConfigError("MaxDepth", c.MaxDepth, fmt.Sprintf("exceeds maximum %d", maxConfigDepth))
 	case c.ProcessingTimeout < 0:
 		return newConfigError("ProcessingTimeout", c.ProcessingTimeout, "cannot be negative")
-	case c.Audit.MaxRawValueLength < 0:
-		return newConfigError("Audit.MaxRawValueLength", c.Audit.MaxRawValueLength, "cannot be negative")
-	case c.Audit.MaxEntries < 0:
-		return newConfigError("Audit.MaxEntries", c.Audit.MaxEntries, "cannot be negative")
-	case c.Audit.MaxEntries > maxConfigAuditEntries:
-		return newConfigError("Audit.MaxEntries", c.Audit.MaxEntries, fmt.Sprintf("exceeds maximum %d", maxConfigAuditEntries))
+	}
+
+	if err := c.Audit.Validate(); err != nil {
+		return err
 	}
 
 	// Validate format strings
-	if err := validateFormat("InlineImageFormat", c.InlineImageFormat, []string{"none", "markdown", "html", "placeholder"}); err != nil {
+	if err := validateFormat("InlineImageFormat", c.InlineImageFormat, []string{FormatNone, FormatMarkdown, FormatHTML, FormatPlaceholder}); err != nil {
 		return err
 	}
-	if err := validateFormat("InlineLinkFormat", c.InlineLinkFormat, []string{"none", "markdown", "html"}); err != nil {
+	if err := validateFormat("InlineLinkFormat", c.InlineLinkFormat, []string{FormatNone, FormatMarkdown, FormatHTML}); err != nil {
 		return err
 	}
-	if err := validateFormat("TableFormat", c.TableFormat, []string{"markdown", "html"}); err != nil {
+	if err := validateFormat("TableFormat", c.TableFormat, []string{FormatMarkdown, FormatHTML}); err != nil {
 		return err
 	}
 
@@ -307,8 +321,8 @@ func MarkdownConfig() Config {
 	cfg := DefaultConfig()
 
 	// Output Formats - enable markdown
-	cfg.InlineImageFormat = "markdown"
-	cfg.InlineLinkFormat = "markdown"
+	cfg.InlineImageFormat = FormatMarkdown
+	cfg.InlineLinkFormat = FormatMarkdown
 
 	return cfg
 }
@@ -321,7 +335,13 @@ func MarkdownConfig() Config {
 type Result struct {
 	// Text is the extracted plain-text content of the document.
 	Text string `json:"text"`
-	// Title is the document title from <title>, or the first <h1>/<h2> when absent.
+	// Title is the document title. With metadata extraction enabled (the
+	// default), a declared metadata title wins — the article-typed JSON-LD
+	// headline over og:title, with a WebPage/WebSite JSON-LD name as the last
+	// metadata resort — and is stripped of a site-name suffix only when the
+	// trailing segment exactly matches the declared site name. Otherwise the
+	// DOM ladder applies: <title>, then the h1 inside the selected article,
+	// the first document h1, and the first h2.
 	Title string `json:"title"`
 	// Images lists extracted <img> elements in document order; empty when PreserveImages is false.
 	Images []ImageInfo `json:"images,omitempty"`

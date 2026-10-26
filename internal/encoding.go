@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,16 +25,6 @@ import (
 )
 
 var (
-	// Pre-compiled regex patterns for charset detection.
-	// Note: These are kept for fallback when extractCharsetFromHTML doesn't find a charset.
-	//
-	// SECURITY: These regex patterns are only applied to the first 1024 bytes of HTML
-	// (see DetectCharsetBasic where htmlStart is created from sample), which limits the
-	// potential impact of ReDoS attacks. The patterns use negated character classes [^>]*
-	// rather than greedy .* to minimize backtracking.
-	charsetPattern    = regexp.MustCompile(`(?i)<meta\s+[^>]*http-equiv=["']?content-type["']?[^>]*content=["']?[^;]*;\s*charset=([^"'\s>]+)`)
-	charsetPatternAlt = regexp.MustCompile(`(?i)<meta\s+charset=["']?([^"'\s>]+)`)
-
 	// charsetNormCache caches normalized charset names to avoid repeated string operations.
 	// This provides 5-10% faster charset normalization for repeated lookups.
 	charsetNormCache sync.Map
@@ -120,18 +109,6 @@ var charsetAliases = map[string]string{
 	"big5":       "big5",
 	"big-5":      "big5",
 	"big5-hkscs": "big5",
-}
-
-// extractCharsetFromHTML extracts charset from HTML using fast string operations.
-// This is a convenience wrapper that delegates to extractCharsetFromBytes.
-// Returns empty string if not found.
-func extractCharsetFromHTML(html string) string {
-	if len(html) == 0 {
-		return ""
-	}
-	// Delegate to the byte-based implementation to avoid code duplication.
-	// Use StringToBytes for zero-allocation conversion.
-	return extractCharsetFromBytes(StringToBytes(html))
 }
 
 // extractCharsetFromBytes extracts charset from HTML bytes using fast byte operations.
@@ -422,27 +399,15 @@ func (ed *EncodingDetector) DetectCharsetBasic(data []byte) string {
 		return "utf-8"
 	}
 
-	// Safe conversion: create a string copy only when needed
-	// This is necessary because the original data slice may be modified by the caller
-	htmlStart := string(sample)
-
-	// Try to detect from meta tags using fast string-based extraction. The
+	// Try to detect from meta tags using fast byte-based extraction. The
 	// non-empty guard keeps a whitespace-only declared value (e.g.
-	// <meta charset=" ">) from returning "" as the detected charset.
-	if declaredCharset := extractCharsetFromHTML(htmlStart); declaredCharset != "" {
+	// <meta charset=" ">) from returning "" as the detected charset. (This
+	// used to go through a string copy and a string-typed wrapper — plus two
+	// regex fallbacks whose only reachable case was a quoted value truncated
+	// by the 1KB sampling window, where they returned a half value like
+	// "shi" that getEncoding rejected outright — worse than this fallback.)
+	if declaredCharset := extractCharsetFromBytes(sample); declaredCharset != "" {
 		if c := normalizeCharset(declaredCharset); c != "" {
-			return c
-		}
-	}
-
-	// Fallback to regex patterns for edge cases not handled by string extraction
-	if matches := charsetPattern.FindStringSubmatch(htmlStart); len(matches) > 1 {
-		if c := normalizeCharset(matches[1]); c != "" {
-			return c
-		}
-	}
-	if matches := charsetPatternAlt.FindStringSubmatch(htmlStart); len(matches) > 1 {
-		if c := normalizeCharset(matches[1]); c != "" {
 			return c
 		}
 	}
@@ -515,8 +480,10 @@ func (ed *EncodingDetector) detectCharsetSmart(data []byte, basicCharset string)
 
 	// The basic pass result arrives as a parameter (see detectCharsetSmart).
 
-	// Step 1: Quick validation of basic detection
-	// For meta-tag declared UTF-8, give it high priority
+	// Step 1: Quick validation of basic detection. basicCharset carries no
+	// provenance — BOM detection has already returned by this point, so a
+	// "utf-8" here is either a meta declaration or the valid-UTF-8
+	// auto-detection, and both get the same treatment below.
 	//
 	// Bound the statistical scoring to MaxSampleSize bytes, exactly as
 	// tryAllEncodings does below: scoring is statistical (printable/CJK/control
@@ -539,12 +506,13 @@ func (ed *EncodingDetector) detectCharsetSmart(data []byte, basicCharset string)
 		}
 	}
 
-	// Check if basic detection came from meta tag. Evaluated after the
-	// score >= 90 branch so the confidence scale is uniform: a utf-8 meta
-	// declaration with a 90+ score previously reported 90 while any other
-	// charset at the same score reported 95.
+	// A utf-8 basicCharset with a good score is trusted here regardless of
+	// whether it came from a meta declaration or the valid-UTF-8
+	// auto-detection (see Step 1). Evaluated after the score >= 90 branch so
+	// the confidence scale is uniform: this branch reports 90 while any
+	// charset at 90+ reports 95.
 	if basicCharset == "utf-8" && score >= 70 {
-		// Meta tag declared UTF-8 with good score - trust it
+		// utf-8 with a good score - trust it
 		return EncodingMatch{
 			Charset:    basicCharset,
 			Confidence: 90,
@@ -634,11 +602,13 @@ func (ed *EncodingDetector) ToUTF8(data []byte, charset string) ([]byte, error) 
 	enc := getEncoding(charset)
 	if enc == nil {
 		// Unknown encoding. If the bytes are already valid UTF-8, return them
-		// unchanged; otherwise the data cannot be decoded safely. Surface an
-		// error rather than silently returning undecodable bytes that would
+		// (BOM stripped, like the utf-8 branch above — a surviving U+FEFF
+		// would surface as a stray text node in the parsed document);
+		// otherwise the data cannot be decoded safely. Surface an error
+		// rather than silently returning undecodable bytes that would
 		// masquerade as successfully converted content downstream.
 		if utf8.Valid(data) {
-			return data, nil
+			return stripUTF8BOM(data), nil
 		}
 		return nil, fmt.Errorf("unsupported encoding %q", charset)
 	}
@@ -949,6 +919,10 @@ func DetectAndConvertToUTF8StringSafe(data []byte, forcedEncoding string) (strin
 //
 // SECURITY: This function uses unsafe pointer operations for performance.
 // It includes defensive bounds checking to prevent out-of-bounds reads.
+// The 64-bit loads are NOT aligned (a slice can start at any byte offset):
+// on amd64/arm64/386 — the supported targets — unaligned loads are legal; a
+// port to an alignment-strict architecture (e.g. linux/mips) must switch to
+// the byte loop.
 func isPureASCII(data []byte) bool {
 	n := len(data)
 	if n == 0 {

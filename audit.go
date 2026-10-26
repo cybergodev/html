@@ -188,6 +188,21 @@ func HighSecurityAuditConfig() AuditConfig {
 	}
 }
 
+// Validate validates the audit configuration and returns an error if invalid.
+// Config.Validate delegates here, so the field names in the returned
+// *ConfigError are prefixed with "Audit." to stay meaningful in both contexts.
+func (c AuditConfig) Validate() error {
+	switch {
+	case c.MaxRawValueLength < 0:
+		return newConfigError("Audit.MaxRawValueLength", c.MaxRawValueLength, "cannot be negative")
+	case c.MaxEntries < 0:
+		return newConfigError("Audit.MaxEntries", c.MaxEntries, "cannot be negative")
+	case c.MaxEntries > maxConfigAuditEntries:
+		return newConfigError("Audit.MaxEntries", c.MaxEntries, fmt.Sprintf("exceeds maximum %d", maxConfigAuditEntries))
+	}
+	return nil
+}
+
 // auditCollector collects audit entries during processing.
 // It is designed to be thread-safe for concurrent use.
 type auditCollector struct {
